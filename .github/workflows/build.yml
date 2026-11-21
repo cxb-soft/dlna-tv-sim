@@ -155,6 +155,7 @@ jobs:
           Copy-Item -Recurse "ui\build\windows\x64\runner\Release\*" $stage
           New-Item -ItemType Directory -Force -Path "$stage\engine" | Out-Null
           Copy-Item "dist\engine\dlna-tv-sim.exe" "$stage\engine\"
+          Copy-Item -Recurse "uosc" "$stage\engine\uosc"
           New-Item -ItemType Directory -Force -Path "$stage\engine\mpv" | Out-Null
           Copy-Item "mpv\mpv.exe" "$stage\engine\mpv\"
           if (Test-Path "mpv\d3dcompiler_43.dll") { Copy-Item "mpv\d3dcompiler_43.dll" "$stage\engine\mpv\" }

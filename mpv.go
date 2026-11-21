@@ -212,7 +212,6 @@ func (m *mpvScreen) start(uri string) error {
 	args := []string{
 		"--fullscreen",
 		// 平时像电视一样干净，鼠标一动才出进度条；手机上拖进度会显示进度条提示。
-		"--osc=yes",
 		"--osd-level=1",
 		"--osd-on-seek=bar",
 		"--osd-bar-align-y=0.95",
@@ -225,8 +224,15 @@ func (m *mpvScreen) start(uri string) error {
 		"--force-window=yes",
 		"--keep-open=no",
 		"--input-ipc-server=" + sock,
-		uri,
 	}
+	if dir := findUoscDir(); dir != "" {
+		// uosc 是随包带的现代播放控件，替代 mpv 默认 OSC。
+		args = append(args, "--config-dir="+dir)
+		m.dev.logf("screen", "mpv 界面：uosc")
+	} else {
+		args = append(args, "--osc=yes")
+	}
+	args = append(args, uri)
 	cmd := exec.Command(m.path, args...)
 	cmd.Stdout = io.Discard
 	stderr := &limitedBuffer{limit: 4096}
@@ -463,4 +469,21 @@ func (m *mpvScreen) stderrText() string {
 		return ""
 	}
 	return strings.TrimSpace(m.stderr.String())
+}
+
+// findUoscDir 找随包的 uosc 资源目录（引擎同目录的 uosc/）。
+func findUoscDir() string {
+	var cands []string
+	if exe, err := os.Executable(); err == nil {
+		cands = append(cands, filepath.Join(filepath.Dir(exe), "uosc"))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		cands = append(cands, filepath.Join(wd, "uosc"))
+	}
+	for _, c := range cands {
+		if st, err := os.Stat(filepath.Join(c, "scripts", "uosc", "main.lua")); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
 }

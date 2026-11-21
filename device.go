@@ -101,7 +101,7 @@ func NewDevice(cfg Config, cfgPath string, verbose bool) *Device {
 		cfg:       cfg,
 		cfgPath:   cfgPath,
 		verbose:   verbose,
-		log:       NewEventLog(400),
+		log:       NewEventLog(2000),
 		state:     stateNoMedia,
 		status:    "OK",
 		playSpeed: "1",
@@ -339,6 +339,8 @@ func (d *Device) SetURI(uri, meta string) {
 		d.duration, d.pos, d.posAt = 0, 0, time.Now()
 		d.state, d.trackNo = stateNoMedia, 0
 		d.mu.Unlock()
+		// 不少控制点结束投屏是「把 URI 置空」而不是发 Stop，这里也要把播放器收掉。
+		d.closeScreen()
 		d.emit(serviceAVTransport)
 		d.logf("avt", "清空当前媒体")
 		return
@@ -419,6 +421,9 @@ func (d *Device) Stop() *upnpError {
 	d.mu.Lock()
 	if d.uri == "" {
 		d.mu.Unlock()
+		// 有些控制点先清 URI 再 Stop；这时即使没有媒体，也要收掉可能还开着的窗口。
+		d.closeScreen()
+		d.logf("avt", "Stop（当前无媒体）")
 		return &upnpError{701, "Transition not available"}
 	}
 	d.pos, d.posAt = 0, time.Now()

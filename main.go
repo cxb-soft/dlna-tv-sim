@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-var version = "0.4.1"
+var version = "0.4.2"
 
 func main() {
 	cfgPath, err := configPath()
