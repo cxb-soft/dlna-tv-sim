@@ -30,6 +30,7 @@ type mpvScreen struct {
 	exiting bool
 	volume  int
 	mute    bool
+	stderr  *limitedBuffer
 }
 
 func (m *mpvScreen) Kind() string { return "mpv" }
@@ -218,7 +219,8 @@ func (m *mpvScreen) start(uri string) error {
 		"--osd-duration=2500",
 		"--cursor-autohide=1200",
 		"--no-terminal",
-		"--really-quiet",
+		// 不用 --really-quiet：它连错误也不输出，mpv 秒退时无法定位。
+		"--msg-level=all=error",
 		"--idle=yes",
 		"--force-window=yes",
 		"--keep-open=no",
@@ -229,6 +231,9 @@ func (m *mpvScreen) start(uri string) error {
 	cmd.Stdout = io.Discard
 	stderr := &limitedBuffer{limit: 4096}
 	cmd.Stderr = stderr
+	m.mu.Lock()
+	m.stderr = stderr
+	m.mu.Unlock()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -345,6 +350,9 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 		case "end-file":
 			if ev.Reason == "eof" || ev.Reason == "error" {
 				m.dev.logf("screen", "播放结束（%s）", ev.Reason)
+				if msg := m.stderrText(); msg != "" {
+					m.dev.logf("screen", "mpv 报错: %s", firstLine(msg))
+				}
 				m.dev.onPlaybackEnded()
 			}
 		case "shutdown":
@@ -445,4 +453,14 @@ func asNetError(err error, target *net.Error) bool {
 		return true
 	}
 	return false
+}
+
+// stderrText 返回 mpv 最后的错误输出，用来解释「为什么秒退」。
+func (m *mpvScreen) stderrText() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stderr == nil {
+		return ""
+	}
+	return strings.TrimSpace(m.stderr.String())
 }

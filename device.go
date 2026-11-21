@@ -427,9 +427,23 @@ func (d *Device) Stop() *upnpError {
 	if d.scr != nil {
 		d.scr.Stop()
 	}
+	// 投屏结束就把播放器窗口收掉，不留一个空着的 mpv。
+	d.closeScreen()
 	d.logf("avt", "Stop")
 	d.emit(serviceAVTransport)
 	return nil
+}
+
+// closeScreen 关掉当前播放器并清空引用；下次 Play 会重新创建。
+// Close 会发 quit 并等进程退出，所以不要在持锁时调。
+func (d *Device) closeScreen() {
+	d.mu.Lock()
+	scr := d.scr
+	d.scr = nil
+	d.mu.Unlock()
+	if scr != nil {
+		scr.Close()
+	}
 }
 
 func (d *Device) Seek(target time.Duration) *upnpError {

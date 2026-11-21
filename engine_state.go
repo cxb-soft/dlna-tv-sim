@@ -23,7 +23,7 @@ func (d *Device) syncPosition(pos time.Duration) {
 	d.mu.Unlock()
 }
 
-// onPlaybackEnded：片子播完了，像电视一样回到 STOPPED。
+// onPlaybackEnded：片子播完了，像电视一样回到 STOPPED，并把播放器窗口收掉。
 func (d *Device) onPlaybackEnded() {
 	d.mu.Lock()
 	was := d.state == statePlaying || d.state == statePaused
@@ -36,6 +36,9 @@ func (d *Device) onPlaybackEnded() {
 	if was {
 		d.logf("avt", "播放结束")
 		d.emit(serviceAVTransport)
+		// Close 会等播放器进程退出，放到另一个 goroutine，避开引擎自己
+		// 的回调栈（mpv 的读循环里不能阻塞等自己所控的进程）。
+		go d.closeScreen()
 	}
 }
 
