@@ -3,281 +3,894 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>DLNA 电视模拟器</title>
 <style>
   :root{
-    --bg:#080b10; --panel:#11161d; --panel2:#161d26; --line:#232c38;
-    --text:#e7edf5; --dim:#8b98a9; --accent:#4c9aff; --ok:#39d98a; --warn:#ffb020; --err:#ff5d5d;
+    --bg:#06080c; --surface:#0c1118; --panel:rgba(17,23,32,.78); --panel-solid:#111720;
+    --line:rgba(255,255,255,.075); --line-strong:rgba(255,255,255,.14);
+    --text:#e8eef7; --dim:#8494a8; --faint:#5b6b80;
+    --accent:#6ea8fe; --accent-2:#5eead4; --ok:#4ade80; --warn:#ffb454; --err:#ff6b6b;
+    --radius:18px;
+    --shadow:0 18px 50px rgba(0,0,0,.45);
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);
-    font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
-  header{display:flex;justify-content:space-between;align-items:center;gap:16px;
-    padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
-  .brand{display:flex;align-items:center;gap:10px;font-size:16px}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
-  .meta{color:var(--dim);font-size:12px;text-align:right;line-height:1.6}
-  main{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:18px;padding:18px 20px}
-  @media(max-width:900px){main{grid-template-columns:1fr}}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
-  .screen-wrap{position:relative;border-radius:12px;overflow:hidden;background:#04070c;
-    border:1px solid var(--line);aspect-ratio:16/9;display:flex;align-items:center;justify-content:center}
-  .screen-wrap video{width:100%;height:100%;object-fit:contain;background:#000}
-  .idle{text-align:center;color:var(--dim)}
-  .idle .tv{font-size:46px;margin-bottom:10px;opacity:.8}
-  .idle .hint{font-size:12px;color:#5d6b7d;margin-top:6px}
-  .caption{display:flex;align-items:center;gap:10px;margin-top:12px;min-height:24px}
-  .badge{font-size:11px;letter-spacing:.06em;padding:3px 8px;border-radius:6px;
-    background:#1d2836;color:var(--dim);border:1px solid var(--line);white-space:nowrap}
-  .badge.playing{color:var(--ok);border-color:#1f4d3a;background:#0f2418}
-  .badge.paused{color:var(--warn);border-color:#4d3d16;background:#241d0b}
-  .badge.transitioning{color:var(--accent);border-color:#1e3a5c;background:#0d1a2b}
-  .title{font-size:13px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .progress{height:4px;background:#1a222d;border-radius:3px;margin-top:10px;overflow:hidden}
-  .progress>div{height:100%;width:0;background:linear-gradient(90deg,#2f6fd0,#4c9aff);transition:width .3s}
-  .times{display:flex;justify-content:space-between;color:var(--dim);font-size:11px;margin-top:6px;
-    font-variant-numeric:tabular-nums}
-  .remote label{display:block;color:var(--dim);font-size:12px;margin:14px 0 6px}
-  .row{display:flex;gap:8px}
-  button{flex:1;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
-    background:var(--panel2);color:var(--text);font-size:13px;cursor:pointer;transition:.15s}
-  button:hover{background:#1e2833;border-color:#31404f}
-  button.primary{background:linear-gradient(180deg,#2f6fd0,#245bb0);border-color:#2f6fd0;color:#fff}
-  button.primary:hover{filter:brightness(1.1)}
-  input[type=text],input[type=range]{width:100%}
-  input[type=text]{padding:10px 12px;border-radius:9px;border:1px solid var(--line);
-    background:#0c1118;color:var(--text);font-size:13px}
-  input[type=range]{-webkit-appearance:none;height:4px;border-radius:2px;background:#233041;outline:none}
-  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;
-    background:var(--accent);cursor:pointer;box-shadow:0 0 6px rgba(76,154,255,.6)}
-  .vol-row{display:flex;align-items:center;gap:10px}
-  .vol-row span{color:var(--dim);font-size:12px;min-width:56px;text-align:right}
-  .stats{margin-top:16px;padding-top:14px;border-top:1px solid var(--line);
-    display:grid;grid-template-columns:1fr 1fr;gap:8px;color:var(--dim);font-size:12px}
-  .stats b{color:var(--text);font-weight:500}
-  .logs{padding:0 20px 24px}
-  .loghead{color:var(--dim);font-size:12px;margin-bottom:8px;display:flex;justify-content:space-between}
-  pre#log{margin:0;height:190px;overflow:auto;background:#05080d;border:1px solid var(--line);
-    border-radius:12px;padding:12px;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;color:#9fb0c4}
-  pre#log .t{color:#54657a}
-  pre#log .k{display:inline-block;min-width:52px;color:#6f8bab}
-  pre#log .k.ssdp{color:#7dd3a0} pre#log .k.soap{color:#79b8ff}
-  pre#log .k.gena{color:#c39bff} pre#log .k.screen{color:#ffcc66}
-  pre#log .k.media{color:#66d9c0} pre#log .k.proxy{color:#ff9f7a}
-  .mute{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px;margin-top:10px}
-  .mute input{width:auto}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 500px at 12% -10%, rgba(110,168,254,.10), transparent 60%),
+      radial-gradient(700px 480px at 92% 4%, rgba(94,234,212,.07), transparent 60%);
+    background-attachment:fixed;
+  }
+  ::selection{background:rgba(110,168,254,.3)}
+  button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+  input{font:inherit;color:inherit}
+
+  /* ---------- 顶栏 ---------- */
+  .appbar{
+    position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;
+    gap:18px;padding:14px 24px;border-bottom:1px solid var(--line);
+    background:rgba(8,11,16,.72);backdrop-filter:blur(18px) saturate(140%);
+  }
+  .brand{display:flex;align-items:center;gap:13px;min-width:0}
+  .mark{
+    width:40px;height:40px;border-radius:12px;display:grid;place-items:center;flex:0 0 auto;
+    background:linear-gradient(145deg,rgba(110,168,254,.22),rgba(94,234,212,.14));
+    border:1px solid rgba(110,168,254,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.08);
+  }
+  .mark svg{width:21px;height:21px;stroke:#cfe0ff}
+  .names{min-width:0}
+  .title-row{display:flex;align-items:center;gap:10px}
+  h1{font-size:15.5px;font-weight:600;margin:0;letter-spacing:.01em;white-space:nowrap;
+     overflow:hidden;text-overflow:ellipsis;max-width:44vw}
+  .sub{color:var(--faint);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;
+    font-size:11px;letter-spacing:.03em;color:var(--dim);
+    background:rgba(255,255,255,.05);border:1px solid var(--line);white-space:nowrap
+  }
+  .pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.8}
+  .pill.playing{color:var(--ok);background:rgba(74,222,128,.09);border-color:rgba(74,222,128,.25)}
+  .pill.paused{color:var(--warn);background:rgba(255,180,84,.09);border-color:rgba(255,180,84,.25)}
+  .pill.buffering{color:var(--accent);background:rgba(110,168,254,.1);border-color:rgba(110,168,254,.28)}
+  .actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+  .ghost{
+    padding:8px 13px;border-radius:10px;border:1px solid var(--line);color:var(--dim);
+    background:rgba(255,255,255,.02);font-size:12.5px;text-decoration:none;transition:.16s
+  }
+  .ghost:hover{color:var(--text);border-color:var(--line-strong);background:rgba(255,255,255,.05)}
+  .ghost.round{width:32px;height:32px;padding:0;display:grid;place-items:center;border-radius:50%}
+
+  /* ---------- 布局 ---------- */
+  .wrap{max-width:1560px;margin:0 auto;padding:22px 24px 40px;
+        display:grid;grid-template-columns:minmax(0,1fr) 372px;gap:20px;align-items:start}
+  .col{display:flex;flex-direction:column;gap:20px;min-width:0}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    backdrop-filter:blur(14px);box-shadow:0 1px 0 rgba(255,255,255,.03) inset
+  }
+
+  /* ---------- 舞台 ---------- */
+  .stage-card{padding:14px}
+  .stage{
+    position:relative;aspect-ratio:16/9;border-radius:14px;overflow:hidden;
+    background:radial-gradient(120% 120% at 50% 0%,#0b1420 0%,#02050a 70%);
+    border:1px solid rgba(255,255,255,.06);
+    box-shadow:0 30px 70px -30px rgba(0,0,0,.9), inset 0 0 90px rgba(0,0,0,.6);
+    display:grid;place-items:center;
+  }
+  .stage video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none}
+  .idle{position:relative;text-align:center;color:var(--faint);padding:20px;z-index:1}
+  .idle .ring{
+    width:96px;height:96px;margin:0 auto 18px;border-radius:50%;display:grid;place-items:center;
+    border:1px solid rgba(110,168,254,.22);position:relative;
+    background:radial-gradient(circle,rgba(110,168,254,.12),transparent 70%);
+  }
+  .idle .ring::after{
+    content:"";position:absolute;inset:-1px;border-radius:50%;border:1px solid rgba(94,234,212,.18);
+    animation:breathe 3.4s ease-in-out infinite;
+  }
+  @keyframes breathe{0%,100%{transform:scale(1);opacity:.55}50%{transform:scale(1.13);opacity:0}}
+  .idle svg{width:42px;height:42px;stroke:#7f92ad;opacity:.9}
+  .idle .big{color:#b7c6da;font-size:14.5px;margin-bottom:5px}
+  .idle .small{font-size:12px;color:var(--faint)}
+  .engine,.live{
+    position:absolute;top:14px;z-index:2;font-size:11px;letter-spacing:.05em;
+    padding:4px 10px;border-radius:999px;backdrop-filter:blur(10px)
+  }
+  .engine{left:14px;color:#c6d8f2;background:rgba(10,16,24,.62);border:1px solid rgba(255,255,255,.1)}
+  .live{right:14px;display:flex;align-items:center;gap:6px;color:var(--dim);
+        background:rgba(10,16,24,.62);border:1px solid rgba(255,255,255,.1)}
+  .live i{width:6px;height:6px;border-radius:50%;background:var(--faint)}
+  .live.on{color:var(--ok)}
+  .live.on i{background:var(--ok);box-shadow:0 0 10px rgba(74,222,128,.8);animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .stage-info{
+    position:absolute;left:0;right:0;bottom:0;z-index:2;padding:44px 20px 16px;
+    background:linear-gradient(to top,rgba(2,5,10,.88),rgba(2,5,10,0));
+    pointer-events:none
+  }
+  .now{font-size:15px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+       text-shadow:0 2px 14px rgba(0,0,0,.8)}
+  .now-sub{font-size:12px;color:#93a4b9;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* ---------- 控制区 ---------- */
+  .controls{padding:16px 6px 4px}
+  .scrub{display:flex;align-items:center;gap:12px}
+  .scrub span{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums;min-width:52px}
+  .scrub span:last-child{text-align:right}
+  input[type=range]{-webkit-appearance:none;appearance:none;background:transparent;outline:none}
+  .scrub input{flex:1;height:22px;cursor:pointer}
+  input[type=range]::-webkit-slider-runnable-track{
+    height:5px;border-radius:99px;
+    background:linear-gradient(to right,var(--accent) var(--p,0%),rgba(255,255,255,.11) var(--p,0%))
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;width:13px;height:13px;margin-top:-4px;border-radius:50%;
+    background:#fff;box-shadow:0 0 0 4px rgba(110,168,254,.18),0 2px 8px rgba(0,0,0,.6);
+    transition:transform .15s
+  }
+  .scrub input:hover::-webkit-slider-thumb{transform:scale(1.18)}
+  input[type=range]:disabled::-webkit-slider-runnable-track{background:rgba(255,255,255,.08)}
+  input[type=range]:disabled::-webkit-slider-thumb{background:#4a5768;box-shadow:none}
+
+  .transport{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:10px;flex-wrap:wrap}
+  .tleft,.tright{display:flex;align-items:center;gap:6px}
+  .icon-btn{
+    width:38px;height:38px;border-radius:11px;display:grid;place-items:center;color:#a9b8cc;
+    transition:.15s
+  }
+  .icon-btn:hover{background:rgba(255,255,255,.07);color:#fff}
+  .icon-btn:disabled{opacity:.3;cursor:not-allowed;background:none}
+  .icon-btn svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.7;
+    stroke-linecap:round;stroke-linejoin:round}
+  .play-btn{
+    width:56px;height:56px;border-radius:50%;display:grid;place-items:center;margin:0 4px;
+    background:linear-gradient(160deg,#7cb4ff,#4f86e8);color:#04101f;
+    box-shadow:0 10px 30px -8px rgba(110,168,254,.7), inset 0 1px 0 rgba(255,255,255,.4);
+    transition:.18s
+  }
+  .play-btn:hover{transform:translateY(-1px);filter:brightness(1.06)}
+  .play-btn:active{transform:scale(.97)}
+  .play-btn svg{width:24px;height:24px;fill:currentColor;stroke:none}
+  .play-btn svg.stroke{fill:none;stroke:currentColor;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+  .vol{display:flex;align-items:center;gap:8px;padding:0 6px}
+  .vol input{width:92px;height:20px;cursor:pointer}
+  .vol input::-webkit-slider-runnable-track{height:4px}
+  .vol input::-webkit-slider-thumb{width:11px;height:11px;margin-top:-3.5px}
+  .chip-btn{
+    height:34px;padding:0 12px;border-radius:10px;border:1px solid var(--line);color:#a9b8cc;
+    font-size:12.5px;background:rgba(255,255,255,.02);transition:.15s;white-space:nowrap
+  }
+  .chip-btn:hover:not(:disabled){color:#fff;border-color:var(--line-strong);background:rgba(255,255,255,.06)}
+  .chip-btn:disabled{opacity:.35;cursor:not-allowed}
+  .chip-btn.active{color:var(--accent);border-color:rgba(110,168,254,.45);background:rgba(110,168,254,.12)}
+  .sep{width:1px;height:22px;background:var(--line);margin:0 4px}
+
+  /* ---------- 右栏 ---------- */
+  .rail{display:flex;flex-direction:column;gap:16px;min-width:0}
+  .rail .card{padding:16px 16px 15px}
+  .rail h2{font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);
+           margin:0 0 12px;font-weight:600}
+  .field{display:block;margin-bottom:10px}
+  .field span{display:block;font-size:12px;color:var(--dim);margin-bottom:6px}
+  .input{
+    width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);
+    background:rgba(4,7,12,.6);color:var(--text);font-size:13px;outline:none;transition:.15s
+  }
+  .input:focus{border-color:rgba(110,168,254,.5);box-shadow:0 0 0 3px rgba(110,168,254,.1)}
+  .row{display:flex;gap:8px;align-items:center}
+  .row .input{flex:1;min-width:0}
+  .primary{
+    padding:10px 16px;border-radius:10px;font-size:13px;font-weight:500;color:#04101f;
+    background:linear-gradient(160deg,#8cc0ff,#5c95f0);white-space:nowrap;
+    box-shadow:0 8px 22px -10px rgba(110,168,254,.8)
+  }
+  .primary:hover{filter:brightness(1.06)}
+  .ghost.wide{width:100%;margin-top:12px}
+  .recent{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+  .recent .tag{
+    max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    padding:5px 9px;border-radius:8px;font-size:11.5px;color:var(--dim);
+    border:1px solid var(--line);background:rgba(255,255,255,.02);cursor:pointer
+  }
+  .recent .tag:hover{color:var(--text);border-color:var(--line-strong)}
+  dl.meta{margin:14px 0 0;display:grid;grid-template-columns:1fr;gap:7px}
+  dl.meta div{display:flex;justify-content:space-between;gap:12px;font-size:12px}
+  dl.meta dt{color:var(--faint);flex:0 0 auto}
+  dl.meta dd{margin:0;color:#b6c4d6;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+  .metric{min-width:0}
+  .metric b{display:block;font-size:16px;font-weight:600;letter-spacing:-.01em;
+            font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .metric span{font-size:11.5px;color:var(--faint)}
+  #diag{margin:12px 0 0;white-space:pre-wrap;font:11.5px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;
+        color:#9fb0c4;background:rgba(3,6,10,.7);border:1px solid var(--line);border-radius:10px;padding:11px}
+
+  /* ---------- 日志 ---------- */
+  .log-card{padding:14px 16px 16px}
+  .log-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .log-head h2{font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);margin:0}
+  .log-tools{display:flex;gap:8px;align-items:center}
+  .toggle{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim);cursor:pointer}
+  .toggle input{accent-color:var(--accent)}
+  #log{height:168px;overflow:auto;font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;
+       color:#93a5b9;background:rgba(3,6,10,.66);border:1px solid var(--line);border-radius:12px;padding:11px 13px}
+  #log .line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #log .t{color:#4d5f74;margin-right:6px}
+  #log .k{display:inline-block;min-width:44px;margin-right:8px;font-weight:500}
+  #log .k.ssdp{color:#6fd6a2} #log .k.soap{color:#7fb7ff} #log .k.gena{color:#bb9bfa}
+  #log .k.screen{color:#f5c76a} #log .k.media{color:#5fd8c4} #log .k.proxy{color:#ff9f7a}
+  #log .k.player{color:#8fe3ff} #log .k.http,#log .k.ui,#log .k.config,#log .k.avt,#log .k.rcs{color:#8ea3bd}
+
+  /* ---------- 浮动菜单 / 提示 ---------- */
+  .floating{
+    position:fixed;z-index:60;min-width:186px;max-height:60vh;overflow:auto;
+    background:rgba(16,22,31,.96);border:1px solid var(--line-strong);border-radius:13px;
+    box-shadow:var(--shadow);padding:7px;backdrop-filter:blur(20px);
+    animation:pop .13s ease-out
+  }
+  @keyframes pop{from{opacity:0;transform:translateY(5px) scale(.98)}to{opacity:1;transform:none}}
+  .floating .sec{padding:6px 9px 4px;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+  .floating .item{
+    display:flex;align-items:center;justify-content:space-between;gap:14px;width:100%;
+    padding:8px 10px;border-radius:8px;font-size:13px;color:#c3d0e0;text-align:left
+  }
+  .floating .item:hover{background:rgba(255,255,255,.07);color:#fff}
+  .floating .item.on{color:var(--accent);background:rgba(110,168,254,.1)}
+  .floating .item .hint{font-size:11px;color:var(--faint)}
+  .floating .item.on .hint{color:inherit;opacity:.85}
+  .toasts{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:80;
+          display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
+  .toast{
+    padding:9px 15px;border-radius:10px;font-size:12.5px;color:#e9f0f9;
+    background:rgba(18,25,35,.95);border:1px solid var(--line-strong);
+    box-shadow:var(--shadow);animation:pop .16s ease-out
+  }
+  .toast.err{color:#ffd7d7;border-color:rgba(255,107,107,.4);background:rgba(40,16,18,.95)}
+
+  @media(max-width:1080px){
+    .wrap{grid-template-columns:1fr}
+    .rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  }
+  @media(max-width:640px){
+    .appbar{padding:12px 14px}
+    .wrap{padding:14px}
+    h1{max-width:38vw}
+    .scrub span{min-width:44px;font-size:11px}
+    .vol input{width:64px}
+    .stage-card{padding:10px}
+  }
 </style>
 </head>
 <body>
-<header>
-  <div class="brand"><span class="dot"></span><b id="name">DLNA 电视</b></div>
-  <div class="meta">
-    <div id="addr">—</div>
-    <div id="uuid">—</div>
+
+<header class="appbar">
+  <div class="brand">
+    <div class="mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2.5" y="5" width="19" height="12.5" rx="2.5"/><path d="M8 21h8M12 17.5V21"/>
+      </svg>
+    </div>
+    <div class="names">
+      <div class="title-row">
+        <h1 id="name">DLNA 电视</h1>
+        <span class="pill" id="statePill">待机</span>
+      </div>
+      <div class="sub" id="addr">—</div>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="ghost" id="diagBtn">网络自检</button>
+    <a class="ghost" href="/screen" target="_blank" rel="noopener">全屏页</a>
+    <button class="ghost round" id="keysBtn" title="快捷键">?</button>
   </div>
 </header>
 
-<main>
-  <section class="card">
-    <div class="screen-wrap">
-      <video id="preview" playsinline muted></video>
-      <div class="idle" id="idle">
-        <div class="tv">📺</div>
-        <div>等待投屏…</div>
-        <div class="hint">在手机视频 App 里点“投屏”，选中这台电视</div>
+<main class="wrap">
+  <div class="col">
+    <section class="card stage-card">
+      <div class="stage" id="stage">
+        <video id="preview" playsinline></video>
+        <div class="idle" id="idle">
+          <div class="ring">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2.5" y="5" width="19" height="12.5" rx="2.5"/><path d="M8 21h8M12 17.5V21"/>
+            </svg>
+          </div>
+          <div class="big">等待投屏</div>
+          <div class="small">在手机视频 App 里点“投屏”，选中这台电视</div>
+        </div>
+        <div class="engine" id="engine">—</div>
+        <div class="live" id="live"><i></i>在线</div>
+        <div class="stage-info">
+          <div class="now" id="nowTitle">还没有投屏</div>
+          <div class="now-sub" id="nowSub">控制台会跟着手机上的遥控实时更新</div>
+        </div>
       </div>
-    </div>
-    <div class="caption">
-      <span class="badge" id="state">NO_MEDIA_PRESENT</span>
-      <span class="title" id="title"></span>
-    </div>
-    <div class="progress"><div id="bar"></div></div>
-    <div class="times"><span id="pos">00:00:00</span><span id="dur">00:00:00</span></div>
-  </section>
 
-  <aside class="card remote">
-    <div class="row">
-      <button data-act="play" class="primary">▶ 播放</button>
-      <button data-act="pause">⏸ 暂停</button>
-      <button data-act="stop">⏹ 停止</button>
-    </div>
+      <div class="controls">
+        <div class="scrub">
+          <span id="pos">00:00:00</span>
+          <input id="seek" type="range" min="0" max="1000" value="0" step="1" disabled aria-label="播放进度">
+          <span id="dur">00:00:00</span>
+        </div>
 
-    <label>音量 <span id="volLabel" style="color:var(--text)">30</span></label>
-    <div class="vol-row">
-      <input id="vol" type="range" min="0" max="100" step="1">
-      <span id="volPct">30%</span>
-    </div>
-    <label class="mute"><input id="mute" type="checkbox"> 静音</label>
+        <div class="transport">
+          <div class="tleft">
+            <button class="icon-btn" id="back10" title="后退 10 秒">
+              <svg viewBox="0 0 24 24"><path d="M11 5 4 12l7 7"/><path d="M20 5l-7 7 7 7"/></svg>
+            </button>
+            <button class="play-btn" id="playBtn" title="播放 / 暂停">
+              <svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5.5v13l11-6.5z"/></svg>
+            </button>
+            <button class="icon-btn" id="fwd10" title="前进 10 秒">
+              <svg viewBox="0 0 24 24"><path d="m13 5 7 7-7 7"/><path d="M4 5l7 7-7 7"/></svg>
+            </button>
+            <button class="icon-btn" id="stopBtn" title="停止">
+              <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            </button>
+          </div>
 
-    <label>进度</label>
-    <input id="seek" type="range" min="0" max="1000" step="1" value="0">
+          <div class="tright">
+            <div class="vol">
+              <button class="icon-btn" id="muteBtn" title="静音">
+                <svg viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9a4.5 4.5 0 0 1 0 6" id="wave1"/><path d="M18.5 6.5a8 8 0 0 1 0 11" id="wave2"/></svg>
+              </button>
+              <input id="vol" type="range" min="0" max="100" step="1" value="30" aria-label="音量">
+            </div>
+            <div class="sep"></div>
+            <button class="chip-btn" id="speedBtn">1×</button>
+            <button class="chip-btn" id="trackBtn">音轨 / 字幕</button>
+            <button class="chip-btn" id="aspectBtn">比例 · 自动</button>
+            <button class="icon-btn" id="loopBtn" title="循环播放">
+              <svg viewBox="0 0 24 24"><path d="M17 2.5 20.5 6 17 9.5"/><path d="M3.5 12V9.5A3.5 3.5 0 0 1 7 6h13.5"/><path d="M7 21.5 3.5 18 7 14.5"/><path d="M20.5 12v2.5a3.5 3.5 0 0 1-3.5 3.5H3.5"/></svg>
+            </button>
+            <button class="icon-btn" id="shotBtn" title="截取当前画面">
+              <svg viewBox="0 0 24 24"><rect x="3" y="6.5" width="18" height="13" rx="2.5"/><circle cx="12" cy="13" r="3.4"/><path d="M8.5 6.5 10 4h4l1.5 2.5"/></svg>
+            </button>
+            <button class="icon-btn" id="fsBtn" title="全屏">
+              <svg viewBox="0 0 24 24"><path d="M4 9V4h5"/><path d="M20 9V4h-5"/><path d="M4 15v5h5"/><path d="M20 15v5h-5"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
 
-    <label>投个地址进来（模拟手机投屏）</label>
-    <input id="castUrl" type="text" placeholder="https://…/index.m3u8 或 .mp4">
-    <div class="row" style="margin-top:8px">
-      <button id="castBtn" class="primary">投屏</button>
-      <button id="clearBtn">断开</button>
-    </div>
+    <section class="card log-card">
+      <div class="log-head">
+        <h2>事件流</h2>
+        <div class="log-tools">
+          <label class="toggle"><input type="checkbox" id="autoScroll" checked>自动滚动</label>
+          <button class="ghost round" id="clearLog" title="清空显示">✕</button>
+        </div>
+      </div>
+      <div id="log"></div>
+    </section>
+  </div>
 
-    <label>设备名</label>
-    <div class="row">
-      <input id="devName" type="text">
-      <button id="renameBtn" style="flex:0 0 76px">改名</button>
-    </div>
+  <aside class="rail">
+    <section class="card">
+      <h2>投屏</h2>
+      <label class="field">
+        <span>视频地址</span>
+        <input class="input" id="castUrl" type="text" placeholder="https://…/index.m3u8 或 .mp4">
+      </label>
+      <div class="row">
+        <button class="primary" id="castBtn" style="flex:1">投到这个地址</button>
+        <button class="ghost" id="clearBtn">断开</button>
+      </div>
+      <div class="recent" id="recent"></div>
+    </section>
 
-    <div class="stats">
-      <div>播放引擎 <b id="player">—</b></div>
-      <div>订阅数 <b id="subs">0</b></div>
-      <div>SOAP 调用 <b id="soap">0</b></div>
-      <div>M-SEARCH <b id="ms">0</b></div>
-      <div style="grid-column:1/-1">拉流 <b id="probe">—</b></div>
-    </div>
-    <button id="diagBtn" style="margin-top:12px">网络自检（手机搜不到时点这里）</button>
-    <pre id="diag" style="display:none;margin:10px 0 0;white-space:pre-wrap;font:11px/1.6 ui-monospace,Menlo,monospace;color:#9fb0c4;background:#05080d;border:1px solid var(--line);border-radius:8px;padding:10px"></pre>
+    <section class="card">
+      <h2>设备</h2>
+      <label class="field">
+        <span>在手机投屏列表里显示的名字</span>
+        <div class="row">
+          <input class="input" id="devName" type="text">
+          <button class="ghost" id="renameBtn">改名</button>
+        </div>
+      </label>
+      <dl class="meta">
+        <div><dt>地址</dt><dd id="mAddr">—</dd></div>
+        <div><dt>UUID</dt><dd id="mUuid">—</dd></div>
+        <div><dt>版本</dt><dd id="mVer">—</dd></div>
+        <div><dt>已运行</dt><dd id="mUp">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="card">
+      <h2>实时</h2>
+      <div class="metrics">
+        <div class="metric"><b id="mEngine">—</b><span>播放引擎</span></div>
+        <div class="metric"><b id="mBitrate">—</b><span>码率</span></div>
+        <div class="metric"><b id="mFps">—</b><span>帧率</span></div>
+        <div class="metric"><b id="mSubs">0</b><span>事件订阅</span></div>
+        <div class="metric"><b id="mSoap">0</b><span>SOAP 调用</span></div>
+        <div class="metric"><b id="mMs">0</b><span>发现请求</span></div>
+      </div>
+      <button class="ghost wide" id="diagBtn2">网络自检</button>
+      <pre id="diag" hidden></pre>
+    </section>
   </aside>
 </main>
 
-<section class="logs">
-  <div class="loghead"><span>事件流</span><span><a href="/screen" style="color:#6f8bab">全屏播放页 →</a></span></div>
-  <pre id="log"></pre>
-</section>
+<div class="toasts" id="toasts"></div>
 
 <script>
-const $ = s => document.querySelector(s);
-const STATE_CN = {
-  PLAYING:'播放中', PAUSED_PLAYBACK:'已暂停', STOPPED:'已停止',
-  NO_MEDIA_PRESENT:'待机', TRANSITIONING:'缓冲中'
-};
-const CLS = {PLAYING:'playing',PAUSED_PLAYBACK:'paused',TRANSITIONING:'transitioning'};
-let lastLogId = 0, seekDragging = false, volDragging = false, lastUri = '';
+(() => {
+  const $ = (s) => document.querySelector(s);
+  const STATE_CN = {
+    PLAYING: '播放中', PAUSED_PLAYBACK: '已暂停', STOPPED: '已停止',
+    NO_MEDIA_PRESENT: '待机', TRANSITIONING: '缓冲中'
+  };
+  const PILL_CLS = { PLAYING: 'playing', PAUSED_PLAYBACK: 'paused', TRANSITIONING: 'buffering' };
+  const ENGINE_CN = { mpv: 'mpv 全屏', vlc: 'VLC 全屏', web: '网页播放' };
+  const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+  const ASPECTS = [
+    { v: 'auto', label: '自动' }, { v: '16:9', label: '16:9' },
+    { v: '4:3', label: '4:3' }, { v: '21:9', label: '21:9' }
+  ];
 
-function fmt(sec){
-  sec = Math.max(0, Math.floor(sec||0));
-  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
-  return [h,m,s].map(v=>String(v).padStart(2,'0')).join(':');
-}
+  let S = null;               // 最近一次 /api/state
+  let seekDragging = false;
+  let volDragging = false;
+  let lastLogId = 0;
+  let lastPreviewUri = '';
+  let menuEl = null;
 
-function render(s){
-  $('#name').textContent = s.friendly_name;
-  $('#devName').value = s.friendly_name;
-  $('#addr').textContent = (s.addresses||[]).map(a=>a+':'+s.port).join('  ·  ') || ('127.0.0.1:'+s.port);
-  $('#uuid').textContent = 'uuid:' + s.uuid;
-  const st = s.state || 'NO_MEDIA_PRESENT';
-  const badge = $('#state');
-  badge.textContent = STATE_CN[st] || st;
-  badge.className = 'badge ' + (CLS[st] || '');
-  $('#title').textContent = s.title || '';
-  const perc = s.duration > 0 ? Math.min(100, s.position / s.duration * 100) : 0;
-  $('#bar').style.width = perc.toFixed(1) + '%';
-  $('#pos').textContent = fmt(s.position);
-  $('#dur').textContent = fmt(s.duration);
-  if (!volDragging){
-    $('#vol').value = s.volume;
-    $('#volLabel').textContent = s.volume;
-    $('#volPct').textContent = s.volume + '%';
+  /* ---------- 小工具 ---------- */
+  const fmt = (sec) => {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+      : `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  };
+  const fmtLong = (sec) => {
+    sec = Math.max(0, Math.floor(sec || 0));
+    return [Math.floor(sec/3600), Math.floor(sec%3600/60), sec%60]
+      .map(x => String(x).padStart(2,'0')).join(':');
+  };
+  const toast = (text, isErr) => {
+    const el = document.createElement('div');
+    el.className = 'toast' + (isErr ? ' err' : '');
+    el.textContent = text;
+    $('#toasts').appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .25s'; }, 2200);
+    setTimeout(() => el.remove(), 2600);
+  };
+  async function post(path, body) {
+    const r = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    let j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (!r.ok) toast(j.error || ('请求失败 ' + r.status), true);
+    return j;
   }
-  $('#mute').checked = !!s.mute;
-  if (!seekDragging && s.duration > 0){
-    $('#seek').value = Math.round(s.position / s.duration * 1000);
-  }
-  $('#player').textContent = s.player === 'vlc' ? 'VLC 全屏' : '网页';
-  $('#subs').textContent = s.subscribers;
-  $('#soap').textContent = s.soap_calls;
-  $('#ms').textContent = s.msearch;
-  const p = s.probe || {};
-  $('#probe').textContent = p.status ? (p.status + (p.detail ? ' · ' + p.detail : '') +
-     (p.content_type ? ' · ' + p.content_type : '')) : '—';
+  const has = (cap) => !!(S && (S.capabilities || []).includes(cap));
 
-  // 网页引擎时在这里直接看画面；VLC 引擎下画在 VLC 自己的窗口里
+  /* ---------- 浮动菜单 ---------- */
+  function closeMenu() {
+    if (menuEl) { menuEl.remove(); menuEl = null; }
+    document.querySelectorAll('.chip-btn.menu-open, .icon-btn.menu-open')
+      .forEach(b => b.classList.remove('menu-open'));
+  }
+  function showMenu(anchor, sections) {
+    const same = menuEl && menuEl.dataset.anchor === (anchor.id || '');
+    closeMenu();
+    if (same) return;
+    const el = document.createElement('div');
+    el.className = 'floating';
+    el.dataset.anchor = anchor.id || '';
+    for (const sec of sections) {
+      if (sec.title) {
+        const h = document.createElement('div');
+        h.className = 'sec'; h.textContent = sec.title;
+        el.appendChild(h);
+      }
+      for (const it of sec.items) {
+        const b = document.createElement('button');
+        b.className = 'item' + (it.active ? ' on' : '');
+        const left = document.createElement('span');
+        left.textContent = it.label;
+        b.appendChild(left);
+        if (it.hint) {
+          const h = document.createElement('span');
+          h.className = 'hint'; h.textContent = it.hint;
+          b.appendChild(h);
+        }
+        b.onclick = () => { closeMenu(); it.onPick && it.onPick(); };
+        el.appendChild(b);
+      }
+    }
+    document.body.appendChild(el);
+    const r = anchor.getBoundingClientRect();
+    const w = el.offsetWidth, h = el.offsetHeight;
+    let left = Math.min(window.innerWidth - w - 12, Math.max(12, r.left + r.width / 2 - w / 2));
+    let top = r.top - h - 10;
+    if (top < 12) top = r.bottom + 10;
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+    menuEl = el;
+    anchor.classList.add('menu-open');
+  }
+  document.addEventListener('click', (e) => {
+    if (menuEl && !menuEl.contains(e.target) && !e.target.closest('#speedBtn,#trackBtn,#aspectBtn,#keysBtn')) {
+      closeMenu();
+    }
+  });
+  window.addEventListener('resize', closeMenu);
+
+  /* ---------- 进度/音量滑块填色 ---------- */
+  function paintRange(el) {
+    const min = +el.min || 0, max = +el.max || 100, v = +el.value || 0;
+    const p = max > min ? ((v - min) / (max - min)) * 100 : 0;
+    el.style.setProperty('--p', p.toFixed(2) + '%');
+  }
+
+  /* ---------- 渲染 ---------- */
+  function render(s) {
+    S = s;
+    const st = s.state || 'NO_MEDIA_PRESENT';
+    const pill = $('#statePill');
+    pill.textContent = STATE_CN[st] || st;
+    pill.className = 'pill ' + (PILL_CLS[st] || '');
+
+    $('#name').textContent = s.friendly_name || 'DLNA 电视';
+    $('#addr').textContent = (s.addresses || []).map(a => a + ':' + s.port).join('  ·  ') || ('127.0.0.1:' + s.port);
+    $('#mAddr').textContent = (s.addresses || [])[0] ? (s.addresses[0] + ':' + s.port) : ('127.0.0.1:' + s.port);
+    $('#mUuid').textContent = 'uuid:' + s.uuid;
+    $('#mVer').textContent = 'v' + s.version;
+    $('#mUp').textContent = fmtLong(s.uptime).replace(/^00:/, '');
+    if (document.activeElement !== $('#devName')) $('#devName').value = s.friendly_name || '';
+
+    const engine = s.player || 'web';
+    $('#engine').textContent = ENGINE_CN[engine] || engine;
+    $('#mEngine').textContent = ENGINE_CN[engine] || engine;
+    const bitrate = s.stats && s.stats.bitrate_kbps;
+    $('#mBitrate').textContent = bitrate > 0 ? (bitrate >= 1000 ? (bitrate/1000).toFixed(1) + ' Mbps' : Math.round(bitrate) + ' kbps') : '—';
+    const fps = s.stats && s.stats.fps;
+    $('#mFps').textContent = fps > 0 ? Math.round(fps) + ' fps' : '—';
+    $('#mSubs').textContent = s.subscribers || 0;
+    $('#mSoap').textContent = s.soap_calls || 0;
+    $('#mMs').textContent = s.msearch || 0;
+
+    const live = $('#live');
+    live.classList.toggle('on', st === 'PLAYING');
+    live.lastChild.textContent = st === 'PLAYING' ? '播放中' : (st === 'PAUSED_PLAYBACK' ? '已暂停' : '在线');
+
+    const title = s.title || '还没有投屏';
+    $('#nowTitle').textContent = title;
+    document.title = (st === 'PLAYING' || st === 'PAUSED_PLAYBACK') ? `${title} · DLNA 电视` : 'DLNA 电视模拟器';
+    $('#nowSub').textContent = s.uri
+      ? (engine === 'web' ? '网页播放（受浏览器格式限制）' : '画面在这台电脑的全屏窗口里，这里显示实时状态')
+      : '在手机视频 App 里点“投屏”，选中这台电视';
+
+    // 进度
+    const dur = s.duration || 0, pos = s.position || 0;
+    $('#pos').textContent = fmt(pos);
+    $('#dur').textContent = fmt(dur);
+    $('#seek').disabled = !(dur > 0);
+    if (!seekDragging) {
+      $('#seek').value = dur > 0 ? Math.round(pos / dur * 1000) : 0;
+      paintRange($('#seek'));
+    }
+
+    // 播放按钮
+    const playing = st === 'PLAYING';
+    const icon = $('#playIcon');
+    icon.setAttribute('class', '');
+    if (st === 'TRANSITIONING') {
+      icon.outerHTML = '<svg viewBox="0 0 24 24" id="playIcon" class="stroke"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v6h-6"/></svg>';
+      if (window.playIconTimer) clearInterval(window.playIconTimer);
+      const cur = document.getElementById('playIcon');
+      cur.style.animation = 'spin 1s linear infinite';
+    } else if (playing) {
+      icon.outerHTML = '<svg viewBox="0 0 24 24" id="playIcon"><rect x="7" y="5" width="4" height="14" rx="1.2"/><rect x="13" y="5" width="4" height="14" rx="1.2"/></svg>';
+    } else {
+      icon.outerHTML = '<svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5.5v13l11-6.5z"/></svg>';
+    }
+    $('#playBtn').disabled = !s.uri;
+    $('#back10').disabled = $('#fwd10').disabled = !s.uri;
+    $('#stopBtn').disabled = !s.uri;
+
+    // 音量
+    if (!volDragging) {
+      $('#vol').value = s.volume;
+      paintRange($('#vol'));
+    }
+    const muted = !!s.mute || s.volume === 0;
+    $('#wave1').style.opacity = muted ? 0.15 : 1;
+    $('#wave2').style.opacity = muted ? 0.15 : 1;
+    $('#muteBtn').classList.toggle('active', muted);
+
+    // 高级控制
+    const speed = s.speed || 1;
+    $('#speedBtn').textContent = (Number.isInteger(speed) ? speed : speed.toFixed(2).replace(/0+$/, '')) + '×';
+    $('#loopBtn').classList.toggle('active', !!s.loop);
+    const aspect = ASPECTS.find(a => a.v === s.aspect) || ASPECTS[0];
+    $('#aspectBtn').textContent = '比例 · ' + aspect.label;
+    const trackCount = (s.tracks || []).length;
+    $('#trackBtn').textContent = trackCount ? `音轨 / 字幕 · ${trackCount}` : '音轨 / 字幕';
+    $('#trackBtn').disabled = !has('tracks') || !s.uri;
+    $('#aspectBtn').disabled = !has('aspect');
+    $('#shotBtn').disabled = !has('screenshot') || !s.uri;
+    $('#loopBtn').disabled = !has('loop');
+
+  // 网页播放时在控制台里看画面
   const v = $('#preview');
-  if (s.player === 'web' && s.uri && s.uri !== lastUri){
-    lastUri = s.uri;
-    v.src = '/proxy?url=' + encodeURIComponent(s.uri);
-    v.style.display = 'block';
-    $('#idle').style.display = 'none';
-  } else if (!s.uri){
-    lastUri = '';
-    v.removeAttribute('src'); v.load();
-    v.style.display = 'none';
-    $('#idle').style.display = 'block';
+  v.addEventListener('loadedmetadata', () => {
+    const d = v.duration;
+    if (isFinite(d) && d > 1) post('/api/report', { duration: d });
+  });
+  v.addEventListener('ended', () => post('/api/report', { ended: true }));
+    if (engine === 'web' && s.uri) {
+      if (s.uri !== lastPreviewUri) {
+        lastPreviewUri = s.uri;
+        v.src = '/proxy?url=' + encodeURIComponent(s.uri);
+      }
+      v.style.display = 'block';
+      $('#idle').style.display = 'none';
+      v.playbackRate = Math.min(4, Math.max(0.25, speed));
+      v.loop = !!s.loop;
+      if (st === 'PLAYING') { v.play().catch(() => {}); }
+      else if (st === 'PAUSED_PLAYBACK') { v.pause(); }
+    } else {
+      if (lastPreviewUri) {
+        lastPreviewUri = '';
+        v.pause(); v.removeAttribute('src'); v.load();
+      }
+      v.style.display = 'none';
+      $('#idle').style.display = s.uri ? 'none' : 'grid';
+    }
   }
-  if (s.state === 'PLAYING' && v.style.display === 'block') { v.play().catch(()=>{}); }
-  if (s.state !== 'PLAYING' && v.style.display === 'block') { v.pause(); }
-}
 
-async function post(url, body){
-  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-  try { return await r.json(); } catch(e){ return {}; }
-}
+  /* ---------- 交互 ---------- */
+  $('#playBtn').onclick = () => {
+    if (!S) return;
+    post('/api/control', { action: S.state === 'PLAYING' ? 'pause' : 'play' });
+  };
+  $('#stopBtn').onclick = () => post('/api/control', { action: 'stop' });
+  $('#back10').onclick = () => post('/api/player', { action: 'seekrel', value: -10 });
+  $('#fwd10').onclick = () => post('/api/player', { action: 'seekrel', value: 10 });
 
-document.querySelectorAll('button[data-act]').forEach(b=>{
-  b.onclick = ()=> post('/api/control', {action: b.dataset.act});
-});
-$('#vol').oninput = e => {
-  volDragging = true;
-  $('#volLabel').textContent = e.target.value;
-  $('#volPct').textContent = e.target.value + '%';
-};
-$('#vol').onchange = e => { volDragging = false; post('/api/control', {action:'volume', value:+e.target.value}); };
-$('#mute').onchange = e => post('/api/control', {action:'mute', value: e.target.checked ? 1 : 0});
-$('#seek').oninput = ()=> seekDragging = true;
-$('#seek').onchange = e => {
-  seekDragging = false;
-  const dur = parseFloat($('#dur').textContent.split(':').reduce((a,t)=>a*60+ +t,0));
-  post('/api/control', {action:'seek', value: dur * e.target.value / 1000});
-};
-$('#castBtn').onclick = async ()=>{
-  const url = $('#castUrl').value.trim();
-  if (!url) return;
-  const r = await post('/api/cast', {url});
-  if (r.error) alert('投屏失败: ' + r.error);
-};
-$('#clearBtn').onclick = ()=> post('/api/control', {action:'clear'});
-$('#renameBtn').onclick = async ()=>{
-  const name = $('#devName').value.trim();
-  if (!name) return;
-  await post('/api/config', {friendly_name: name});
-};
+  $('#seek').oninput = (e) => {
+    seekDragging = true;
+    paintRange(e.target);
+    if (S && S.duration > 0) $('#pos').textContent = fmt(S.duration * e.target.value / 1000);
+  };
+  $('#seek').onchange = (e) => {
+    seekDragging = false;
+    if (S && S.duration > 0) {
+      post('/api/control', { action: 'seek', value: S.duration * e.target.value / 1000 });
+    }
+  };
 
-$('#diagBtn').onclick = async ()=>{
-  const box = $('#diag');
-  box.style.display = 'block';
-  box.textContent = '检查中…';
-  const d = await (await fetch('/api/diag')).json();
-  const lines = [];
-  lines.push('地址：' + (d.addresses || []).join(', ') + ':' + d.port);
-  lines.push('组播 239.255.255.250: ' + (d.multicast_ok ? '可以发送' : '发不出去 — ' + d.multicast_err));
-  lines.push('子网广播 ' + (d.broadcast_addr || '-') + ': ' + (d.broadcast_ok ? '可以发送' : '发不出去 — ' + d.broadcast_err));
-  lines.push('已收到 M-SEARCH：' + d.msearch_count + ' 次');
-  if ((d.hints || []).length) { lines.push(''); lines.push(...d.hints); }
-  box.textContent = lines.join('\n');
-};
+  $('#vol').oninput = (e) => { volDragging = true; paintRange(e.target); };
+  $('#vol').onchange = (e) => {
+    volDragging = false;
+    post('/api/control', { action: 'volume', value: +e.target.value });
+  };
+  $('#muteBtn').onclick = () => post('/api/control', { action: 'mute', value: (S && S.mute) ? 0 : 1 });
 
-const KIND_CN = {ssdp:'发现', soap:'控制', gena:'事件', screen:'屏幕', media:'拉流',
-                 proxy:'代理', http:'服务', ui:'界面', config:'配置', avt:'控制', rcs:'音量', vlc:'VLC'};
-function appendLog(e){
-  const box = $('#log');
-  const div = document.createElement('div');
-  div.innerHTML = '<span class="t">' + e.at + '</span> ' +
-    '<span class="k ' + e.kind + '">' + (KIND_CN[e.kind] || e.kind) + '</span>' + escapeHtml(e.text);
-  box.appendChild(div);
-  while (box.childElementCount > 300) box.removeChild(box.firstChild);
-  box.scrollTop = box.scrollHeight;
-}
-function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
+  $('#speedBtn').onclick = () => showMenu($('#speedBtn'), [{
+    title: '播放倍速',
+    items: SPEEDS.map(v => ({
+      label: (Number.isInteger(v) ? v : v.toFixed(2).replace(/0+$/, '')) + '×',
+      active: Math.abs((S && S.speed || 1) - v) < 0.01,
+      onPick: () => post('/api/player', { action: 'speed', value: v })
+    }))
+  }]);
 
-async function tick(){
-  try{
-    const s = await (await fetch('/api/state')).json();
-    render(s);
-    const l = await (await fetch('/api/log?since=' + lastLogId)).json();
-    (l.entries||[]).forEach(e=>{ lastLogId = Math.max(lastLogId, e.id); appendLog(e); });
-  }catch(e){}
-}
-tick();
-setInterval(tick, 1000);
+  $('#aspectBtn').onclick = () => showMenu($('#aspectBtn'), [{
+    title: '画面比例',
+    items: ASPECTS.map(a => ({
+      label: a.label,
+      active: (S && S.aspect) === a.v,
+      onPick: () => post('/api/player', { action: 'aspect', text: a.v })
+    }))
+  }]);
+
+  $('#trackBtn').onclick = () => {
+    const tracks = (S && S.tracks) || [];
+    const audio = tracks.filter(t => t.type === 'audio');
+    const subs = tracks.filter(t => t.type === 'sub');
+    const sec = [];
+    sec.push({
+      title: '音轨',
+      items: audio.length ? audio.map(t => ({
+        label: t.title || t.lang || ('音轨 ' + t.id),
+        hint: [t.lang, t.codec].filter(Boolean).join(' · '),
+        active: t.selected,
+        onPick: () => post('/api/player', { action: 'track', kind: 'audio', id: t.id })
+      })) : [{ label: '没有可选音轨', onPick: () => {} }]
+    });
+    const subItems = subs.map(t => ({
+      label: t.title || t.lang || ('字幕 ' + t.id),
+      hint: [t.lang, t.codec].filter(Boolean).join(' · '),
+      active: t.selected,
+      onPick: () => post('/api/player', { action: 'track', kind: 'sub', id: t.id })
+    }));
+    subItems.push({ label: '关闭字幕', active: !subs.some(t => t.selected),
+                    onPick: () => post('/api/player', { action: 'track', kind: 'sub', id: 0 }) });
+    sec.push({ title: '字幕', items: subItems });
+    showMenu($('#trackBtn'), sec);
+  };
+
+  $('#loopBtn').onclick = () => post('/api/player', { action: 'loop', value: (S && S.loop) ? 0 : 1 });
+
+  $('#shotBtn').onclick = async () => {
+    const r = await post('/api/player', { action: 'screenshot' });
+    if (!r || r.error) return;
+    const a = document.createElement('a');
+    a.href = '/api/screenshot?t=' + Date.now();
+    a.download = 'dlna-tv-' + new Date().toISOString().replace(/[:.]/g, '-') + '.png';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast('已截取当前画面');
+  };
+
+  $('#keysBtn').onclick = () => showMenu($('#keysBtn'), [{
+    title: '快捷键',
+    items: [
+      { label: '空格', hint: '播放 / 暂停' },
+      { label: '← / →', hint: '后退 / 前进 10 秒' },
+      { label: '↑ / ↓', hint: '音量 ±5' },
+      { label: 'M', hint: '静音' },
+      { label: 'F', hint: '全屏' },
+      { label: 'S', hint: '截图' }
+    ].map(x => ({ ...x, onPick: () => {} }))
+  }]);
+
+  $('#fsBtn').onclick = () => {
+    const el = $('#stage');
+    if (document.fullscreenElement) document.exitFullscreen();
+    else el.requestFullscreen && el.requestFullscreen().catch(() => toast('这个浏览器不支持全屏', true));
+  };
+
+  $('#castBtn').onclick = async () => {
+    const url = $('#castUrl').value.trim();
+    if (!url) return toast('先填一个视频地址', true);
+    const r = await post('/api/cast', { url });
+    if (r && !r.error) {
+      toast('已开始投屏');
+      rememberCast(url);
+      $('#castUrl').value = '';
+    } else if (r && r.error) {
+      toast('投屏失败：' + r.error, true);
+    }
+  };
+  $('#castUrl').addEventListener('keydown', e => { if (e.key === 'Enter') $('#castBtn').click(); });
+  $('#clearBtn').onclick = () => post('/api/control', { action: 'clear' });
+
+  $('#renameBtn').onclick = async () => {
+    const name = $('#devName').value.trim();
+    if (!name) return toast('名字不能为空', true);
+    const r = await post('/api/config', { friendly_name: name });
+    if (r && !r.error) toast('已改名，重新广播后生效');
+  };
+
+  /* ---------- 最近投屏 ---------- */
+  const RECENT_KEY = 'dlna-recent-casts';
+  function recentCasts() {
+    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch (e) { return []; }
+  }
+  function rememberCast(url) {
+    const list = [url, ...recentCasts().filter(u => u !== url)].slice(0, 5);
+    localStorage.setItem(RECENT_KEY, JSON.stringify(list));
+    renderRecent();
+  }
+  function renderRecent() {
+    const box = $('#recent');
+    box.innerHTML = '';
+    for (const url of recentCasts()) {
+      const b = document.createElement('button');
+      b.className = 'tag';
+      b.textContent = url.replace(/^https?:\/\//, '').slice(0, 44);
+      b.title = url;
+      b.onclick = () => { $('#castUrl').value = url; };
+      box.appendChild(b);
+    }
+  }
+
+  /* ---------- 网络自检 ---------- */
+  async function runDiag() {
+    const box = $('#diag');
+    box.hidden = false;
+    box.textContent = '检查中…';
+    try {
+      const d = await (await fetch('/api/diag')).json();
+      const lines = [];
+      lines.push('地址：' + ((d.addresses || []).join(', ') || '—') + ':' + d.port);
+      lines.push('组播 239.255.255.250：' + (d.multicast_ok ? '可以发送' : '发不出去 — ' + (d.multicast_err || '未知')));
+      lines.push('子网广播：' + (d.broadcast_ok ? '可以发送' : '发不出去 — ' + (d.broadcast_err || '未知')));
+      lines.push('已收到发现请求：' + d.msearch_count + ' 次');
+      if ((d.hints || []).length) { lines.push(''); lines.push(...d.hints); }
+      box.textContent = lines.join('\n');
+    } catch (e) {
+      box.textContent = '自检失败：' + e;
+    }
+  }
+  $('#diagBtn').onclick = runDiag;
+  $('#diagBtn2').onclick = runDiag;
+  $('#keysBtn').ondblclick = () => {};
+
+  /* ---------- 日志 ---------- */
+  const KIND_CN = {
+    ssdp: '发现', soap: '控制', gena: '事件', screen: '屏幕', media: '拉流',
+    proxy: '代理', http: '服务', ui: '界面', config: '配置',
+    avt: '控制', rcs: '音量', player: '播放', vlc: 'VLC'
+  };
+  function appendLog(e) {
+    const box = $('#log');
+    const line = document.createElement('div');
+    line.className = 'line';
+    line.innerHTML = '<span class="t">' + escapeHtml(e.at) + '</span>' +
+      '<span class="k ' + escapeHtml(e.kind) + '">' + escapeHtml(KIND_CN[e.kind] || e.kind) + '</span>' +
+      escapeHtml(e.text);
+    box.appendChild(line);
+    while (box.childElementCount > 400) box.removeChild(box.firstChild);
+    if ($('#autoScroll').checked) box.scrollTop = box.scrollHeight;
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  $('#clearLog').onclick = () => { $('#log').innerHTML = ''; };
+
+  /* ---------- 轮询 ---------- */
+  async function tick() {
+    try {
+      const s = await (await fetch('/api/state')).json();
+      render(s);
+      const l = await (await fetch('/api/log?since=' + lastLogId)).json();
+      (l.entries || []).forEach(e => { lastLogId = Math.max(lastLogId, e.id); appendLog(e); });
+    } catch (e) { /* 服务重启时会短暂失败，忽略 */ }
+  }
+
+  /* ---------- 键盘 ---------- */
+  document.addEventListener('keydown', (e) => {
+    if (e.target.matches('input,textarea')) return;
+    const k = e.key.toLowerCase();
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (S && S.uri) post('/api/control', { action: S.state === 'PLAYING' ? 'pause' : 'play' });
+    } else if (k === 'arrowleft') {
+      e.preventDefault(); post('/api/player', { action: 'seekrel', value: -10 });
+    } else if (k === 'arrowright') {
+      e.preventDefault(); post('/api/player', { action: 'seekrel', value: 10 });
+    } else if (k === 'arrowup') {
+      e.preventDefault();
+      if (S) post('/api/control', { action: 'volume', value: Math.min(100, (S.volume || 0) + 5) });
+    } else if (k === 'arrowdown') {
+      e.preventDefault();
+      if (S) post('/api/control', { action: 'volume', value: Math.max(0, (S.volume || 0) - 5) });
+    } else if (k === 'm') {
+      post('/api/control', { action: 'mute', value: (S && S.mute) ? 0 : 1 });
+    } else if (k === 'f') {
+      $('#fsBtn').click();
+    } else if (k === 's') {
+      if (!$('#shotBtn').disabled) $('#shotBtn').click();
+    } else if (k === '?') {
+      $('#keysBtn').click();
+    } else if (k === 'escape') {
+      closeMenu();
+    }
+  });
+
+  /* 转圈动画（用于缓冲态） */
+  const style = document.createElement('style');
+  style.textContent = '@keyframes spin{to{transform:rotate(360deg)}}';
+  document.head.appendChild(style);
+
+  renderRecent();
+  tick();
+  setInterval(tick, 1000);
+})();
 </script>
 </body>
 </html>

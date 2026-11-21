@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -73,6 +74,9 @@ func (d *Device) routes() http.Handler {
 	mux.HandleFunc("/api/log", d.handleLogAPI)
 	mux.HandleFunc("/api/cast", d.handleCastAPI)
 	mux.HandleFunc("/api/control", d.handleControlAPI)
+	mux.HandleFunc("/api/player", d.handlePlayerAPI)
+	mux.HandleFunc("/api/report", d.handleReportAPI)
+	mux.HandleFunc("/api/screenshot", d.handleScreenshotAPI)
 	mux.HandleFunc("/api/config", d.handleConfigAPI)
 	mux.HandleFunc("/api/diag", d.handleDiagAPI)
 	mux.HandleFunc("/proxy", d.handleProxy)
@@ -257,6 +261,106 @@ func (d *Device) handleControlAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, d.Snapshot())
+}
+
+func (d *Device) handlePlayerAPI(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, d.PlayerState())
+		return
+	case http.MethodPost:
+	default:
+		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Action string  `json:"action"`
+		Value  float64 `json:"value"`
+		Text   string  `json:"text"`
+		Kind   string  `json:"kind"`
+		ID     int     `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	var uerr *upnpError
+	switch strings.ToLower(body.Action) {
+	case "speed":
+		uerr = d.SetSpeed(body.Value)
+	case "loop":
+		uerr = d.SetLoop(body.Value != 0)
+	case "aspect":
+		uerr = d.SetAspect(body.Text)
+	case "track":
+		uerr = d.SelectTrack(body.Kind, body.ID)
+	case "screenshot":
+		_, uerr = d.Screenshot()
+	case "seekrel":
+		// 相对跳转，单位秒；负值后退
+		d.mu.RLock()
+		pos := d.positionLocked()
+		d.mu.RUnlock()
+		target := pos + time.Duration(body.Value*float64(time.Second))
+		if target < 0 {
+			target = 0
+		}
+		uerr = d.Seek(target)
+	default:
+		http.Error(w, "unknown action", http.StatusBadRequest)
+		return
+	}
+	if uerr != nil {
+		writeJSONStatus(w, http.StatusConflict, map[string]any{"error": uerr.Desc, "code": uerr.Code})
+		return
+	}
+	writeJSON(w, d.PlayerState())
+}
+
+// handleReportAPI 收网页播放器上报的播放信息（目前只有时长）。
+func (d *Device) handleReportAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Duration float64 `json:"duration"`
+		Ended    bool    `json:"ended"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if body.Ended {
+		d.onPlaybackEnded()
+	}
+	if body.Duration > 0 && body.Duration < 24*3600 {
+		d.ReportDuration(time.Duration(body.Duration * float64(time.Second)))
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleScreenshotAPI 返回最近一次截图；mpv 写文件是异步的，这里等一小会儿。
+func (d *Device) handleScreenshotAPI(w http.ResponseWriter, r *http.Request) {
+	path := d.lastScreenshot()
+	if path == "" {
+		http.Error(w, "还没有截图", http.StatusNotFound)
+		return
+	}
+	var err error
+	for i := 0; i < 20; i++ {
+		var fi os.FileInfo
+		if fi, err = os.Stat(path); err == nil && fi.Size() > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		http.Error(w, "截图文件还没就绪", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, path)
 }
 
 func (d *Device) handleConfigAPI(w http.ResponseWriter, r *http.Request) {

@@ -46,6 +46,7 @@ func (m *mpvScreen) Show(uri, title string, volume int, mute bool) {
 	}
 	m.send(map[string]any{"command": []any{"loadfile", uri}})
 	m.applyVolume(volume, mute)
+	m.applySettings()
 	m.send(map[string]any{"command": []any{"set_property", "pause", false}})
 	m.dev.logf("screen", "mpv 全屏播放: %s", title)
 }
@@ -87,6 +88,85 @@ func (m *mpvScreen) SetMute(b bool) {
 	m.mute = b
 	m.mu.Unlock()
 	m.send(map[string]any{"command": []any{"set_property", "mute", b}})
+}
+
+// ---------- 高级播放控制 ----------
+
+func (m *mpvScreen) SetSpeed(v float64) {
+	m.send(map[string]any{"command": []any{"set_property", "speed", v}})
+}
+
+func (m *mpvScreen) SetLoop(on bool) {
+	val := "no"
+	if on {
+		val = "inf"
+	}
+	m.send(map[string]any{"command": []any{"set_property", "loop-file", val}})
+}
+
+func (m *mpvScreen) SetAspect(a string) {
+	val := "no"
+	if a != "" && a != "auto" {
+		val = a
+	}
+	m.send(map[string]any{"command": []any{"set_property", "video-aspect-override", val}})
+}
+
+// SelectTrack 切音轨/字幕轨；id=0 表示关掉字幕（关闭音轨没有意义，允许但很少用）。
+func (m *mpvScreen) SelectTrack(kind string, id int) {
+	prop := "aid"
+	if kind == "sub" {
+		prop = "sid"
+	}
+	var val any = id
+	if id <= 0 {
+		val = "no"
+	}
+	m.send(map[string]any{"command": []any{"set_property", prop, val}})
+}
+
+func (m *mpvScreen) ScreenshotTo(path string) error {
+	m.send(map[string]any{"command": []any{"screenshot-to-file", path, "video"}})
+	return nil
+}
+
+// parseMPVTracks 把 mpv 的 track-list 压成控制台需要的音轨/字幕轨。
+type mpvTrackJSON struct {
+	ID       int    `json:"id"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Lang     string `json:"lang"`
+	Codec    string `json:"codec"`
+	Selected bool   `json:"selected"`
+}
+
+func parseMPVTracks(data json.RawMessage) []TrackInfo {
+	var raw []mpvTrackJSON
+	if json.Unmarshal(data, &raw) != nil {
+		return nil
+	}
+	list := make([]TrackInfo, 0, len(raw))
+	for _, t := range raw {
+		if t.Type != "audio" && t.Type != "sub" {
+			continue
+		}
+		list = append(list, TrackInfo{
+			ID: t.ID, Type: t.Type, Title: t.Title,
+			Lang: t.Lang, Codec: t.Codec, Selected: t.Selected,
+		})
+	}
+	return list
+}
+
+// applySettings 在每次投流时把控制台调好的参数带给新的 mpv 实例。
+func (m *mpvScreen) applySettings() {
+	d := m.dev
+	d.mu.RLock()
+	speed, loop, aspect := d.speed, d.loop, d.aspect
+	d.mu.RUnlock()
+	m.SetSpeed(speed)
+	m.SetLoop(loop)
+	m.SetAspect(aspect)
 }
 
 func (m *mpvScreen) applyVolume(vol int, mute bool) {
@@ -196,6 +276,12 @@ func (m *mpvScreen) start(uri string) error {
 	m.send(map[string]any{"command": []any{"observe_property", 1, "time-pos"}})
 	m.send(map[string]any{"command": []any{"observe_property", 2, "duration"}})
 	m.send(map[string]any{"command": []any{"observe_property", 3, "pause"}})
+	// 高级播放：轨道、码率、帧率、倍速、循环
+	m.send(map[string]any{"command": []any{"observe_property", 4, "track-list"}})
+	m.send(map[string]any{"command": []any{"observe_property", 5, "video-bitrate"}})
+	m.send(map[string]any{"command": []any{"observe_property", 6, "container-fps"}})
+	m.send(map[string]any{"command": []any{"observe_property", 7, "speed"}})
+	m.send(map[string]any{"command": []any{"observe_property", 8, "loop-file"}})
 	m.dev.logf("screen", "mpv 已启动（%s）", m.path)
 	return nil
 }
@@ -232,6 +318,28 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 				var sec float64
 				if json.Unmarshal(ev.Data, &sec) == nil && sec >= 0 {
 					m.dev.syncPosition(time.Duration(sec * float64(time.Second)))
+				}
+			case "track-list":
+				m.dev.setTracks(parseMPVTracks(ev.Data))
+			case "video-bitrate":
+				var bps float64
+				if json.Unmarshal(ev.Data, &bps) == nil && bps > 0 {
+					m.dev.setBitrate(bps)
+				}
+			case "container-fps":
+				var fps float64
+				if json.Unmarshal(ev.Data, &fps) == nil && fps > 0 {
+					m.dev.setFPS(fps)
+				}
+			case "speed":
+				var v float64
+				if json.Unmarshal(ev.Data, &v) == nil && v > 0 {
+					m.dev.noteSpeed(v)
+				}
+			case "loop-file":
+				var v string
+				if json.Unmarshal(ev.Data, &v) == nil {
+					m.dev.noteLoop(v != "no")
 				}
 			}
 		case "end-file":

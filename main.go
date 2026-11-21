@@ -7,10 +7,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	cfgPath, err := configPath()
@@ -27,7 +28,7 @@ func main() {
 	port := flag.Int("http-port", 0, "HTTP 端口（默认 8090，0 表示用配置里的）")
 	name := flag.String("name", "", "电视名称，写进配置")
 	uuidArg := flag.String("uuid", "", "固定设备 UUID，写进配置")
-	player := flag.String("player", "", "播放引擎：auto（默认）/ vlc / web")
+	player := flag.String("player", "", "播放引擎：auto（默认）/ mpv / vlc / web")
 	noSSDP := flag.Bool("no-ssdp", false, "不启动 SSDP 发现（只跑 HTTP，排查用）")
 	noOpen := flag.Bool("no-open", false, "启动后不自动打开控制台网页")
 	verbose := flag.Bool("v", false, "详细日志（含每个 SSDP / SOAP / VLC 细节）")
@@ -111,13 +112,7 @@ func printBanner(d *Device) {
 	for _, ip := range append([]string{"127.0.0.1"}, localIPv4s()...) {
 		fmt.Printf("  地址   : http://%s:%d/dmr.xml\n", ip, d.httpPort)
 	}
-	if p := findMPV(); p != "" {
-		fmt.Println("  播放器 : mpv 全屏引擎（" + p + "）")
-	} else if p := findVLC(); p != "" {
-		fmt.Println("  播放器 : VLC 全屏引擎（" + p + "）")
-	} else {
-		fmt.Println("  播放器 : 网页播放器（未找到 mpv/VLC；可用 -player 指定）")
-	}
+	fmt.Println("  播放器 : " + engineLabel(cfg.Player))
 	fmt.Println("  控制台 : http://127.0.0.1:" + fmt.Sprint(d.httpPort) + "/")
 	fmt.Println()
 	if runtime.GOOS == "windows" {
@@ -151,4 +146,29 @@ func init() {
 	if runtime.GOOS == "windows" {
 		enableUTF8Console()
 	}
+}
+
+// engineLabel 说明最终会用到哪个播放引擎，横幅要和实际选择一致。
+func engineLabel(player string) string {
+	switch strings.ToLower(strings.TrimSpace(player)) {
+	case "web":
+		return "网页播放器（-player web）"
+	case "vlc":
+		if p := findVLC(); p != "" {
+			return "VLC 全屏引擎（" + p + "）"
+		}
+		return "网页播放器（没找到 VLC，-player vlc 失效）"
+	case "mpv":
+		if p := findMPV(); p != "" {
+			return "mpv 全屏引擎（" + p + "）"
+		}
+		return "网页播放器（没找到 mpv，-player mpv 失效）"
+	}
+	if p := findMPV(); p != "" {
+		return "mpv 全屏引擎（" + p + "，自动选择）"
+	}
+	if p := findVLC(); p != "" {
+		return "VLC 全屏引擎（" + p + "，自动选择）"
+	}
+	return "网页播放器（没找到 mpv/VLC，可用 -player 指定）"
 }

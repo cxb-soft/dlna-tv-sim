@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -533,5 +534,104 @@ func TestVolumeDB(t *testing.T) {
 	}
 	if v := dbToVolume(-80); v != 0 {
 		t.Errorf("-80 dB 应对应 0，实际 %d", v)
+	}
+}
+
+// ---------- 高级播放 ----------
+
+func TestPlayerControls(t *testing.T) {
+	dev := newTestDevice(t)
+
+	if e := dev.SetSpeed(1.5); e != nil {
+		t.Fatalf("设 1.5x 失败: %+v", e)
+	}
+	if got := dev.Snapshot().Speed; got != 1.5 {
+		t.Fatalf("倍速未生效: %v", got)
+	}
+	if e := dev.SetSpeed(0.1); e == nil || e.Code != 402 {
+		t.Fatalf("过低倍速应 402，得到 %+v", e)
+	}
+	if e := dev.SetSpeed(9); e == nil || e.Code != 402 {
+		t.Fatalf("过高倍速应 402，得到 %+v", e)
+	}
+	if e := dev.SetAspect("99:1"); e == nil || e.Code != 402 {
+		t.Fatalf("非法比例应 402，得到 %+v", e)
+	}
+	if e := dev.SetAspect("4:3"); e != nil {
+		t.Fatalf("合法比例失败: %+v", e)
+	}
+	dev.SetLoop(true)
+	if !dev.Snapshot().Loop {
+		t.Fatal("循环未生效")
+	}
+	dev.ReportDuration(90 * time.Second)
+	if got := dev.Snapshot().Duration; got != 90 {
+		t.Fatalf("时长上报未生效: %v", got)
+	}
+
+	dev.setTracks([]TrackInfo{{ID: 2, Type: "audio"}, {ID: 1, Type: "sub"}})
+	if e := dev.SelectTrack("audio", 2); e != nil {
+		t.Fatalf("合法音轨切换失败: %+v", e)
+	}
+	if e := dev.SelectTrack("audio", 7); e == nil || e.Code != 402 {
+		t.Fatalf("不存在的轨道应 402，得到 %+v", e)
+	}
+	if e := dev.SelectTrack("sub", 2); e == nil || e.Code != 402 {
+		t.Fatalf("轨道类型不匹配应 402，得到 %+v", e)
+	}
+	if e := dev.SelectTrack("video", 1); e == nil || e.Code != 402 {
+		t.Fatalf("不支持的轨道类型应 402，得到 %+v", e)
+	}
+
+	caps := capabilitiesFor("web")
+	if len(caps) != 2 || caps[0] != "speed" || caps[1] != "loop" {
+		t.Fatalf("网页引擎能力不对: %v", caps)
+	}
+}
+
+func TestPlayerHTTP(t *testing.T) {
+	dev := newTestDevice(t)
+	h := dev.routes()
+
+	get := func(path string) (int, map[string]any) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		var m map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &m)
+		return rec.Code, m
+	}
+	post := func(path, body string) (int, map[string]any) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rec, req)
+		var m map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &m)
+		return rec.Code, m
+	}
+
+	if code, m := get("/api/player"); code != 200 || m["engine"] != "web" {
+		t.Fatalf("GET /api/player: %d %v", code, m)
+	}
+	if code, m := post("/api/player", `{"action":"speed","value":1.25}`); code != 200 || m["speed"] != 1.25 {
+		t.Fatalf("设倍速: %d %v", code, m)
+	}
+	if code, _ := post("/api/player", `{"action":"aspect","text":"1:1"}`); code != http.StatusConflict {
+		t.Fatalf("非法比例应 409，得到 %d", code)
+	}
+	if code, _ := post("/api/player", `{"action":"screenshot"}`); code != http.StatusConflict {
+		t.Fatalf("网页引擎截图应冲突，得到 %d", code)
+	}
+	if code, _ := post("/api/report", `{"duration":125}`); code != 200 {
+		t.Fatalf("上报时长: %d", code)
+	}
+	if got := dev.Snapshot().Duration; got != 125 {
+		t.Fatalf("时长未写入: %v", got)
+	}
+	if code, _ := post("/api/report", `{"ended":true}`); code != 200 {
+		t.Fatalf("播完上报: %d", code)
+	}
+	if code, m := get("/api/player"); code != 200 || m["capabilities"] == nil {
+		t.Fatalf("能力列表缺失: %d %v", code, m)
 	}
 }

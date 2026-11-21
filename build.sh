@@ -3,14 +3,19 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-}"
 mkdir -p dist
 
+# 只有显式给了 VERSION 才用 ldflags 覆盖，否则用 main.go 里的版本号
 build() {
   local goos="$1" goarch="$2" out="$3"
   echo "→ $goos/$goarch  $out"
+  local ldflags="-s -w"
+  if [ -n "$VERSION" ]; then
+    ldflags="$ldflags -X main.version=$VERSION"
+  fi
   GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-    go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/$out" .
+    go build -trimpath -ldflags "$ldflags" -o "dist/$out" .
 }
 
 build darwin arm64  dlna-tv-sim-macos-arm64

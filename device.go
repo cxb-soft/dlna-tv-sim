@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -68,6 +70,16 @@ type Device struct {
 	volume int
 	mute   bool
 
+	// 播放器高级选项（控制台可调，mpv 引擎会真正生效）
+	speed      float64
+	loop       bool
+	aspect     string
+	tracks     []TrackInfo
+	bitrate    float64
+	fps        float64
+	lastShot   string
+	lastShotAt time.Time
+
 	probe Probe
 
 	subs      *Subscriptions
@@ -95,6 +107,8 @@ func NewDevice(cfg Config, cfgPath string, verbose bool) *Device {
 		playSpeed: "1",
 		playMode:  "NORMAL",
 		volume:    30,
+		speed:     1,
+		aspect:    "auto",
 		startedAt: time.Now(),
 		bootID:    int(time.Now().Unix() % 2147483647),
 		client: &http.Client{
@@ -546,6 +560,224 @@ func (d *Device) probeMedia(uri string) {
 
 // ---------- 给网页用的快照 ----------
 
+// TrackInfo 是一条音轨/字幕轨的摘要，目前由 mpv 提供。
+type TrackInfo struct {
+	ID       int    `json:"id"`
+	Type     string `json:"type"` // audio / sub
+	Title    string `json:"title"`
+	Lang     string `json:"lang"`
+	Codec    string `json:"codec"`
+	Selected bool   `json:"selected"`
+}
+
+// PlayerStats 是播放引擎的实时指标，拿不到就是 0。
+type PlayerStats struct {
+	BitrateKbps float64 `json:"bitrate_kbps"`
+	FPS         float64 `json:"fps"`
+}
+
+func capabilitiesFor(engine string) []string {
+	switch engine {
+	case "mpv":
+		return []string{"speed", "loop", "aspect", "tracks", "screenshot", "stats"}
+	case "web":
+		return []string{"speed", "loop"}
+	}
+	return []string{}
+}
+
+// engineNameLocked 算出当前（或第一次投屏时）会用的引擎。
+// 还没有屏幕实例时按配置和本机可用性推算，避免控制台先显示成"网页播放"。
+func (d *Device) engineNameLocked() string {
+	if d.scr != nil {
+		return d.scr.Kind()
+	}
+	switch strings.ToLower(strings.TrimSpace(d.cfg.Player)) {
+	case "web":
+		return "web"
+	case "vlc":
+		if findVLC() != "" {
+			return "vlc"
+		}
+		return "web"
+	case "mpv":
+		if findMPV() != "" {
+			return "mpv"
+		}
+		return "web"
+	}
+	if findMPV() != "" {
+		return "mpv"
+	}
+	if findVLC() != "" {
+		return "vlc"
+	}
+	return "web"
+}
+
+// ReportDuration 让网页播放器把拿到的时长告诉设备，
+// 这样 DLNA 侧 GetMediaDuration 和进度条才有值（mpv 自己会报）。
+func (d *Device) ReportDuration(dur time.Duration) {
+	if dur <= 0 {
+		return
+	}
+	d.mu.Lock()
+	changed := d.duration == 0 || d.duration > dur+500*time.Millisecond || d.duration < dur-500*time.Millisecond
+	if changed {
+		d.duration = dur
+	}
+	d.mu.Unlock()
+	if changed {
+		d.logf("player", "网页播放器上报时长 %s", dur.Truncate(time.Second))
+		d.emit(serviceAVTransport)
+	}
+}
+
+// SetSpeed 调整播放倍速（0.25x–4x）。mpv 立即生效，网页引擎由页面应用。
+func (d *Device) SetSpeed(v float64) *upnpError {
+	if v < 0.25 || v > 4 {
+		return &upnpError{402, "Invalid Args"}
+	}
+	d.mu.Lock()
+	d.speed = v
+	d.mu.Unlock()
+	if e, ok := d.scr.(playerEngine); ok {
+		e.SetSpeed(v)
+	}
+	d.logf("player", "播放倍速 → %gx", v)
+	return nil
+}
+
+func (d *Device) SetLoop(on bool) *upnpError {
+	d.mu.Lock()
+	d.loop = on
+	d.mu.Unlock()
+	if e, ok := d.scr.(playerEngine); ok {
+		e.SetLoop(on)
+	}
+	d.logf("player", "循环播放 → %v", on)
+	return nil
+}
+
+func (d *Device) SetAspect(a string) *upnpError {
+	switch a {
+	case "auto", "16:9", "4:3", "21:9":
+	default:
+		return &upnpError{402, "Invalid Args"}
+	}
+	d.mu.Lock()
+	d.aspect = a
+	d.mu.Unlock()
+	if e, ok := d.scr.(playerEngine); ok {
+		e.SetAspect(a)
+	}
+	d.logf("player", "画面比例 → %s", a)
+	return nil
+}
+
+// SelectTrack 切音轨或字幕轨；kind=audio/sub，id=0 表示关掉字幕。
+func (d *Device) SelectTrack(kind string, id int) *upnpError {
+	if kind != "audio" && kind != "sub" {
+		return &upnpError{402, "Invalid Args"}
+	}
+	if id < 0 {
+		return &upnpError{402, "Invalid Args"}
+	}
+	d.mu.RLock()
+	tracks := d.tracks
+	d.mu.RUnlock()
+	if id > 0 && len(tracks) > 0 {
+		found := false
+		for _, t := range tracks {
+			if t.ID == id && t.Type == kind {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return &upnpError{402, "Invalid Args"}
+		}
+	}
+	if e, ok := d.scr.(playerEngine); ok {
+		e.SelectTrack(kind, id)
+	}
+	d.logf("player", "切%s轨 → %d", kind, id)
+	return nil
+}
+
+// Screenshot 让播放引擎截一张当前画面，返回文件路径。
+func (d *Device) Screenshot() (string, *upnpError) {
+	e, ok := d.scr.(playerEngine)
+	if !ok {
+		return "", &upnpError{501, "Action Failed"}
+	}
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("dlna-tv-shot-%d.png", time.Now().UnixNano()))
+	if err := e.ScreenshotTo(path); err != nil {
+		d.logf("player", "截图失败: %v", err)
+		return "", &upnpError{501, "Action Failed"}
+	}
+	d.mu.Lock()
+	old := d.lastShot
+	d.lastShot = path
+	d.lastShotAt = time.Now()
+	d.mu.Unlock()
+	if old != "" && old != path {
+		_ = os.Remove(old)
+	}
+	d.logf("player", "已截图")
+	return path, nil
+}
+
+func (d *Device) lastScreenshot() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.lastShot
+}
+
+func (d *Device) noteSpeed(v float64) {
+	d.mu.Lock()
+	d.speed = v
+	d.mu.Unlock()
+}
+
+func (d *Device) noteLoop(on bool) {
+	d.mu.Lock()
+	d.loop = on
+	d.mu.Unlock()
+}
+
+func (d *Device) setTracks(list []TrackInfo) {
+	d.mu.Lock()
+	d.tracks = list
+	d.mu.Unlock()
+}
+
+func (d *Device) setBitrate(bps float64) {
+	d.mu.Lock()
+	d.bitrate = bps / 1000
+	d.mu.Unlock()
+}
+
+func (d *Device) setFPS(f float64) {
+	d.mu.Lock()
+	d.fps = f
+	d.mu.Unlock()
+}
+
+// PlayerState 是 /api/player 的返回：控制台据此渲染高级控制。
+func (d *Device) PlayerState() map[string]any {
+	s := d.Snapshot()
+	return map[string]any{
+		"engine":       s.Player,
+		"speed":        s.Speed,
+		"loop":         s.Loop,
+		"aspect":       s.Aspect,
+		"tracks":       s.Tracks,
+		"capabilities": s.Capabilities,
+		"stats":        s.Stats,
+	}
+}
+
 type StateJSON struct {
 	FriendlyName  string   `json:"friendly_name"`
 	UUID          string   `json:"uuid"`
@@ -570,10 +802,19 @@ type StateJSON struct {
 	UptimeSeconds int64    `json:"uptime"`
 	Player        string   `json:"player"`
 	Version       string   `json:"version"`
+
+	// 高级播放状态
+	Speed        float64     `json:"speed"`
+	Loop         bool        `json:"loop"`
+	Aspect       string      `json:"aspect"`
+	Tracks       []TrackInfo `json:"tracks"`
+	Capabilities []string    `json:"capabilities"`
+	Stats        PlayerStats `json:"stats"`
 }
 
 func (d *Device) Snapshot() StateJSON {
 	d.mu.RLock()
+	player := d.engineNameLocked()
 	s := StateJSON{
 		FriendlyName:  d.cfg.FriendlyName,
 		UUID:          d.cfg.UUID,
@@ -593,10 +834,12 @@ func (d *Device) Snapshot() StateJSON {
 		Port:          d.httpPort,
 		UptimeSeconds: int64(time.Since(d.startedAt).Seconds()),
 		Version:       version,
-	}
-	player := "web"
-	if d.scr != nil {
-		player = d.scr.Kind()
+		Speed:         d.speed,
+		Loop:          d.loop,
+		Aspect:        d.aspect,
+		Tracks:        append([]TrackInfo(nil), d.tracks...),
+		Capabilities:  capabilitiesFor(player),
+		Stats:         PlayerStats{BitrateKbps: d.bitrate, FPS: d.fps},
 	}
 	s.Player = player
 	d.mu.RUnlock()

@@ -3,152 +3,289 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>电视屏幕</title>
 <style>
-  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}
+  :root{
+    --fg:#e9eef6; --dim:#93a3b8; --faint:#5b6b80; --accent:#7cb4ff;
+  }
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
   video{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none}
   #idle{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
-    color:#5f7186;font:15px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
-    background:radial-gradient(circle at 50% 40%,#101822,#04070b 70%)}
-  #idle .tv{font-size:64px;opacity:.35;margin-bottom:14px}
-  #hud{position:fixed;left:40px;bottom:36px;right:40px;display:flex;justify-content:space-between;
-    align-items:flex-end;color:#e9eef5;font:13px/1.5 -apple-system,"PingFang SC",sans-serif;
-    opacity:0;transition:opacity .4s;pointer-events:none}
-  #hud .t{font-size:17px;text-shadow:0 2px 12px #000;max-width:70%;overflow:hidden;
-    text-overflow:ellipsis;white-space:nowrap}
-  #hud .p{color:#b9c6d6;font-variant-numeric:tabular-nums;text-shadow:0 2px 12px #000}
-  #pauseBadge{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font-size:58px;
-    color:rgba(255,255,255,.85);display:none;text-shadow:0 4px 24px #000}
-  #tip{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);color:#8b98a9;
-    font:12px/1.5 -apple-system,"PingFang SC",sans-serif;opacity:0;transition:opacity .4s}
+    color:var(--faint);text-align:center;padding:24px;
+    background:
+      radial-gradient(900px 600px at 50% 26%,rgba(28,44,64,.55),transparent 62%),
+      radial-gradient(circle at 50% 40%,#0a1119,#03060a 72%)}
+  #idle .ring{width:112px;height:112px;border-radius:50%;display:grid;place-items:center;position:relative;
+    border:1px solid rgba(124,180,255,.2);background:radial-gradient(circle,rgba(124,180,255,.1),transparent 70%);
+    margin-bottom:22px}
+  #idle .ring::after{content:"";position:absolute;inset:-1px;border-radius:50%;
+    border:1px solid rgba(94,234,212,.16);animation:breathe 3.6s ease-in-out infinite}
+  @keyframes breathe{0%,100%{transform:scale(1);opacity:.5}50%{transform:scale(1.16);opacity:0}}
+  #idle svg{width:46px;height:46px;stroke:#7c8fa8;fill:none;stroke-width:1.4;
+    stroke-linecap:round;stroke-linejoin:round}
+  #idle .name{color:#cfdcec;font-size:17px;margin-bottom:8px;letter-spacing:.01em}
+  #idle .big{color:#aebdd0;font-size:15px;margin-bottom:6px}
+  #idle .small{font-size:12.5px;color:var(--faint);line-height:1.8}
+  #idle code{color:#7f93ab;font-size:12px}
+
+  #hud{position:fixed;left:48px;right:48px;bottom:40px;color:var(--fg);
+    opacity:0;transition:opacity .35s;pointer-events:none;z-index:5}
+  #hud .top{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:12px}
+  #hud .title{font-size:18px;font-weight:500;text-shadow:0 2px 16px #000;
+    max-width:70%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #hud .time{color:#c0cddd;font-size:13px;font-variant-numeric:tabular-nums;text-shadow:0 2px 12px #000}
+  #hud .track{height:4px;border-radius:99px;background:rgba(255,255,255,.18);overflow:hidden;
+    box-shadow:0 2px 12px rgba(0,0,0,.6)}
+  #hud .track i{display:block;height:100%;width:0;border-radius:99px;
+    background:linear-gradient(90deg,#5c95f0,#7ee7c7);transition:width .3s linear}
+  #hud .badges{display:flex;gap:8px;margin-top:10px;align-items:center;color:#9fb0c4;font-size:11.5px}
+  #hud .badges span{padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.14);
+    background:rgba(0,0,0,.35)}
+
+  #pauseBadge{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:4;
+    width:104px;height:104px;border-radius:50%;display:none;place-items:center;
+    background:rgba(6,10,16,.55);border:1px solid rgba(255,255,255,.14);backdrop-filter:blur(8px)}
+  #pauseBadge svg{width:38px;height:38px;fill:#eef4fb;opacity:.92}
+  #spinner{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:6;display:none;
+    width:52px;height:52px;border-radius:50%;border:3px solid rgba(255,255,255,.12);
+    border-top-color:var(--accent);animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:translate(-50%,-50%) rotate(360deg)}}
+  #error{position:fixed;inset:0;z-index:7;display:none;flex-direction:column;align-items:center;
+    justify-content:center;gap:10px;background:rgba(3,6,10,.82);text-align:center;padding:30px;cursor:default}
+  #error .ttl{color:#ffd7d7;font-size:16px}
+  #error .msg{color:#8fa1b5;font-size:13px;max-width:560px;line-height:1.7;word-break:break-all}
+  #error button{margin-top:10px;padding:9px 18px;border-radius:10px;border:1px solid rgba(255,255,255,.16);
+    background:rgba(255,255,255,.06);color:#dbe6f4;font-size:13px;cursor:pointer}
+  #error button:hover{background:rgba(255,255,255,.12)}
+
+  #tip{position:fixed;left:50%;bottom:118px;transform:translateX(-50%);z-index:5;
+    color:#93a3b8;font-size:12.5px;opacity:0;transition:opacity .4s;pointer-events:none;
+    padding:6px 12px;border-radius:999px;background:rgba(0,0,0,.4)}
 </style>
 </head>
 <body>
 <video id="v" playsinline></video>
+
 <div id="idle">
-  <div class="tv">📺</div>
-  <div>等待投屏…</div>
-  <div style="font-size:12px;color:#465468;margin-top:6px">在手机视频 App 里点“投屏”，选中这台电视</div>
+  <div class="ring">
+    <svg viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="13" rx="2.5"/><path d="M8 21h8M12 17.5V21"/></svg>
+  </div>
+  <div class="name" id="idleName">DLNA 电视</div>
+  <div class="big">等待投屏</div>
+  <div class="small">在手机视频 App 里点“投屏”，选中这台电视<br><code id="idleAddr"></code></div>
 </div>
-<div id="pauseBadge">⏸</div>
-<div id="hud"><div class="t" id="title"></div><div class="p" id="time"></div></div>
-<div id="tip">点一下画面进入全屏；空格暂停</div>
+
+<div id="spinner"></div>
+<div id="pauseBadge">
+  <svg viewBox="0 0 24 24"><rect x="6" y="4.5" width="4.2" height="15" rx="1.2"/><rect x="13.8" y="4.5" width="4.2" height="15" rx="1.2"/></svg>
+</div>
+
+<div id="hud">
+  <div class="top">
+    <div class="title" id="title"></div>
+    <div class="time" id="time"></div>
+  </div>
+  <div class="track"><i id="bar"></i></div>
+  <div class="badges"><span id="badgeEngine">—</span><span id="badgeSpeed" hidden></span><span id="badgeLoop" hidden>循环</span></div>
+</div>
+
+<div id="error">
+  <div class="ttl">这个格式在浏览器里放不了</div>
+  <div class="msg" id="errMsg"></div>
+  <button id="retryBtn">重试</button>
+</div>
+
+<div id="tip">点一下进入全屏 · 空格暂停 · ← → 跳转</div>
 
 <script src="/hls.min.js"></script>
 <script>
-const v = document.getElementById('v');
-const idle = document.getElementById('idle');
-const hud = document.getElementById('hud');
-const tip = document.getElementById('tip');
-const pauseBadge = document.getElementById('pauseBadge');
-const titleEl = document.getElementById('title');
-const timeEl = document.getElementById('time');
+(() => {
+  const $ = id => document.getElementById(id);
+  const v = $('v'), idle = $('idle'), hud = $('hud'), tip = $('tip'), pauseBadge = $('pauseBadge');
+  const spinner = $('spinner'), errorBox = $('error'), errMsg = $('errMsg');
+  const ENGINE_CN = { mpv: 'mpv 全屏', vlc: 'VLC 全屏', web: '网页播放' };
 
-let curUri = '', hls = null, lastState = '', dragging = false;
+  let curUri = '', hls = null, lastState = '', dragging = false, lastRender = 0;
+  let retryTimer = null;
 
-function proxyUrl(u){ return '/proxy?url=' + encodeURIComponent(u); }
-function fmt(sec){
-  sec = Math.max(0, Math.floor(sec || 0));
-  return [Math.floor(sec/3600), Math.floor(sec%3600/60), sec%60]
-    .map(x => String(x).padStart(2,'0')).join(':');
-}
+  const fmt = (sec) => {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+    return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+                 : `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  };
 
-function loadMedia(uri){
-  curUri = uri;
-  if (hls){ hls.destroy(); hls = null; }
-  document.getElementById('pauseBadge').style.display = 'none';
-  const src = proxyUrl(uri);
-  const isHls = /\.m3u8(\?|$)/i.test(uri);
-  if (isHls && window.Hls && Hls.isSupported()){
-    hls = new Hls({enableWorker:false, lowLatencyMode:false});
-    hls.loadSource(src);
-    hls.attachMedia(v);
-    hls.on(Hls.Events.ERROR, (_, data) => {
-      if (data && data.fatal){ console.warn('hls error', data); }
-    });
-  } else {
-    v.src = src;
-  }
-  v.style.display = 'block';
-  idle.style.display = 'none';
-}
-
-function clearMedia(){
-  curUri = '';
-  if (hls){ hls.destroy(); hls = null; }
-  v.pause();
-  v.removeAttribute('src');
-  v.load();
-  v.style.display = 'none';
-  idle.style.display = 'flex';
-  pauseBadge.style.display = 'none';
-  hud.style.opacity = 0;
-}
-
-function showTip(){
-  tip.style.opacity = 1;
-  setTimeout(()=> tip.style.opacity = 0, 4000);
-}
-
-function poke(){
-  hud.style.opacity = 1;
-  document.body.style.cursor = 'default';
-  clearTimeout(window._hide);
-  window._hide = setTimeout(()=>{
-    if (!v.paused){ document.body.style.cursor = 'none'; hud.style.opacity = 0; }
-  }, 3000);
-}
-
-document.addEventListener('mousemove', poke);
-document.addEventListener('click', ()=>{
-  if (!document.fullscreenElement){
-    document.documentElement.requestFullscreen().catch(()=>{});
-  }
-});
-
-async function tick(){
-  let s;
-  try { s = await (await fetch('/api/state')).json(); } catch(e){ return; }
-  if (!s.uri){ clearMedia(); return; }
-  if (s.uri !== curUri){ loadMedia(s.uri); showTip(); }
-  titleEl.textContent = s.title || '';
-  timeEl.textContent = fmt(s.position) + ' / ' + fmt(s.duration);
-  v.volume = Math.max(0, Math.min(1, s.volume / 100));
-  v.muted = !!s.mute;
-
-  if (s.state === 'PLAYING'){
-    if (v.paused) v.play().catch(()=>{});
+  function loadMedia(uri) {
+    curUri = uri;
+    if (hls) { hls.destroy(); hls = null; }
+    errorBox.style.display = 'none';
     pauseBadge.style.display = 'none';
-  } else if (s.state === 'PAUSED_PLAYBACK'){
-    if (!v.paused) v.pause();
-    pauseBadge.style.display = 'block';
-  } else if (s.state === 'STOPPED'){
-    v.pause();
+    const src = '/proxy?url=' + encodeURIComponent(uri);
+    const isHls = /\.m3u8(\?|$)/i.test(uri);
+    if (isHls && window.Hls && Hls.isSupported()) {
+      hls = new Hls({ enableWorker: false, lowLatencyMode: false, maxBufferLength: 40 });
+      hls.loadSource(src);
+      hls.attachMedia(v);
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data && data.fatal) showError('HLS 拉流失败：' + (data.details || data.type));
+      });
+    } else {
+      v.src = src;
+    }
+    v.style.display = 'block';
+    idle.style.display = 'none';
   }
-  if (lastState !== s.state) poke();
-  lastState = s.state;
-}
 
-v.addEventListener('timeupdate', ()=>{
-  if (!dragging && v.duration && isFinite(v.duration)){
-    timeEl.textContent = fmt(v.currentTime) + ' / ' + fmt(v.duration);
+  function clearMedia() {
+    curUri = '';
+    if (hls) { hls.destroy(); hls = null; }
+    v.pause(); v.removeAttribute('src'); v.load();
+    v.style.display = 'none';
+    idle.style.display = 'flex';
+    hud.style.opacity = 0;
+    pauseBadge.style.display = 'none';
+    spinner.style.display = 'none';
+    errorBox.style.display = 'none';
   }
-});
 
-document.addEventListener('keydown', e=>{
-  if (e.code === 'Space'){
-    e.preventDefault();
-    fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({action: v.paused ? 'play' : 'pause'})});
+  function showError(msg) {
+    errMsg.textContent = msg;
+    errorBox.style.display = 'flex';
+    spinner.style.display = 'none';
   }
-  if (e.key === 'f'){
-    if (document.fullscreenElement) document.exitFullscreen();
-    else document.documentElement.requestFullscreen().catch(()=>{});
-  }
-});
 
-tick();
-setInterval(tick, 1000);
+  function showTip(text) {
+    tip.textContent = text;
+    tip.style.opacity = 1;
+    clearTimeout(window._tipTimer);
+    window._tipTimer = setTimeout(() => tip.style.opacity = 0, 4200);
+  }
+
+  function poke() {
+    hud.style.opacity = 1;
+    document.body.style.cursor = 'default';
+    clearTimeout(window._hide);
+    window._hide = setTimeout(() => {
+      if (!v.paused) { document.body.style.cursor = 'none'; hud.style.opacity = 0; }
+    }, 2800);
+  }
+
+  document.addEventListener('mousemove', poke);
+  document.addEventListener('click', () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(() => {});
+    }
+    poke();
+  });
+
+  async function tick() {
+    let s;
+    try { s = await (await fetch('/api/state')).json(); } catch (e) { return; }
+    $('idleName').textContent = s.friendly_name || 'DLNA 电视';
+    $('idleAddr').textContent = s.addresses && s.addresses[0] ? (s.addresses[0] + ':' + s.port) : '';
+
+    if (!s.uri) { clearMedia(); return; }
+    if (s.uri !== curUri) { loadMedia(s.uri); showTip('已开始投屏 · 点一下进入全屏'); }
+
+    $('title').textContent = s.title || '';
+    $('time').textContent = fmt(s.position) + ' / ' + fmt(s.duration);
+    const pct = s.duration > 0 ? Math.min(100, s.position / s.duration * 100) : 0;
+    $('bar').style.width = pct.toFixed(2) + '%';
+    $('badgeEngine').textContent = ENGINE_CN[s.player] || s.player || '—';
+    $('badgeSpeed').hidden = !(s.speed && Math.abs(s.speed - 1) > 0.01);
+    $('badgeSpeed').textContent = s.speed ? s.speed + '×' : '';
+    $('badgeLoop').hidden = !s.loop;
+
+    v.volume = Math.max(0, Math.min(1, (s.mute ? 0 : s.volume) / 100));
+    v.muted = !!s.mute;
+    v.playbackRate = Math.min(4, Math.max(0.25, s.speed || 1));
+    v.loop = !!s.loop;
+
+    if (s.state === 'PLAYING') {
+      if (v.paused) v.play().catch(() => {});
+      pauseBadge.style.display = 'none';
+      spinner.style.display = 'none';
+    } else if (s.state === 'PAUSED_PLAYBACK') {
+      if (!v.paused) v.pause();
+      pauseBadge.style.display = 'grid';
+      spinner.style.display = 'none';
+      hud.style.opacity = 1;
+      document.body.style.cursor = 'default';
+    } else if (s.state === 'TRANSITIONING') {
+      spinner.style.display = 'block';
+    } else if (s.state === 'STOPPED') {
+      v.pause();
+      spinner.style.display = 'none';
+    }
+
+    if (lastState !== s.state) poke();
+    lastState = s.state;
+  }
+
+  v.addEventListener('waiting', () => { spinner.style.display = 'block'; });
+  v.addEventListener('loadedmetadata', () => {
+    if (isFinite(v.duration) && v.duration > 1) {
+      fetch('/api/report', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ duration: v.duration })
+      }).catch(() => {});
+    }
+  });
+  v.addEventListener('ended', () => {
+    fetch('/api/report', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ended: true })
+    }).catch(() => {});
+  });
+  v.addEventListener('playing', () => { spinner.style.display = 'none'; errorBox.style.display = 'none'; });
+  v.addEventListener('error', () => {
+    if (!curUri) return;
+    const code = v.error && v.error.code;
+    showError('浏览器无法解码这个流（错误码 ' + (code || '未知') + '）。换成 mpv 引擎可以播 mkv / HEVC / ts 等格式。');
+  });
+  v.addEventListener('timeupdate', () => {
+    if (v.duration && isFinite(v.duration)) {
+      $('time').textContent = fmt(v.currentTime) + ' / ' + fmt(v.duration);
+      $('bar').style.width = Math.min(100, v.currentTime / v.duration * 100).toFixed(2) + '%';
+    }
+  });
+
+  $('retryBtn').onclick = () => {
+    errorBox.style.display = 'none';
+    if (curUri) { const u = curUri; curUri = ''; loadMedia(u); }
+  };
+
+  document.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (e.code === 'Space') {
+      e.preventDefault();
+      fetch('/api/control', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ action: v.paused ? 'play' : 'pause' }) });
+      poke();
+    } else if (k === 'arrowleft' || k === 'arrowright') {
+      e.preventDefault();
+      fetch('/api/player', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ action:'seekrel', value: k === 'arrowright' ? 10 : -10 }) });
+      poke();
+    } else if (k === 'arrowup' || k === 'arrowdown') {
+      e.preventDefault();
+      fetch('/api/control', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ action:'volume', value: Math.max(0, Math.min(100, (v.volume * 100) + (k === 'arrowup' ? 5 : -5))) }) });
+      poke();
+    } else if (k === 'm') {
+      fetch('/api/control', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ action:'mute', value: v.muted ? 0 : 1 }) });
+    } else if (k === 'f') {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else document.documentElement.requestFullscreen().catch(() => {});
+    }
+  });
+
+  tick();
+  setInterval(tick, 1000);
+})();
 </script>
 </body>
 </html>

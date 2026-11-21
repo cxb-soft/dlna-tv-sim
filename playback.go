@@ -29,6 +29,16 @@ type screen interface {
 	Close()
 }
 
+// playerEngine 是可选的"高级播放控制"能力，目前只有 mpv 完整实现。
+// 网页引擎靠页面自己读 /api/state 应用倍速和循环，VLC 不提供这些。
+type playerEngine interface {
+	SetSpeed(v float64)
+	SetLoop(on bool)
+	SetAspect(a string)
+	SelectTrack(kind string, id int)
+	ScreenshotTo(path string) error
+}
+
 // ---------- 网页播放器（兜底） ----------
 
 type webScreen struct{ dev *Device }

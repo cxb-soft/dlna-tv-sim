@@ -11,3 +11,7 @@ dist/
 .idea/
 .vscode/
 *.swp
+
+# go build ./... 生成的本地二进制
+/dlnatvsim
+*.test

@@ -46,8 +46,13 @@
 ## 已验证（本机 macOS 26/27 beta，2026-11-21）
 
 - **真实设备投屏跑通**：iPad 上的视频 App 发现设备后，依次调用 `SetAVTransportURI` → `Play` → `Seek` → 持续 `GetTransportInfo`/`GetPositionInfo`/`GetVolume`/`GetCurrentTransportActions`，mpv 全屏播放该集（mkv，47 分钟），进度同步。片子由 iPad 自己在链接本地网络上提供（`http://169.254.149.65:50431/...`）。
+- **控制台高级控制（mpv）**：投带双音轨双字幕的 mkv 后，`/api/player` 返回 2 条音轨（English/Chinese，aac）与 2 条字幕（EnglishSub/ChineseSub，subrip）；切到中文音轨、中文字幕后 selected 正确翻转；画面比例 4:3、倍速 2× 均生效；截图返回 HTTP 200、40026 字节 PNG（640×360）。
+- **控制台高级控制（网页引擎）**：能力表只报 `speed`/`loop`；倍速 1.5×、循环开关都写进设备状态；非法比例返回 409；网页引擎下截图返回 409（不支持）。
+- **网页播放时长与结束**：网页播放器把 `duration` 上报给设备（`/api/report`），DLNA 侧不再永远是 0；播完上报 `ended`，设备回到 `STOPPED`、进度归零（日志「播放结束」）。
+- **控制台 UI**：Chromium 1440×900 下实际打开，页面无 console 报错；倍速菜单、循环、进度、音量、日志、自检都能操作；待机时设备卡显示「mpv 全屏」而不是误报「网页播放」。
+- **进度条**：seek 时屏幕底部出现进度条与时间（截图确认 `00:11:32 / 00:47:04 (25%)`）。
 - **组播权限坑**：同样的发包代码，在 Friend 的 agent 进程里报 `no route to host`，用 Terminal 身份运行则正常。macOS 的本地网络权限按 App 身份隔离，所以推荐用 `启动电视.command` 双击启动。
-- `go test ./...` 全绿（描述/SCPD 解析、订阅与事件 SEQ、状态机、Seek、音量、错误码、HLS 改写、SSDP 报文构造）。
+- `go test ./...` 全绿（描述/SCPD 解析、订阅与事件 SEQ、状态机、Seek、音量、错误码、HLS 改写、SSDP 报文构造，以及新增的倍速/比例/轨道校验、`/api/player`、`/api/report`）。
 - 环回单播 M-SEARCH → 正确 200 OK（LOCATION/ST/USN/EXT/CACHE-CONTROL）。
 - 网页控制台可打开、可投屏、日志实时。
 
