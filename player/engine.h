@@ -63,6 +63,7 @@ int  pe_get_volume(PePlayer *p);
 int  pe_get_mute(PePlayer *p);
 void pe_set_fullscreen(PePlayer *p, int on);
 void pe_toggle_fullscreen(PePlayer *p);
+void pe_close_window(PePlayer *p);
 void pe_get_status(PePlayer *p, PeStatus *out);
 const char *pe_video_codec(PePlayer *p);
 const char *pe_audio_codec(PePlayer *p);
@@ -71,6 +72,7 @@ int  pe_window_number(PePlayer *p);
 void pe_run(PePlayer *p);
 void pe_stop_run(PePlayer *p);
 void pe_close(PePlayer *p);
+void pe_destroy(PePlayer *p);
 const char *pe_ffmpeg_version(void);
 double pe_now(void);
 
