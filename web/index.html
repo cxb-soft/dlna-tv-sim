@@ -639,8 +639,19 @@
       $('#idle').style.display = 'none';
       v.playbackRate = Math.min(4, Math.max(0.25, speed));
       v.loop = !!s.loop;
+      // 跟随设备的进度：iPad 上拖动、控制台拖进度条都会改设备状态，
+      // 网页播放器必须把画面跳过去，否则两边会各播各的。
+      const vdur = isFinite(v.duration) && v.duration > 0 ? v.duration : (s.duration || 0);
+      if (!v.seeking && vdur > 0) {
+        const target = Math.max(0, Math.min(s.position || 0, vdur - 0.25));
+        const limit = st === 'PLAYING' ? 2.5 : 0.8;
+        if (Math.abs(v.currentTime - target) > limit) {
+          try { v.currentTime = target; } catch (e) {}
+        }
+      }
       if (st === 'PLAYING') { v.play().catch(() => {}); }
       else if (st === 'PAUSED_PLAYBACK') { v.pause(); }
+      else if (st === 'STOPPED') { v.pause(); }
     } else {
       if (lastPreviewUri) {
         lastPreviewUri = '';

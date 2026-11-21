@@ -28,13 +28,13 @@
 
 ### Windows
 
-解压 `dlna-tv-sim-windows-x64.zip`，双击 `dlna-tv-sim.exe`。首次运行如果弹出防火墙提示，勾选「专用网络」并允许（需要 UDP 1900 和 TCP 8090）。
+解压 `dlna-tv-sim-windows-x64.zip`，双击 `dlna-tv-sim-windows-x64.exe`。首次运行如果弹出防火墙提示，勾选「专用网络」并允许（需要 UDP 1900 和 TCP 8090）。
 
-播放引擎：
+**mpv 已经内置在包里**（`mpv\mpv.exe`），解压即用，不需要另外安装播放器；m3u8/ts/mkv/HEVC/AV1 都能播。
 
-- **推荐**：把 `mpv.exe`（免安装版）放到 exe 同一个目录下，程序会自动用它，格式支持最全（m3u8/ts/mkv/HEVC 都行）；
-- 或者装一个 VLC，程序也会自动找到；
-- 两个都没有时，会退回浏览器播放（`/screen` 页面），只支持 Chrome/Edge 能解的格式。
+如果不想用内置的，也可以自己装 VLC，程序会依次找 `mpv\mpv.exe` → 同目录 `mpv.exe` → 系统 VLC；都没有时退回浏览器播放（`/screen`，只支持浏览器能解的格式）。
+
+内置 mpv 是 shinchiro 的官方构建，GPLv2，许可证全文在包里的 `LICENSE-mpv.txt`。
 
 ## 它模拟了什么
 

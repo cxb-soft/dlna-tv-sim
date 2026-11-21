@@ -65,12 +65,30 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # Windows 包里内置的 mpv（shinchiro 构建）；换版本时两个值一起改
+      MPV_RELEASE: "20261111"
+      MPV_COMMIT: "bcde6b93cc"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Fetch mpv for Windows
+        run: |
+          set -euo pipefail
+          # 系统自带的 7z 版本太旧，解不开这个包，用官方 7zz
+          curl -sSL -o 7zz.tar.xz "https://github.com/ip7z/7zip/releases/download/26.06/7z2606-linux-x64.tar.xz"
+          tar -xf 7zz.tar.xz
+          chmod +x 7zz
+          base="https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/${MPV_RELEASE}"
+          curl -sSL -o mpv-x64.7z "${base}/mpv-x86_64-${MPV_RELEASE}-git-${MPV_COMMIT}.7z"
+          curl -sSL -o mpv-arm64.7z "${base}/mpv-aarch64-${MPV_RELEASE}-git-${MPV_COMMIT}.7z"
+          ./7zz x -y -ompv-x64 mpv-x64.7z
+          ./7zz x -y -ompv-arm64 mpv-arm64.7z
+          test -f mpv-x64/mpv.exe
+          test -f mpv-arm64/mpv.exe
       - name: Package
         run: |
           set -euo pipefail
@@ -78,10 +96,31 @@ jobs:
           chmod +x dlna-tv-sim-macos-* dlna-tv-sim-linux-* || true
           cp ../README.md .
           cp ../README-Windows.txt .
+          cp ../LICENSE-mpv.txt .
           cp "../启动电视.command" .
           chmod +x "启动电视.command"
-          zip -q -j dlna-tv-sim-windows-x64.zip dlna-tv-sim-windows-x64.exe README-Windows.txt
-          zip -q -j dlna-tv-sim-windows-arm64.zip dlna-tv-sim-windows-arm64.exe README-Windows.txt
+
+          # Windows 包：exe + 说明 + 许可证 + 最小化 mpv（mpv\mpv.exe）
+          stage_windows() {
+            local arch="$1" mpvdir="$2"
+            rm -rf "stage-$arch"
+            mkdir -p "stage-$arch/mpv/mpv"
+            cp "dlna-tv-sim-windows-$arch.exe" "stage-$arch/"
+            cp README-Windows.txt LICENSE-mpv.txt "stage-$arch/"
+            cp "$mpvdir/mpv.exe" "stage-$arch/mpv/"
+            if [ -f "$mpvdir/d3dcompiler_43.dll" ]; then
+              cp "$mpvdir/d3dcompiler_43.dll" "stage-$arch/mpv/"
+            fi
+            if [ -f "$mpvdir/mpv/fonts.conf" ]; then
+              cp "$mpvdir/mpv/fonts.conf" "stage-$arch/mpv/mpv/"
+            fi
+            (cd "stage-$arch" && zip -q -r "../dlna-tv-sim-windows-$arch.zip" .)
+            unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "mpv/mpv.exe"
+            rm -rf "stage-$arch"
+          }
+          stage_windows x64 ../mpv-x64
+          stage_windows arm64 ../mpv-arm64
+
           zip -q -j dlna-tv-sim-macos.zip dlna-tv-sim-macos-arm64 dlna-tv-sim-macos-amd64 "启动电视.command" README.md
           zip -q -j dlna-tv-sim-linux.zip dlna-tv-sim-linux-amd64 dlna-tv-sim-linux-arm64 README.md
           shasum -a 256 *.zip > SHA256SUMS.txt
