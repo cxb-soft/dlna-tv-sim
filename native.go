@@ -187,13 +187,23 @@ func (n *nativeScreen) Show(uri, title string, volume int, mute bool) {
 	n.closeSession()
 
 	res := make(chan error, 1)
+	n.dev.mu.RLock()
+	speed, loop, aspect := n.dev.speed, n.dev.loop, n.dev.aspect
+	n.dev.mu.RUnlock()
+	if speed <= 0 {
+		speed = 1
+	}
 	req := nativeOpenReq{
 		opts: player.Options{
 			URL:        uri,
 			Title:      title,
+			DeviceName: n.dev.cfg.FriendlyName,
 			Fullscreen: true,
 			Volume:     volume,
 			Mute:       mute,
+			Speed:      speed,
+			Loop:       loop,
+			Aspect:     aspect,
 		},
 		res: res,
 		onNew: func(p *player.Player) {
@@ -228,6 +238,7 @@ func (n *nativeScreen) Show(uri, title string, volume int, mute bool) {
 		n.dev.fallbackFrom("native")
 		return
 	}
+	n.updateTracks(sess.p)
 	st := sess.p.Status()
 	if st.Duration > 0 {
 		n.dev.setDuration(toDuration(st.Duration))
@@ -258,6 +269,68 @@ func (n *nativeScreen) attach(sess *nativeSession) {
 		n.dev.logf("screen", "用户关闭了播放器窗口")
 		n.dev.onScreenExit()
 	})
+}
+
+// updateTracks 把引擎枚举到的音轨/字幕轨报给设备快照（/api/player）。
+func (n *nativeScreen) updateTracks(p *player.Player) {
+	if p == nil {
+		return
+	}
+	list := make([]TrackInfo, 0, 8)
+	for _, t := range p.AudioTracks() {
+		list = append(list, TrackInfo{ID: t.ID, Type: "audio", Title: t.Title,
+			Lang: t.Lang, Codec: t.Codec, Selected: t.Selected})
+	}
+	for _, t := range p.SubtitleTracks() {
+		list = append(list, TrackInfo{ID: t.ID, Type: "sub", Title: t.Title,
+			Lang: t.Lang, Codec: t.Codec, Selected: t.Selected})
+	}
+	n.dev.mu.Lock()
+	n.dev.tracks = list
+	n.dev.mu.Unlock()
+}
+
+// ---------- playerEngine：高级播放控制 ----------
+
+func (n *nativeScreen) SetSpeed(v float64) {
+	if s := n.session(); s != nil {
+		s.p.SetSpeed(v)
+	}
+}
+
+func (n *nativeScreen) SetLoop(on bool) {
+	if s := n.session(); s != nil {
+		s.p.SetLoop(on)
+	}
+}
+
+func (n *nativeScreen) SetAspect(a string) {
+	if s := n.session(); s != nil {
+		s.p.SetAspect(a)
+	}
+}
+
+func (n *nativeScreen) SelectTrack(kind string, id int) {
+	s := n.session()
+	if s == nil {
+		return
+	}
+	if kind == "audio" {
+		if id > 0 {
+			s.p.SetAudioTrack(id)
+		}
+	} else {
+		s.p.SetSubtitleTrack(id)
+	}
+	time.AfterFunc(600*time.Millisecond, func() { n.updateTracks(s.p) })
+}
+
+func (n *nativeScreen) ScreenshotTo(path string) error {
+	s := n.session()
+	if s == nil {
+		return errors.New("自研播放核心没有在播放")
+	}
+	return s.p.Screenshot(path)
 }
 
 func (n *nativeScreen) Play() {

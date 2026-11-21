@@ -35,10 +35,11 @@ func hhmmss(sec float64) string {
 }
 
 func summarize(st player.Status) string {
-	return fmt.Sprintf("pos=%s/%s paused=%v ended=%v hw=%v drift=%+.1fms avg=%+.1f p95=%.1f max=%.1f shown=%d dropped=%d cpu=%.1f%% buf=%.0fms",
-		hhmmss(st.Position), hhmmss(st.Duration), st.Paused, st.Ended, st.Hardware,
+	return fmt.Sprintf("pos=%s/%s paused=%v ended=%v hw=%v audio=%v drift=%+.1fms avg=%+.1f p95=%.1f max=%.1f shown=%d dropped=%d cpu=%.1f%% buf=%.0fms speed=%.2fx loop=%v aspect=%s tracks=%d/%d sub=%d",
+		hhmmss(st.Position), hhmmss(st.Duration), st.Paused, st.Ended, st.Hardware, st.HasAudio,
 		st.DriftMS, st.DriftAvgMS, st.DriftP95MS, st.DriftMaxMS,
-		st.FramesShown, st.FramesDroped, st.CPUPercent, st.BufferedMS)
+		st.FramesShown, st.FramesDroped, st.CPUPercent, st.BufferedMS,
+		st.Speed, st.Loop, st.Aspect, st.AudioTracks, st.SubtitleTracks, st.SubtitleTrack)
 }
 
 func screenshot(win int, path string) error {
@@ -106,6 +107,49 @@ func runScript(p *player.Player, script string) {
 				p.ToggleFullscreen()
 			}
 			logf("全屏 → %v", p.Status().Fullscreen)
+		case "speed":
+			v, _ := strconv.ParseFloat(arg, 64)
+			p.SetSpeed(v)
+			logf("倍速 → %.2fx", p.Speed())
+		case "loop":
+			p.SetLoop(arg == "on" || arg == "true" || arg == "1")
+			logf("循环 → %v", p.Loop())
+		case "aspect":
+			if arg == "" {
+				arg = "auto"
+			}
+			p.SetAspect(arg)
+			logf("比例 → %s", p.Aspect())
+		case "atrack":
+			id, _ := strconv.Atoi(arg)
+			p.SetAudioTrack(id)
+			logf("音轨 → %d", id)
+		case "strack":
+			id, _ := strconv.Atoi(arg)
+			p.SetSubtitleTrack(id)
+			logf("字幕 → %d", id)
+		case "text":
+			logf("当前字幕：%q", p.SubtitleText())
+		case "uivis":
+			p.UISetVisible(arg == "on" || arg == "true" || arg == "1")
+		case "hover":
+			p.UIHover(arg)
+		case "click":
+			p.UIClick(arg)
+		case "menu":
+			p.UIMenu(arg)
+		case "key":
+			p.UIKey(arg)
+		case "shotvid":
+			path := arg
+			if path == "" {
+				path = fmt.Sprintf("/tmp/player-frame-%d.png", time.Now().Unix())
+			}
+			if err := p.Screenshot(path); err != nil {
+				logf("帧截图失败: %v", err)
+			} else {
+				logf("帧截图已保存 %s", path)
+			}
 		case "closewin":
 			p.CloseWindow()
 		case "pos", "status":

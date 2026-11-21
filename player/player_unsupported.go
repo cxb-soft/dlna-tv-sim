@@ -8,6 +8,7 @@ import "errors"
 type Options struct {
 	URL            string
 	Title          string
+	DeviceName     string
 	Width, Height  int
 	Fullscreen     bool
 	Volume         int
@@ -15,6 +16,23 @@ type Options struct {
 	SoftwareDecode bool
 	Renderer       string
 	StartPosition  float64
+	Speed          float64
+	Aspect         string
+	Loop           bool
+	AudioTrack     int
+	SubtitleTrack  int
+}
+
+// Track 与 darwin 实现保持同构。
+type Track struct {
+	ID          int
+	StreamIndex int
+	Type        string
+	Lang        string
+	Title       string
+	Codec       string
+	Channels    int
+	Selected    bool
 }
 
 // Status 与 darwin 实现保持同构，便于上层代码跨平台编译。
@@ -46,6 +64,16 @@ type Status struct {
 	Volume       int
 	Muted        bool
 	WindowNumber int
+
+	Speed          float64
+	Loop           bool
+	Aspect         string
+	AudioTrack     int
+	SubtitleTrack  int
+	AudioTracks    int
+	SubtitleTracks int
+	Buffering      bool
+	IOError        bool
 }
 
 type Player struct{ opts Options }
@@ -60,6 +88,7 @@ func HardwareDevice() string { return "" }
 func (p *Player) Play()                 {}
 func (p *Player) Pause()                {}
 func (p *Player) Toggle()               {}
+func (p *Player) Restart()              {}
 func (p *Player) Stop()                 {}
 func (p *Player) Seek(float64)          {}
 func (p *Player) SeekRelative(float64)  {}
@@ -78,3 +107,23 @@ func (p *Player) OnUpdate(func(Status)) {}
 func (p *Player) OnClose(func())        {}
 func (p *Player) Run()                  {}
 func (p *Player) Close()                {}
+
+func (p *Player) SetSpeed(float64)        {}
+func (p *Player) Speed() float64          { return 1 }
+func (p *Player) SetLoop(bool)            {}
+func (p *Player) Loop() bool              { return false }
+func (p *Player) SetAspect(string)        {}
+func (p *Player) Aspect() string          { return "auto" }
+func (p *Player) AudioTracks() []Track    { return nil }
+func (p *Player) SubtitleTracks() []Track { return nil }
+func (p *Player) SetAudioTrack(int)       {}
+func (p *Player) SetSubtitleTrack(int)    {}
+func (p *Player) SubtitleText() string    { return "" }
+func (p *Player) Screenshot(string) error { return errUnsupported }
+func (p *Player) Title() string           { return "" }
+func (p *Player) DeviceName() string      { return "" }
+func (p *Player) UISetVisible(bool)       {}
+func (p *Player) UIHover(string)          {}
+func (p *Player) UIClick(string)          {}
+func (p *Player) UIMenu(string)           {}
+func (p *Player) UIKey(string)            {}

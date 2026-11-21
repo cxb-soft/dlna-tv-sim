@@ -601,6 +601,8 @@ func capabilitiesFor(engine string) []string {
 	switch engine {
 	case "mpv":
 		return []string{"speed", "loop", "aspect", "tracks", "screenshot", "stats"}
+	case "native":
+		return []string{"speed", "loop", "aspect", "tracks", "screenshot"}
 	case "web":
 		return []string{"speed", "loop"}
 	}

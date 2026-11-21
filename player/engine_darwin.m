@@ -11,6 +11,8 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <ImageIO/ImageIO.h>
+#import <CoreImage/CoreImage.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -31,9 +33,10 @@
 #include <sys/resource.h>
 
 #include "engine.h"
+#include "player_ui_darwin.h"
 
 #define PE_AUDIO_RATE 48000
-#define PE_AUDIO_SECONDS 2.0
+#define PE_AUDIO_SECONDS 6.0
 #define PE_AUDIO_FRAMES ((size_t)(PE_AUDIO_RATE * PE_AUDIO_SECONDS))
 #define PE_SCHED_FRAMES 1024
 #define PE_MAX_SCHEDULES 24
@@ -49,11 +52,18 @@ typedef struct PeFrameNode {
     struct PeFrameNode *next;
 } PeFrameNode;
 
+typedef struct {
+    double start;
+    double end;
+    char *text;
+} PeSubCue;
+
 struct PePlayer {
     // 配置
     char url[4096];
     char title[256];
     int req_w, req_h, req_fs, req_vol, req_mute, req_hw;
+    int req_audio_track, req_sub_track;
     char renderer[16];
     double start_pos;
 
@@ -132,7 +142,39 @@ struct PePlayer {
     int window_number;
     int fullscreen;
     int volume, muted;
+
+    // 高级播放
+    double speed;              /* 0.25..4 */
+    int aspect;                /* 0 auto 1 16:9 2 4:3 3 fill */
+    int loop;
+    char aspect_name[8];
+    char device_name[128];
+
+    // 音轨/字幕轨
+    PeTrackInfo atracks[32];
+    int natracks;
+    PeTrackInfo stracks[32];
+    int nstracks;
+    int sidx;                  /* 当前字幕流索引，-1 = 关闭 */
+    AVCodecContext *sctx;
+    AVStream *sst;
+    int audio_switch_pending, sub_switch_pending;
+    int pending_aidx, pending_sidx;
+
+    // 字幕 cue（媒体时间）
+    PeSubCue *cues;
+    int ncues, cues_cap;
+
+    // 缓冲/错误
+    int buffering;
+    int loop_count;
+    double end_hold_start;   // 片尾等待起点：HLS demuxer 可能不报 EOF
+
+    // 截图：最近一帧的像素缓冲
+    CVPixelBufferRef last_pb;
 };
+
+static double clock_locked(PePlayer *p);
 
 // ---------------- 工具 ----------------
 
@@ -167,6 +209,39 @@ static void cond_wait_ms(PePlayer *p, int ms) {
     pthread_cond_timedwait(&p->cond, &p->mu, &ts);
 }
 
+static int parse_aspect(const char *a) {
+    if (!a || !a[0] || strcmp(a, "auto") == 0) return 0;
+    if (strcmp(a, "16:9") == 0) return 1;
+    if (strcmp(a, "4:3") == 0) return 2;
+    if (strcmp(a, "fill") == 0) return 3;
+    return 0;
+}
+
+static const char *aspect_name_of(int v) {
+    switch (v) {
+        case 1: return "16:9";
+        case 2: return "4:3";
+        case 3: return "fill";
+        default: return "auto";
+    }
+}
+
+static void copy_meta(char *dst, size_t len, AVDictionary *meta, const char *key) {
+    dst[0] = 0;
+    if (!meta) return;
+    AVDictionaryEntry *e = av_dict_get(meta, key, NULL, 0);
+    if (e && e->value) snprintf(dst, len, "%s", e->value);
+}
+
+static int track_id_for_stream(PePlayer *p, int stream_index, int subtitle) {
+    int n = subtitle ? p->nstracks : p->natracks;
+    PeTrackInfo *list = subtitle ? p->stracks : p->atracks;
+    for (int i = 0; i < n; i++) {
+        if (list[i].stream_index == stream_index) return list[i].id;
+    }
+    return 0;
+}
+
 static double frame_pts_of(AVStream *st, AVFrame *f, double fallback, double interval) {
     int64_t ts = f->best_effort_timestamp;
     if (ts == AV_NOPTS_VALUE) ts = f->pts;
@@ -188,12 +263,17 @@ static enum AVPixelFormat pe_get_format(AVCodecContext *ctx, const enum AVPixelF
 @property (nonatomic, assign) PePlayer *ctx;
 @end
 
+@class PeOverlayView;
+
 @interface PeUI : NSObject <NSWindowDelegate>
 @property (nonatomic, strong) NSWindow *window;
+@property (nonatomic, strong) NSView *rootView;
+@property (nonatomic, strong) PeOverlayView *overlay;
 @property (nonatomic, strong) PeVideoView *view;
 @property (nonatomic, strong) AVSampleBufferDisplayLayer *layer;
 @property (nonatomic, strong) AVAudioEngine *audioEngine;
 @property (nonatomic, strong) AVAudioPlayerNode *audioPlayer;
+@property (nonatomic, strong) AVAudioUnitTimePitch *timePitch;
 @property (nonatomic, strong) AVAudioFormat *audioFormat;
 @property (nonatomic, assign) PePlayer *ctx;
 @property (nonatomic, assign) BOOL fsActive;
@@ -225,6 +305,9 @@ static enum AVPixelFormat pe_get_format(AVCodecContext *ctx, const enum AVPixelF
 - (void)playAudio;
 - (void)pauseAudio;
 - (void)stopAudio;
+- (void)layoutVideoLayer;
+- (void)setSpeedRate:(double)speed;
+- (void)fadeOutThenHideWithCompletion:(void (^)(void))done;
 - (void)teardown;
 @end
 
@@ -240,6 +323,49 @@ static void clear_video_queue_locked(PePlayer *p) {
     }
     p->vhead = p->vtail = NULL;
     p->vcount = 0;
+}
+
+// ---------------- 字幕 cue ----------------
+
+static void clear_sub_cues_locked(PePlayer *p) {
+    for (int i = 0; i < p->ncues; i++) free(p->cues[i].text);
+    free(p->cues);
+    p->cues = NULL;
+    p->ncues = p->cues_cap = 0;
+}
+
+static void add_sub_cue_locked(PePlayer *p, double start, double end, const char *text) {
+    if (!text || !text[0]) return;
+    if (p->ncues >= 512) {
+        // 丢掉最早的一条，避免长片积累过多 cue。
+        free(p->cues[0].text);
+        memmove(p->cues, p->cues + 1, sizeof(PeSubCue) * (size_t)(p->ncues - 1));
+        p->ncues--;
+    }
+    if (p->ncues >= p->cues_cap) {
+        int cap = p->cues_cap ? p->cues_cap * 2 : 64;
+        PeSubCue *grown = realloc(p->cues, sizeof(PeSubCue) * (size_t)cap);
+        if (!grown) return;
+        p->cues = grown;
+        p->cues_cap = cap;
+    }
+    // 旧 cue 已经过期很久的顺手清掉。
+    double now = p->paused || p->ended ? p->clock_frozen : clock_locked(p);
+    int w = 0;
+    for (int i = 0; i < p->ncues; i++) {
+        if (p->cues[i].end < now - 10.0) {
+            free(p->cues[i].text);
+        } else {
+            p->cues[w++] = p->cues[i];
+        }
+    }
+    p->ncues = w;
+    PeSubCue *c = &p->cues[p->ncues];
+    c->start = start;
+    c->end = end;
+    c->text = strdup(text);
+    if (!c->text) return;
+    p->ncues++;
 }
 
 // ---------------- 打开媒体 ----------------
@@ -358,8 +484,211 @@ static int open_audio_decoder(PePlayer *p) {
     return 0;
 }
 
+// 枚举容器里的音轨/字幕轨，给 UI、Go 和 DLNA 控制台用。
+static void enum_tracks(PePlayer *p) {
+    p->natracks = 0;
+    p->nstracks = 0;
+    for (unsigned i = 0; i < p->fmt->nb_streams; i++) {
+        AVStream *st = p->fmt->streams[i];
+        AVCodecParameters *cp = st->codecpar;
+        const char *codec = avcodec_get_name(cp->codec_id);
+        if (cp->codec_type == AVMEDIA_TYPE_AUDIO && p->natracks < 32) {
+            PeTrackInfo *t = &p->atracks[p->natracks];
+            memset(t, 0, sizeof(*t));
+            t->id = p->natracks + 1;
+            t->stream_index = (int)i;
+            t->channels = cp->ch_layout.nb_channels;
+            snprintf(t->codec, sizeof(t->codec), "%s", codec ? codec : "");
+            copy_meta(t->lang, sizeof(t->lang), st->metadata, "language");
+            copy_meta(t->title, sizeof(t->title), st->metadata, "title");
+            p->natracks++;
+        } else if (cp->codec_type == AVMEDIA_TYPE_SUBTITLE && p->nstracks < 32) {
+            PeTrackInfo *t = &p->stracks[p->nstracks];
+            memset(t, 0, sizeof(*t));
+            t->id = p->nstracks + 1;
+            t->stream_index = (int)i;
+            snprintf(t->codec, sizeof(t->codec), "%s", codec ? codec : "");
+            copy_meta(t->lang, sizeof(t->lang), st->metadata, "language");
+            copy_meta(t->title, sizeof(t->title), st->metadata, "title");
+            p->nstracks++;
+        }
+    }
+    PE_LOG(p, "轨道：音频 %d 条，字幕 %d 条", p->natracks, p->nstracks);
+    for (int i = 0; i < p->natracks; i++) {
+        PE_LOG(p, "  音轨 %d：流 %d %s %dch lang=%s title=%s", p->atracks[i].id,
+               p->atracks[i].stream_index, p->atracks[i].codec, p->atracks[i].channels,
+               p->atracks[i].lang, p->atracks[i].title);
+    }
+    for (int i = 0; i < p->nstracks; i++) {
+        PE_LOG(p, "  字幕 %d：流 %d %s lang=%s title=%s", p->stracks[i].id,
+               p->stracks[i].stream_index, p->stracks[i].codec,
+               p->stracks[i].lang, p->stracks[i].title);
+    }
+}
+
+static int open_subtitle_decoder(PePlayer *p) {
+    if (p->sctx) avcodec_free_context(&p->sctx);
+    p->sctx = NULL;
+    p->sst = NULL;
+    pthread_mutex_lock(&p->mu);
+    clear_sub_cues_locked(p);
+    pthread_mutex_unlock(&p->mu);
+    if (p->sidx < 0) return 0;
+    p->sst = p->fmt->streams[p->sidx];
+    const AVCodec *codec = avcodec_find_decoder(p->sst->codecpar->codec_id);
+    if (!codec) {
+        PE_LOG(p, "没有字幕解码器 codec_id=%d", (int)p->sst->codecpar->codec_id);
+        p->sidx = -1;
+        p->sst = NULL;
+        return -1;
+    }
+    p->sctx = avcodec_alloc_context3(codec);
+    if (!p->sctx) {
+        p->sidx = -1;
+        p->sst = NULL;
+        return -1;
+    }
+    avcodec_parameters_to_context(p->sctx, p->sst->codecpar);
+    p->sctx->pkt_timebase = p->sst->time_base;
+    int r = avcodec_open2(p->sctx, codec, NULL);
+    if (r < 0) {
+        char eb[128];
+        PE_LOG(p, "字幕解码器打开失败：%s", av_text(r, eb, sizeof(eb)));
+        avcodec_free_context(&p->sctx);
+        p->sidx = -1;
+        p->sst = NULL;
+        return -1;
+    }
+    PE_LOG(p, "字幕解码器：%s（流 %d）", p->sst->codecpar->codec_id == AV_CODEC_ID_ASS ? "ass" : codec->name, p->sidx);
+    return 0;
+}
+
+static void append_utf8(char *out, size_t len, const char *src) {
+    size_t o = strlen(out);
+    if (o + 1 >= len) return;
+    snprintf(out + o, len - o, "%s", src);
+}
+
+// FFmpeg 的文本字幕解码器把 SRT/ASS 都转成 ASS 事件，这里剥掉
+// 样式覆盖标签，只保留纯文本；复杂的 ASS 排版（定位、字体、颜色）不渲染。
+// Matroska 里的 ASS 包没有 "Dialogue:" 前缀，字段是
+// ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text（8 个逗号）。
+static const char *skip_commas(const char *s, int n) {
+    for (int i = 0; i < n && s; i++) {
+        const char *c = strchr(s, ',');
+        if (!c) return s;
+        s = c + 1;
+    }
+    return s;
+}
+
+static void subtitle_rect_text(AVSubtitleRect *r, char *out, size_t len) {
+    out[0] = 0;
+    const char *src = NULL;
+    if (r->type == SUBTITLE_ASS && r->ass) {
+        const char *d = strstr(r->ass, "Dialogue:");
+        if (d) {
+            src = skip_commas(d + strlen("Dialogue:"), 9);
+        } else {
+            // 前三个字段里有 xx:xx:xx 时间码 → 还是 Dialogue 行（9 个逗号）；
+            // 否则是 Matroska ASS 包（8 个逗号）。
+            int alt = 0;
+            const char *p = r->ass;
+            for (int i = 0; i < 3 && p; i++) {
+                const char *comma = strchr(p, ',');
+                size_t field = comma ? (size_t)(comma - p) : strlen(p);
+                if (memchr(p, ':', field)) alt = 1;
+                p = comma ? comma + 1 : NULL;
+            }
+            src = skip_commas(r->ass, alt ? 9 : 8);
+        }
+    } else if (r->text) {
+        src = r->text;
+    }
+    if (!src) return;
+    size_t o = 0;
+    for (const char *s = src; *s && o + 1 < len; s++) {
+        if (*s == '{') {
+            while (*s && *s != '}') s++;
+            continue;
+        }
+        if (*s == '\\' && s[1]) {
+            char n = s[1];
+            if (n == 'N' || n == 'n') {
+                if (o + 1 < len) out[o++] = '\n';
+                s++;
+                continue;
+            }
+            if (n == 'h') {
+                if (o + 1 < len) out[o++] = ' ';
+                s++;
+                continue;
+            }
+        }
+        if (*s == '\r') continue;
+        out[o++] = *s;
+    }
+    out[o] = 0;
+    // 去掉首尾空白
+    char *b = out;
+    while (*b == ' ' || *b == '\n' || *b == '\t') b++;
+    if (b != out) memmove(out, b, strlen(b) + 1);
+    size_t n = strlen(out);
+    while (n > 0 && (out[n-1] == ' ' || out[n-1] == '\n' || out[n-1] == '\t')) out[--n] = 0;
+}
+
+static void decode_subtitle_packet(PePlayer *p, AVPacket *pkt) {
+    AVSubtitle sub;
+    memset(&sub, 0, sizeof(sub));
+    int got = 0;
+    int r = avcodec_decode_subtitle2(p->sctx, &sub, &got, pkt);
+    if (r < 0) return;
+    static int sub_logs = 0;
+    if (got) {
+        double base = 0;
+        if (sub.pts != AV_NOPTS_VALUE) {
+            base = (double)sub.pts / AV_TIME_BASE;
+        } else if (pkt->pts != AV_NOPTS_VALUE && p->sst) {
+            base = (double)pkt->pts * av_q2d(p->sst->time_base);
+        }
+        double start = base + (double)sub.start_display_time / 1000.0;
+        double end = base + (double)sub.end_display_time / 1000.0;
+        if (end <= start + 0.01) end = start + 4.0;
+        char text[1024];
+        text[0] = 0;
+        for (unsigned i = 0; i < sub.num_rects; i++) {
+            char tmp[512];
+            subtitle_rect_text(sub.rects[i], tmp, sizeof(tmp));
+            if (!tmp[0]) continue;
+            if (text[0]) append_utf8(text, sizeof(text), "\n");
+            append_utf8(text, sizeof(text), tmp);
+        }
+        if (sub_logs < 6) {
+            sub_logs++;
+            const char *raw = (sub.num_rects > 0 && sub.rects[0]->ass) ? sub.rects[0]->ass :
+                              (sub.num_rects > 0 ? sub.rects[0]->text : "");
+            PE_LOG(p, "字幕包：pktpts=%lld subpts=%lld start=%u end=%u → %.3f..%.3f type=%d raw=%s",
+                   (long long)pkt->pts, (long long)sub.pts, sub.start_display_time,
+                   sub.end_display_time, start, end,
+                   sub.num_rects > 0 ? (int)sub.rects[0]->type : -1, raw ? raw : "");
+        }
+        if (text[0]) {
+            pthread_mutex_lock(&p->mu);
+            add_sub_cue_locked(p, start, end, text);
+            pthread_mutex_unlock(&p->mu);
+            if (sub_logs <= 6) PE_LOG(p, "字幕 cue：%.3f..%.3f %s", start, end, text);
+        }
+        avsubtitle_free(&sub);
+    }
+}
+
 static int open_media(PePlayer *p) {
-    int r = avformat_open_input(&p->fmt, p->url, NULL, NULL);
+    // HLS 的 AES-128 密钥常是 .bin/.key 这类非媒体扩展名，FFmpeg 默认会以
+    // “不像媒体文件”为由拒绝本地密钥。播放器需要显式放行。
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "allowed_extensions", "ALL", 0);
+    int r = avformat_open_input(&p->fmt, p->url, NULL, &opts);
+    av_dict_free(&opts);
     if (r < 0) {
         char eb[128];
         PE_LOG(p, "打开输入失败：%s", av_text(r, eb, sizeof(eb)));
@@ -374,8 +703,16 @@ static int open_media(PePlayer *p) {
     p->duration = p->fmt->duration > 0 ? (double)p->fmt->duration / AV_TIME_BASE : 0;
     p->vidx = av_find_best_stream(p->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     p->aidx = av_find_best_stream(p->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-    PE_LOG(p, "容器：%s，时长 %.3fs，视频流=%d 音频流=%d",
-           p->fmt->iformat->name, p->duration, p->vidx, p->aidx);
+    enum_tracks(p);
+    if (p->req_audio_track >= 1 && p->req_audio_track <= p->natracks) {
+        p->aidx = p->atracks[p->req_audio_track - 1].stream_index;
+    }
+    p->sidx = -1;
+    if (p->req_sub_track >= 1 && p->req_sub_track <= p->nstracks) {
+        p->sidx = p->stracks[p->req_sub_track - 1].stream_index;
+    }
+    PE_LOG(p, "容器：%s，时长 %.3fs，视频流=%d 音频流=%d 字幕流=%d",
+           p->fmt->iformat->name, p->duration, p->vidx, p->aidx, p->sidx);
     if (p->vidx < 0 && p->aidx < 0) {
         PE_LOG(p, "没有可播放的音视频流");
         return -1;
@@ -384,6 +721,7 @@ static int open_media(PePlayer *p) {
     if (open_audio_decoder(p) < 0) {
         // 音频解不出来不影响出画面，主时钟退回墙钟。
     }
+    if (p->sidx >= 0) open_subtitle_decoder(p);
     return 0;
 }
 
@@ -394,12 +732,20 @@ static double clock_locked(PePlayer *p) {
     if (p->paused || p->ended) return p->clock_frozen;
     double pos = p->clock_base;
     if (p->has_audio && !p->audio_failed) {
+        if (!p->ui) return p->clock_frozen;
         double ns = [(__bridge PeUI *)p->ui nodeSeconds];
         if (ns < 0) return p->clock_frozen;
         pos = p->clock_base + (ns - p->anchor_node_sec);
     } else {
-        pos = p->clock_base + (now_sec() - p->wall_anchor);
+        pos = p->clock_base + (now_sec() - p->wall_anchor) * p->speed;
     }
+    if (pos < 0) pos = 0;
+    if (p->duration > 0 && pos > p->duration) pos = p->duration;
+    return pos;
+}
+
+static double pos_locked(PePlayer *p) {
+    double pos = (p->paused || p->ended) ? p->clock_frozen : clock_locked(p);
     if (pos < 0) pos = 0;
     if (p->duration > 0 && pos > p->duration) pos = p->duration;
     return pos;
@@ -419,7 +765,18 @@ static void enqueue_video_frame(PePlayer *p, AVFrame *frame, double pts) {
     node->pts = pts;
 
     pthread_mutex_lock(&p->mu);
-    while (!p->abort && !p->seek_req && p->vcount >= PE_VIDEO_QUEUE_MAX + 4) {
+    // 音频还没预填时，demux 要尽快读到音频包。HLS 一个分片里视频包可能
+    // 排在音频包前面，若在这里反压等待，音频永远进不了环形缓冲，主时钟
+    // 就不会启动（表现为黑屏几秒）。此时丢掉新视频帧，让 demux 继续读。
+    int need_audio = p->has_audio && !p->audio_failed && !p->clock_started;
+    if (need_audio && p->vcount >= PE_VIDEO_QUEUE_MAX) {
+        pthread_mutex_unlock(&p->mu);
+        av_frame_free(&clone);
+        free(node);
+        return;
+    }
+    while (!p->abort && !p->seek_req && !need_audio &&
+           p->vcount >= PE_VIDEO_QUEUE_MAX + 4) {
         cond_wait_ms(p, 20);
     }
     if (p->abort || p->seek_req || p->discarding) {
@@ -540,6 +897,41 @@ static void decode_audio_packet(PePlayer *p, AVPacket *pkt, AVFrame *frame) {
 
 // ---------------- seek / EOF ----------------
 
+// 调用时持锁。把播放器状态切到“已请求 seek、等 demux 线程执行”。
+static void request_seek_locked(PePlayer *p, double target) {
+    if (target < 0) target = 0;
+    if (p->duration > 0 && target > p->duration - 0.05) target = p->duration - 0.05;
+    if (target < 0) target = 0;
+    p->seek_req = 1;
+    p->seek_target = target;
+    p->seek_t0 = now_sec();
+    p->seek_waiting = 1;
+    p->end_hold_start = 0;
+    p->clock_frozen = target;
+    p->clock_started = 0;
+    p->clock_base = target;
+    p->ended = 0;
+    p->force_present = 0;
+    p->discarding = 1;
+    p->dropping_until = target;
+    p->drift_sum = 0;
+    p->drift_max = 0;
+    p->drift_last = 0;
+    p->drift_frames = 0;
+    p->drift_count = 0;
+    p->drift_pos = 0;
+    clear_video_queue_locked(p);
+    clear_sub_cues_locked(p);
+    p->alen = 0;
+    p->aread = p->awrite = 0;
+    p->ring_start_pts = target;
+    p->audio_next_pts = target;
+    p->audio_trim = 1;
+    p->audio_trim_to = target;
+    p->sched_buffers = 0;
+    pthread_cond_broadcast(&p->cond);
+}
+
 static void perform_seek(PePlayer *p, double target) {
     int64_t ts = (int64_t)(target * AV_TIME_BASE);
     int r = avformat_seek_file(p->fmt, -1, INT64_MIN, ts, INT64_MAX, AVSEEK_FLAG_BACKWARD);
@@ -550,12 +942,14 @@ static void perform_seek(PePlayer *p, double target) {
     }
     if (p->vctx) avcodec_flush_buffers(p->vctx);
     if (p->actx) avcodec_flush_buffers(p->actx);
+    if (p->sctx) avcodec_flush_buffers(p->sctx);
     if (p->swr) {
         swr_close(p->swr);
         swr_init(p->swr);
     }
     pthread_mutex_lock(&p->mu);
     clear_video_queue_locked(p);
+    clear_sub_cues_locked(p);
     p->discarding = 0;
     p->alen = 0;
     p->aread = p->awrite = 0;
@@ -607,10 +1001,12 @@ static void *demux_main(void *arg) {
     AVFrame *frame = av_frame_alloc();
     while (!p->abort) {
         pthread_mutex_lock(&p->mu);
+        int need_audio = p->has_audio && !p->audio_failed && !p->clock_started;
         while (!p->abort && !p->seek_req &&
-               (p->vcount >= PE_VIDEO_QUEUE_MAX ||
+               ((!need_audio && p->vcount >= PE_VIDEO_QUEUE_MAX) ||
                 (p->has_audio && p->alen + PE_AUDIO_RATE / 2 >= p->acap))) {
             cond_wait_ms(p, 50);
+            need_audio = p->has_audio && !p->audio_failed && !p->clock_started;
         }
         if (p->abort) {
             pthread_mutex_unlock(&p->mu);
@@ -618,11 +1014,38 @@ static void *demux_main(void *arg) {
         }
         int do_seek = p->seek_req;
         double target = p->seek_target;
-        if (do_seek) p->seek_req = 0;
+        int audio_sw = p->audio_switch_pending;
+        int sub_sw = p->sub_switch_pending;
+        int new_aidx = p->pending_aidx;
+        int new_sidx = p->pending_sidx;
+        if (do_seek) {
+            p->seek_req = 0;
+            p->audio_switch_pending = 0;
+            p->sub_switch_pending = 0;
+        }
         int at_eof = p->eof;
         pthread_mutex_unlock(&p->mu);
 
         if (do_seek) {
+            if (audio_sw) {
+                if (p->actx) avcodec_free_context(&p->actx);
+                if (p->swr) swr_free(&p->swr);
+                free(p->scratch);
+                p->scratch = NULL;
+                p->scratch_frames = 0;
+                p->ast = NULL;
+                p->has_audio = 0;
+                p->audio_failed = 0;
+                p->aidx = new_aidx;
+                if (open_audio_decoder(p) < 0) {
+                    p->audio_failed = 1;
+                    PE_LOG(p, "切音轨失败，继续用画面无声播放");
+                }
+            }
+            if (sub_sw) {
+                p->sidx = new_sidx;
+                if (open_subtitle_decoder(p) < 0) p->sidx = -1;
+            }
             perform_seek(p, target);
             continue;
         }
@@ -659,6 +1082,7 @@ static void *demux_main(void *arg) {
         }
         if (pkt->stream_index == p->vidx && p->vctx) decode_video_packet(p, pkt, frame);
         else if (pkt->stream_index == p->aidx && p->actx) decode_audio_packet(p, pkt, frame);
+        else if (p->sctx && pkt->stream_index == p->sidx) decode_subtitle_packet(p, pkt);
         av_packet_unref(pkt);
     }
     av_frame_free(&frame);
@@ -716,9 +1140,16 @@ static void *render_main(void *arg) {
                        p->vcount, (int)p->alen, p->sched_buffers, clock_locked(p), p->duration);
             }
         }
-        if (p->eof && p->vcount == 0 && p->alen == 0 && p->sched_buffers == 0) {
+        if (p->eof && !p->seek_req && p->vcount <= 1 && p->alen == 0 && p->sched_buffers == 0) {
             double clk = clock_locked(p);
             if (p->duration <= 0 || clk >= p->duration - 0.15) {
+                if (p->loop) {
+                    p->loop_count++;
+                    PE_LOG(p, "循环播放：第 %d 次回到开头", p->loop_count);
+                    pthread_mutex_unlock(&p->mu);
+                    pe_seek(p, 0);
+                    continue;
+                }
                 p->ended = 1;
                 p->clock_frozen = p->duration > 0 ? p->duration : clk;
                 pthread_cond_broadcast(&p->cond);
@@ -726,6 +1157,36 @@ static void *render_main(void *arg) {
                        p->clock_frozen, p->eof, p->io_error);
                 pthread_mutex_unlock(&p->mu);
                 continue;
+            }
+        }
+        // HLS（尤其 TS）的 demuxer 有时到片尾不返回 EOF，队列里留一帧音频/视频，
+        // eof 分支永远不满足。以 duration 为准：到片尾后连续 1.2s 没进展就收尾；
+        // loop 则回开头。暂停在上面已 continue，seek 会重置 end_hold_start。
+        if (!p->ended && p->duration > 0 && !p->seek_req) {
+            double clk = clock_locked(p);
+            if (clk >= p->duration - 0.05) {
+                if (p->end_hold_start == 0) {
+                    p->end_hold_start = now_sec();
+                } else if (now_sec() - p->end_hold_start >= 1.2) {
+                    if (p->loop) {
+                        p->loop_count++;
+                        p->end_hold_start = 0;
+                        PE_LOG(p, "循环播放：第 %d 次回到开头（片尾兜底）", p->loop_count);
+                        pthread_mutex_unlock(&p->mu);
+                        pe_seek(p, 0);
+                        continue;
+                    }
+                    p->ended = 1;
+                    p->clock_frozen = p->duration;
+                    p->end_hold_start = 0;
+                    pthread_cond_broadcast(&p->cond);
+                    PE_LOG(p, "播放结束：位置 %.3fs（片尾兜底，eof=%d）",
+                           p->clock_frozen, p->eof);
+                    pthread_mutex_unlock(&p->mu);
+                    continue;
+                }
+            } else {
+                p->end_hold_start = 0;
             }
         }
         if (p->vcount == 0) {
@@ -855,6 +1316,7 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
     p->open_t0 = now_sec();
     snprintf(p->url, sizeof(p->url), "%s", cfg->url);
     snprintf(p->title, sizeof(p->title), "%s", cfg->title ? cfg->title : "DLNA 电视");
+    snprintf(p->device_name, sizeof(p->device_name), "%s", cfg->device_name ? cfg->device_name : "DLNA 电视");
     snprintf(p->renderer, sizeof(p->renderer), "%s", cfg->renderer ? cfg->renderer : "layer");
     p->req_w = cfg->width > 0 ? cfg->width : 1280;
     p->req_h = cfg->height > 0 ? cfg->height : 720;
@@ -863,6 +1325,14 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
     p->volume = cfg->volume < 0 ? 0 : (cfg->volume > 100 ? 100 : cfg->volume);
     p->muted = cfg->muted != 0;
     p->start_pos = cfg->start_position > 0 ? cfg->start_position : 0;
+    p->req_audio_track = cfg->audio_track;
+    p->req_sub_track = cfg->subtitle_track;
+    p->speed = cfg->speed > 0 ? cfg->speed : 1.0;
+    if (p->speed < 0.25) p->speed = 0.25;
+    if (p->speed > 4.0) p->speed = 4.0;
+    p->aspect = parse_aspect(cfg->aspect);
+    snprintf(p->aspect_name, sizeof(p->aspect_name), "%s", aspect_name_of(p->aspect));
+    p->loop = cfg->loop != 0;
     p->dropping_until = -1;
     p->paused = 0;
     p->frames_shown = 0;
@@ -909,31 +1379,45 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
         return NULL;
     }
     p->window_number = (int)ui.window.windowNumber;
-    if (p->has_audio) {
-        if ([ui startAudio]) {
-            [ui setVolume:p->volume muted:p->muted];
-        } else {
-            p->audio_failed = 1;
-            p->has_audio = 0;
-            PE_LOG(p, "音频引擎启动失败，改用墙钟并静音");
-        }
+    // 即使当前没有音轨也先把音频引擎起好：切到带音轨的流（如 HLS 多码率）时
+    // 可以直接出声，不用重建窗口。
+    if ([ui startAudio]) {
+        [ui setVolume:p->volume muted:p->muted];
+        [ui setSpeedRate:p->speed];
+    } else {
+        p->audio_failed = 1;
+        p->has_audio = 0;
+        PE_LOG(p, "音频引擎启动失败，改用墙钟并静音");
     }
     p->clock_frozen = p->start_pos;
+    // 无音频时没有音频线程来启动时钟：直接用墙钟起步，否则渲染线程
+    // 会永远停在 clock_started=0，纯视频文件一帧都不出。
+    if (!p->has_audio || p->audio_failed) {
+        p->clock_started = 1;
+        p->clock_base = p->start_pos;
+        p->wall_anchor = now_sec();
+        p->force_present = 1;
+    }
     p->running = 1;
     pthread_create(&p->th_demux, NULL, demux_main, p);
     pthread_create(&p->th_audio, NULL, audio_main, p);
     pthread_create(&p->th_render, NULL, render_main, p);
     if (p->start_pos > 0) pe_seek(p, p->start_pos);
-    PE_LOG(p, "播放器就绪：窗口 %dx%d，全屏=%d，音量=%d，静音=%d",
-           win_w, win_h, p->req_fs, p->volume, p->muted);
+    PE_LOG(p, "播放器就绪：窗口 %dx%d，全屏=%d，音量=%d，静音=%d，倍速=%.2f，比例=%s，循环=%d",
+           win_w, win_h, p->req_fs, p->volume, p->muted, p->speed, p->aspect_name, p->loop);
     return p;
 }
 
 void pe_play(PePlayer *p) {
     if (!p) return;
     pthread_mutex_lock(&p->mu);
+    int ended = p->ended;
     int wasPaused = p->paused && !p->ended;
     pthread_mutex_unlock(&p->mu);
+    if (ended) {
+        pe_restart(p);
+        return;
+    }
     if (!wasPaused) return;
     // 先让节点真的跑起来，再读节点时间做锚点：pause 后 playerTimeForNodeTime
     // 可能返回 nil，沿用旧锚点会让音频时钟把暂停时长也算进去。
@@ -1003,6 +1487,8 @@ void pe_stop(PePlayer *p) {
     p->audio_trim_to = 0;
     p->sched_buffers = 0;
     clear_video_queue_locked(p);
+    clear_sub_cues_locked(p);
+    p->buffering = 0;
     pthread_cond_broadcast(&p->cond);
     pthread_mutex_unlock(&p->mu);
     PeUI *ui = (__bridge PeUI *)p->ui;
@@ -1011,39 +1497,31 @@ void pe_stop(PePlayer *p) {
     PE_LOG(p, "stop");
 }
 
+void pe_restart(PePlayer *p) {
+    if (!p) return;
+    pthread_mutex_lock(&p->mu);
+    int ended = p->ended;
+    pthread_mutex_unlock(&p->mu);
+    if (!ended) return;
+    pe_seek(p, 0);
+    pthread_mutex_lock(&p->mu);
+    p->ended = 0;
+    p->paused = 0;
+    p->clock_started = 0;
+    p->clock_frozen = 0;
+    p->clock_base = 0;
+    pthread_cond_broadcast(&p->cond);
+    pthread_mutex_unlock(&p->mu);
+    if (p->has_audio && !p->audio_failed) [(__bridge PeUI *)p->ui playAudio];
+    PE_LOG(p, "从头重新播放");
+}
+
 void pe_seek(PePlayer *p, double seconds) {
     if (!p) return;
     if (seconds < 0) seconds = 0;
     pthread_mutex_lock(&p->mu);
-    double target = seconds;
-    if (p->duration > 0 && target > p->duration - 0.05) target = p->duration - 0.05;
-    if (target < 0) target = 0;
-    p->seek_req = 1;
-    p->seek_target = target;
-    p->seek_t0 = now_sec();
-    p->seek_waiting = 1;
-    p->clock_frozen = target;
-    p->clock_started = 0;
-    p->clock_base = target;
-    p->ended = 0;
-    p->force_present = 0;
-    p->discarding = 1;
-    p->dropping_until = target;
-    p->drift_sum = 0;
-    p->drift_max = 0;
-    p->drift_last = 0;
-    p->drift_frames = 0;
-    p->drift_count = 0;
-    p->drift_pos = 0;
-    clear_video_queue_locked(p);
-    p->alen = 0;
-    p->aread = p->awrite = 0;
-    p->ring_start_pts = target;
-    p->audio_next_pts = target;
-    p->audio_trim = 1;
-    p->audio_trim_to = target;
-    p->sched_buffers = 0;
-    pthread_cond_broadcast(&p->cond);
+    request_seek_locked(p, seconds);
+    double target = p->seek_target;
     pthread_mutex_unlock(&p->mu);
     [(__bridge PeUI *)p->ui stopAudio];
     PE_LOG(p, "seek 请求：%.3fs", target);
@@ -1136,6 +1614,291 @@ const char *pe_hwdevice_name(PePlayer *p) {
 
 int pe_window_number(PePlayer *p) { return p ? p->window_number : 0; }
 
+// ---------- 高级播放控制 ----------
+
+void pe_set_speed(PePlayer *p, double speed) {
+    if (!p) return;
+    if (speed < 0.25) speed = 0.25;
+    if (speed > 4.0) speed = 4.0;
+    pthread_mutex_lock(&p->mu);
+    double pos = pos_locked(p);
+    p->speed = speed;
+    p->clock_base = pos;
+    p->clock_frozen = pos;
+    p->wall_anchor = now_sec();
+    if (p->has_audio && !p->audio_failed && p->ui) {
+        double ns = [(__bridge PeUI *)p->ui nodeSeconds];
+        if (ns >= 0) p->anchor_node_sec = ns;
+    }
+    pthread_mutex_unlock(&p->mu);
+    PeUI *ui = (__bridge PeUI *)p->ui;
+    if (ui) [ui postUIBlock:^{ [ui setSpeedRate:speed]; }];
+    PE_LOG(p, "倍速 → %.2fx（位置 %.3fs）", speed, pos);
+}
+
+double pe_get_speed(PePlayer *p) {
+    if (!p) return 1.0;
+    pthread_mutex_lock(&p->mu);
+    double v = p->speed;
+    pthread_mutex_unlock(&p->mu);
+    return v;
+}
+
+void pe_set_loop(PePlayer *p, int on) {
+    if (!p) return;
+    pthread_mutex_lock(&p->mu);
+    p->loop = on != 0;
+    pthread_mutex_unlock(&p->mu);
+    PE_LOG(p, "循环播放 → %d", on != 0);
+}
+
+int pe_get_loop(PePlayer *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int v = p->loop;
+    pthread_mutex_unlock(&p->mu);
+    return v;
+}
+
+void pe_set_aspect(PePlayer *p, const char *aspect) {
+    if (!p) return;
+    int a = parse_aspect(aspect);
+    pthread_mutex_lock(&p->mu);
+    p->aspect = a;
+    snprintf(p->aspect_name, sizeof(p->aspect_name), "%s", aspect_name_of(a));
+    pthread_mutex_unlock(&p->mu);
+    PeUI *ui = (__bridge PeUI *)p->ui;
+    if (ui) [ui postUIBlock:^{ [ui layoutVideoLayer]; }];
+    PE_LOG(p, "画面比例 → %s", aspect_name_of(a));
+}
+
+const char *pe_get_aspect(PePlayer *p) {
+    if (!p) return "auto";
+    pthread_mutex_lock(&p->mu);
+    int a = p->aspect;
+    pthread_mutex_unlock(&p->mu);
+    return aspect_name_of(a);
+}
+
+int pe_audio_track_count(PePlayer *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int n = p->natracks;
+    pthread_mutex_unlock(&p->mu);
+    return n;
+}
+
+int pe_audio_track_info(PePlayer *p, int ordinal, PeTrackInfo *out) {
+    if (!p || !out) return -1;
+    pthread_mutex_lock(&p->mu);
+    if (ordinal < 0 || ordinal >= p->natracks) {
+        pthread_mutex_unlock(&p->mu);
+        return -1;
+    }
+    *out = p->atracks[ordinal];
+    pthread_mutex_unlock(&p->mu);
+    return 0;
+}
+
+int pe_subtitle_track_count(PePlayer *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int n = p->nstracks;
+    pthread_mutex_unlock(&p->mu);
+    return n;
+}
+
+int pe_subtitle_track_info(PePlayer *p, int ordinal, PeTrackInfo *out) {
+    if (!p || !out) return -1;
+    pthread_mutex_lock(&p->mu);
+    if (ordinal < 0 || ordinal >= p->nstracks) {
+        pthread_mutex_unlock(&p->mu);
+        return -1;
+    }
+    *out = p->stracks[ordinal];
+    pthread_mutex_unlock(&p->mu);
+    return 0;
+}
+
+void pe_set_audio_track(PePlayer *p, int id) {
+    if (!p) return;
+    pthread_mutex_lock(&p->mu);
+    if (id < 1 || id > p->natracks) {
+        pthread_mutex_unlock(&p->mu);
+        return;
+    }
+    int stream = p->atracks[id - 1].stream_index;
+    if (stream == p->aidx && !p->audio_switch_pending) {
+        pthread_mutex_unlock(&p->mu);
+        return;
+    }
+    p->pending_aidx = stream;
+    p->audio_switch_pending = 1;
+    double pos = pos_locked(p);
+    request_seek_locked(p, pos);
+    pthread_mutex_unlock(&p->mu);
+    PeUI *ui = (__bridge PeUI *)p->ui;
+    if (ui) [ui stopAudio];
+    PE_LOG(p, "切音轨 → %d（流 %d，位置 %.3fs）", id, stream, pos);
+}
+
+void pe_set_subtitle_track(PePlayer *p, int id) {
+    if (!p) return;
+    pthread_mutex_lock(&p->mu);
+    int stream = -1;
+    if (id > 0) {
+        if (id > p->nstracks) {
+            pthread_mutex_unlock(&p->mu);
+            return;
+        }
+        stream = p->stracks[id - 1].stream_index;
+    }
+    if (stream == p->sidx && !p->sub_switch_pending) {
+        pthread_mutex_unlock(&p->mu);
+        return;
+    }
+    p->pending_sidx = stream;
+    p->sub_switch_pending = 1;
+    double pos = pos_locked(p);
+    request_seek_locked(p, pos);
+    pthread_mutex_unlock(&p->mu);
+    PeUI *ui = (__bridge PeUI *)p->ui;
+    if (ui) [ui stopAudio];
+    PE_LOG(p, "切字幕 → %d（流 %d，位置 %.3fs）", id, stream, pos);
+}
+
+int pe_get_audio_track(PePlayer *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int id = track_id_for_stream(p, p->aidx, 0);
+    pthread_mutex_unlock(&p->mu);
+    return id;
+}
+
+int pe_get_subtitle_track(PePlayer *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int id = track_id_for_stream(p, p->sidx, 1);
+    pthread_mutex_unlock(&p->mu);
+    return id;
+}
+
+int pe_get_subtitle_text(PePlayer *p, char *buf, int len) {
+    if (!p || !buf || len <= 0) return 0;
+    buf[0] = 0;
+    pthread_mutex_lock(&p->mu);
+    double pos = pos_locked(p);
+    int o = 0;
+    for (int i = 0; i < p->ncues && o + 1 < len; i++) {
+        PeSubCue *c = &p->cues[i];
+        if (pos + 0.02 < c->start || pos > c->end + 0.02) continue;
+        size_t n = strlen(c->text);
+        if (o + (int)n + 2 >= len) n = (size_t)(len - o - 2);
+        if (o > 0) buf[o++] = '\n';
+        memcpy(buf + o, c->text, n);
+        o += (int)n;
+        buf[o] = 0;
+    }
+    pthread_mutex_unlock(&p->mu);
+    return o;
+}
+
+int pe_screenshot(PePlayer *p, const char *path, char *errbuf, int errlen) {
+    if (errbuf && errlen > 0) errbuf[0] = 0;
+    if (!p || !path || !path[0]) {
+        if (errbuf) snprintf(errbuf, errlen, "截图路径为空");
+        return -1;
+    }
+    pthread_mutex_lock(&p->mu);
+    CVPixelBufferRef pb = p->last_pb ? CVPixelBufferRetain(p->last_pb) : NULL;
+    pthread_mutex_unlock(&p->mu);
+    if (!pb) {
+        if (errbuf) snprintf(errbuf, errlen, "还没有可截图的画面");
+        return -1;
+    }
+    static CIContext *ciCtx = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ciCtx = [CIContext contextWithOptions:nil]; });
+    CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
+    CGImageRef cg = ci ? [ciCtx createCGImage:ci fromRect:ci.extent] : NULL;
+    CVPixelBufferRelease(pb);
+    if (!cg) {
+        if (errbuf) snprintf(errbuf, errlen, "像素缓冲转图片失败");
+        return -1;
+    }
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, (const UInt8 *)path, strlen(path), false);
+    if (!url) {
+        CGImageRelease(cg);
+        if (errbuf) snprintf(errbuf, errlen, "截图路径无效");
+        return -1;
+    }
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+    if (!dest) {
+        CFRelease(url);
+        CGImageRelease(cg);
+        if (errbuf) snprintf(errbuf, errlen, "创建 PNG 失败");
+        return -1;
+    }
+    CGImageDestinationAddImage(dest, cg, NULL);
+    bool ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    CFRelease(url);
+    CGImageRelease(cg);
+    if (!ok) {
+        if (errbuf) snprintf(errbuf, errlen, "写 PNG 失败");
+        return -1;
+    }
+    PE_LOG(p, "截图已保存：%s", path);
+    return 0;
+}
+
+const char *pe_title(PePlayer *p) { return p ? p->title : ""; }
+const char *pe_device_name(PePlayer *p) { return p ? p->device_name : ""; }
+
+// ---------- UI 验证钩子 ----------
+
+static void pe_ui_block(PePlayer *p, void (^fn)(PeOverlayView *)) {
+    if (!p) return;
+    PeUI *ui = (__bridge PeUI *)p->ui;
+    if (!ui) return;
+    [ui postUIBlock:^{
+        if (ui.overlay) fn(ui.overlay);
+    }];
+}
+
+void pe_ui_set_visible(PePlayer *p, int visible) {
+    pe_ui_block(p, ^(PeOverlayView *v) { [v debugSetControlsVisible:visible != 0]; });
+}
+
+void pe_ui_hover(PePlayer *p, const char *control) {
+    if (!control) return;
+    NSString *name = [NSString stringWithUTF8String:control];
+    if (!name) return;
+    pe_ui_block(p, ^(PeOverlayView *v) { [v debugHoverControl:name]; });
+}
+
+void pe_ui_click(PePlayer *p, const char *control) {
+    if (!control) return;
+    NSString *name = [NSString stringWithUTF8String:control];
+    if (!name) return;
+    pe_ui_block(p, ^(PeOverlayView *v) { [v debugClickControl:name]; });
+}
+
+void pe_ui_menu(PePlayer *p, const char *menu) {
+    if (!menu) return;
+    NSString *name = [NSString stringWithUTF8String:menu];
+    if (!name) return;
+    pe_ui_block(p, ^(PeOverlayView *v) { [v debugOpenMenu:name]; });
+}
+
+void pe_ui_key(PePlayer *p, const char *key) {
+    if (!key) return;
+    NSString *name = [NSString stringWithUTF8String:key];
+    if (!name) return;
+    pe_ui_block(p, ^(PeOverlayView *v) { [v debugKey:name]; });
+}
+
 static double drift_p95_locked(PePlayer *p) {
     int n = p->drift_count < PE_DRIFT_SAMPLES ? p->drift_count : PE_DRIFT_SAMPLES;
     if (n <= 0) return 0;
@@ -1186,6 +1949,15 @@ void pe_get_status(PePlayer *p, PeStatus *out) {
     out->muted = p->muted;
     out->window_number = p->window_number;
     out->buffered_ms = ((double)p->vcount * p->frame_interval + (double)p->alen / PE_AUDIO_RATE) * 1000.0;
+    out->speed = p->speed;
+    out->loop = p->loop;
+    snprintf(out->aspect, sizeof(out->aspect), "%s", p->aspect_name);
+    out->audio_track = track_id_for_stream(p, p->aidx, 0);
+    out->subtitle_track = track_id_for_stream(p, p->sidx, 1);
+    out->audio_tracks = p->natracks;
+    out->subtitle_tracks = p->nstracks;
+    out->buffering = (!p->paused && !p->ended && (!p->first_frame_done || p->seek_waiting)) ? 1 : 0;
+    out->io_error = p->io_error;
     pthread_mutex_unlock(&p->mu);
 
     struct rusage ru;
@@ -1272,8 +2044,10 @@ void pe_close(PePlayer *p) {
         if (p->run_started && !pthread_main_np()) {
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             [ui postUIBlock:^{
-                [ui hideWindow];
-                [ui requestStopRun];
+                [ui fadeOutThenHideWithCompletion:^{
+                    [ui hideWindow];
+                    [ui requestStopRun];
+                }];
                 dispatch_semaphore_signal(sem);
             }];
             long timedout = dispatch_semaphore_wait(
@@ -1296,6 +2070,13 @@ void pe_destroy(PePlayer *p) {
     if (p->fmt) avformat_close_input(&p->fmt);
     if (p->swr) swr_free(&p->swr);
     if (p->hwdev) av_buffer_unref(&p->hwdev);
+    if (p->sctx) avcodec_free_context(&p->sctx);
+    if (p->last_pb) {
+        CVPixelBufferRelease(p->last_pb);
+        p->last_pb = NULL;
+    }
+    for (int i = 0; i < p->ncues; i++) free(p->cues[i].text);
+    free(p->cues);
     free(p->scratch);
     free(p->aring);
     PeUI *ui = (__bridge PeUI *)p->ui;
@@ -1360,22 +2141,37 @@ void pe_destroy(PePlayer *p) {
     view.ctx = self.ctx;
     view.wantsLayer = YES;
     view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.view = view;
-    self.window.contentView = view;
+
+    NSView *root = [[NSView alloc] initWithFrame:rect];
+    root.wantsLayer = YES;
+    root.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    root.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.rootView = root;
+    [root addSubview:view];
 
     self.layer = [[AVSampleBufferDisplayLayer alloc] init];
     self.layer.frame = view.bounds;
     self.layer.videoGravity = AVLayerVideoGravityResizeAspect;
     self.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-    self.layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     [view.layer addSublayer:self.layer];
 
-    [self.window makeFirstResponder:view];
+    PePlayer *p = self.ctx;
+    NSString *devName = p ? [NSString stringWithUTF8String:p->device_name] : @"";
+    self.overlay = [[PeOverlayView alloc] initWithFrame:root.bounds
+                                                player:p
+                                                 title:title
+                                                device:devName];
+    self.overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [root addSubview:self.overlay];
+
+    self.window.contentView = root;
+    [self.window makeFirstResponder:self.overlay];
     [self.window makeKeyAndOrderFront:nil];
     [self setupMenu];
     self.uiQueue = [NSMutableArray array];
     self.uiLock = [[NSLock alloc] init];
-    PePlayer *p = self.ctx;
     __weak PeUI *weakSelf = self;
     self.uiTimer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *t) {
         (void)t;
@@ -1393,6 +2189,7 @@ void pe_destroy(PePlayer *p) {
         }
     }];
     [[NSRunLoop mainRunLoop] addTimer:self.uiTimer forMode:NSRunLoopCommonModes];
+    [self layoutVideoLayer];
     if (fs) [self setFullscreen:YES];
     return YES;
 }
@@ -1424,14 +2221,48 @@ void pe_destroy(PePlayer *p) {
 
 - (void)windowDidResize:(NSNotification *)note {
     (void)note;
+    if (self.rootView) {
+        self.view.frame = self.rootView.bounds;
+        self.overlay.frame = self.rootView.bounds;
+    }
+    [self layoutVideoLayer];
+}
+
+- (void)layoutVideoLayer {
+    if (!self.view || !self.layer) return;
+    NSRect b = self.view.bounds;
+    PePlayer *p = self.ctx;
+    int asp = p ? p->aspect : 0;
+    NSRect r = b;
+    NSString *grav = AVLayerVideoGravityResizeAspect;
+    if (asp == 1 || asp == 2) {
+        double target = asp == 1 ? 16.0 / 9.0 : 4.0 / 3.0;
+        double bw = b.size.width, bh = b.size.height;
+        if (bw / bh > target) {
+            r.size.width = bh * target;
+            r.origin.x = (bw - r.size.width) / 2.0;
+        } else {
+            r.size.height = bw / target;
+            r.origin.y = (bh - r.size.height) / 2.0;
+        }
+        grav = AVLayerVideoGravityResize;
+    } else if (asp == 3) {
+        grav = AVLayerVideoGravityResizeAspectFill;
+    }
+    self.layer.videoGravity = grav;
+    self.layer.frame = r;
 }
 
 - (BOOL)startAudio {
     self.audioEngine = [[AVAudioEngine alloc] init];
     self.audioPlayer = [[AVAudioPlayerNode alloc] init];
+    self.timePitch = [[AVAudioUnitTimePitch alloc] init];
+    self.timePitch.rate = 1.0;
     [self.audioEngine attachNode:self.audioPlayer];
+    [self.audioEngine attachNode:self.timePitch];
     self.audioFormat = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:PE_AUDIO_RATE channels:2];
-    [self.audioEngine connect:self.audioPlayer to:self.audioEngine.mainMixerNode format:self.audioFormat];
+    [self.audioEngine connect:self.audioPlayer to:self.timePitch format:self.audioFormat];
+    [self.audioEngine connect:self.timePitch to:self.audioEngine.mainMixerNode format:self.audioFormat];
     self.audioEngine.mainMixerNode.outputVolume = 1.0;
     NSError *err = nil;
     if (![self.audioEngine startAndReturnError:&err]) {
@@ -1439,6 +2270,11 @@ void pe_destroy(PePlayer *p) {
         return NO;
     }
     return YES;
+}
+
+- (void)setSpeedRate:(double)speed {
+    if (!self.timePitch) return;
+    self.timePitch.rate = (float)speed;
 }
 
 - (void)setVolume:(int)vol muted:(BOOL)muted {
@@ -1472,7 +2308,11 @@ static int gFullscreenDepth = 0;
     }
     [self.window makeKeyAndOrderFront:nil];
     self.fsActive = on;
-    self.layer.frame = self.view.bounds;
+    if (self.rootView) {
+        self.view.frame = self.rootView.bounds;
+        self.overlay.frame = self.rootView.bounds;
+    }
+    [self layoutVideoLayer];
     gFullscreenDepth--;
     PE_LOG(p, "全屏切换完成 on=%d 窗口 %.0fx%.0f", on,
            self.window.frame.size.width, self.window.frame.size.height);
@@ -1496,6 +2336,14 @@ static int gFullscreenDepth = 0;
         owned = YES;
     }
     if (!pb) return;
+    PePlayer *p = self.ctx;
+    if (p) {
+        pthread_mutex_lock(&p->mu);
+        CVPixelBufferRef old = p->last_pb;
+        p->last_pb = CVPixelBufferRetain(pb);
+        pthread_mutex_unlock(&p->mu);
+        if (old) CVPixelBufferRelease(old);
+    }
     CMVideoFormatDescriptionRef fd = NULL;
     if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fd) == noErr) {
         CMSampleTimingInfo timing = {kCMTimeInvalid, CMTimeMakeWithSeconds(pts, 1000), kCMTimeInvalid};
@@ -1617,6 +2465,21 @@ static int gFullscreenDepth = 0;
     [self.uiLock unlock];
 }
 
+- (void)fadeOutThenHideWithCompletion:(void (^)(void))done {
+    if (!self.window) {
+        if (done) done();
+        return;
+    }
+    __weak PeUI *weakSelf = self;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+        ctx.duration = 0.18;
+        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
+        weakSelf.window.animator.alphaValue = 0.0;
+    } completionHandler:^{
+        if (done) done();
+    }];
+}
+
 - (void)hideWindow {
     if (!self.window) return;
     self.window.delegate = nil;
@@ -1648,6 +2511,11 @@ static int gFullscreenDepth = 0;
 }
 
 - (void)teardown {
+    if (self.overlay) {
+        [self.overlay shutdown];
+        [self.overlay removeFromSuperview];
+        self.overlay = nil;
+    }
     if (self.uiTimer) {
         [self.uiTimer invalidate];
         self.uiTimer = nil;
@@ -1665,6 +2533,7 @@ static int gFullscreenDepth = 0;
         [self.window orderOut:nil];
         [self.window close];
         self.window = nil;
+        self.rootView = nil;
         // 事件循环随后就要停：手动提交一次 CA 事务，把“窗口已移除”
         // 真正推给窗口服务器，否则它会留一块黑屏盖在桌面上。
         [CATransaction flush];

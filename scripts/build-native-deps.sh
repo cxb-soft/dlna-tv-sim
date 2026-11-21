@@ -77,10 +77,10 @@ CONFIGURE_ARGS=(
   --enable-swresample --enable-swscale
   --enable-videotoolbox --enable-audiotoolbox --enable-securetransport
   --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox
-  --enable-decoder=h264,hevc,aac,aac_at,mp3,h264_videotoolbox,hevc_videotoolbox
-  --enable-demuxer=mov,matroska,mp3,aac
+  --enable-decoder=h264,hevc,aac,aac_at,mp3,mp2,ac3,eac3,flac,opus,vorbis,subrip,ass,ssa,mov_text,webvtt,h264_videotoolbox,hevc_videotoolbox
+  --enable-demuxer=mov,matroska,mp3,aac,mpegts,hls
   --enable-parser=h264,hevc,aac,mpegaudio
-  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb
+  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc
   --enable-protocol=file,http,https,tcp,udp,crypto
   --enable-network
   # dylib 的 install_name 用 @rpath，App 内由 executable 的 rpath 指向 lib/

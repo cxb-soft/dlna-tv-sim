@@ -216,3 +216,8 @@ DLNA_NATIVE_ENGINE=0 ./scripts/package-macos-app.sh   # 旧行为：不含 nativ
 - 实测（App 内引擎、`env -i` 干净环境）：H.264/HEVC 均 `videotoolbox_vld` 硬解，
   seek 20s 首帧 pts=20.000，Stop 后正常关窗退出；运行时加载的 libav* 全部来自
   App 内 `engine/lib`。
+
+## 完整化（2026-11-22）
+
+HLS（TS/AES）、音轨/字幕、倍速、比例、循环、截图与自绘控件已实现，详见
+[`NATIVE-FULL.md`](NATIVE-FULL.md)。HLS fMP4 仍有已知限制，文中列明。

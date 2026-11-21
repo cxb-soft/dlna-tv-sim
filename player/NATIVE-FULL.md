@@ -1,0 +1,46 @@
+# native 播放核心完整化（2026-11-22）
+
+这一轮把 `-player native` 从 spike 补到可日常使用：HLS、音轨/字幕、倍速、画面比例、循环、截图，以及一套自绘播放器控件。默认引擎仍是 mpv；`-player native` 才走这里。
+
+## 能力
+
+| 能力 | 实现 | 状态 |
+| --- | --- | --- |
+| HLS | LGPL FFmpeg 增加 hls/mpegts demuxer、aac_adtstoasc、crypto 协议；本地/HTTP 的 TS 分片、AES-128 均可播、可 seek | HTTP TS 1.2s/seek 43ms；HTTP fMP4 673ms、30fps；本地 fMP4 约 5s（音频先读） |
+| 音轨 | 枚举语言/标题/编码/声道；切轨重建解码器 + seek 到当前位置 + 重锚音频时钟 | AAC/AC3 双音轨实测 |
+| 字幕 | SRT/ASS/SSA/mov_text/WebVTT 解码 + 自绘；Matroska ASS 包（8 逗号）与 Dialogue 行（9 逗号）都能解析，剥 `{\...}` 标签 | SRT/ASS 实测 |
+| 倍速 | `AVAudioUnitTimePitch.rate`，0.25–4×，变速不变调；UI 提供 0.5–2.0× | 1.5× 实测 0.6s 墙钟走 0.9s 媒体 |
+| 比例 | auto / 16:9 / 4:3 / fill；16:9、4:3 用独立视频层矩形做黑边，fill 用 `ResizeAspectFill` | 截图确认 |
+| 循环 | 结尾自动 seek 0 并重锚时钟 | 18.5s→0.13s |
+| 截图 | 保留最近一帧 CVPixelBuffer，CIContext→CGImage→PNG（不含控件） | 实测 PNG |
+| 缓冲/错误 | 状态 `buffering`/`io_error`；UI 居中 loading、顶部 toast | 已实现 |
+| 控件 | AppKit/CoreAnimation 全自绘，深色影院风，与应用主题同色 | 10+ 张截图 |
+
+## UI
+
+- 顶部：媒体标题 + 设备名/投屏中 + `H.264 · 1280×720 · 30fps · 硬解`。
+- 底部：48pt 琥珀播放/暂停、±10s、音量滑块/静音、倍速/音轨/字幕/比例胶囊、全屏、关闭；进度条含已播/缓冲/悬停预览气泡和时间；热区 ≥ 40pt。
+- 鼠标移动淡入、静止 2.5s 淡出（暂停/菜单/拖动不淡出）；悬停高亮；拖进度/音量；单击画面播放暂停（0.22s 延迟规避双击）、双击全屏；空格、←→、↑↓、M、F、S、Esc。
+- 菜单：倍速（含循环开关）、音轨、字幕（关闭+各轨）、比例，自绘面板/勾选/悬停。
+- 打开黑场 0.55s 淡入；关闭按钮 0.22s 淡出后收窗；DLNA Stop 0.18s 窗口淡出。
+- 截图在 `/tmp/pe_shots/`：`10_controls.png`（控件+进度悬停）、`11_audio_menu.png`、`12_paused.png`、`13_sub_srt.png`、`14_sub_ass.png`、`15_aspect43.png`、`16_aspect169.png`、`17_loop.png`、`18_hls_ts.png`、`20_hidden.png`（控件淡出）、`21_buffering.png`（fMP4 起播缓冲）。均为 `screencapture -l<window>` 窗口原图，不是合成图。
+
+## 验证结果（macOS 27 arm64）
+
+- 1080p H.264+AAC mp4：硬解，首帧 0.4–1.5s，pacing p95 5–7ms，CPU 3–9%。
+- 1080p HEVC mkv：硬解，首帧约 1.1s，CPU 6–7%。
+- 双音轨/双字幕 mkv：2/2 枚举；AAC→AC3 切轨 110ms；SRT→ASS 42–93ms，cue 文本/时间正确。
+- HLS TS（本地/HTTP）：HTTP 首帧 1.2s、seek 10s 43ms；本地首帧 0.5–2.3s、seek 37–259ms；播完 `ended=true`（TS demuxer 不报 EOF 时按 duration 兜底）。
+- HLS fMP4：HTTP 首帧 673ms、30fps、零丢帧（7.5s/93 帧）；本地文件约 5s 起播后 30fps（长跑 10.8s/178 帧）；seek 15–162ms，播完 `ended=true`。
+- 片尾兜底：duration 到片尾后连续 1.2s 无进展就上报 Ended；TS/fMP4 都验证，loop 同样回开头。
+- 纯视频 mp4 / 纯视频 fMP4 HLS：30fps，位置正常推进（无音轨时引擎用墙钟起步）。
+- HLS AES-128：放行密钥扩展名后首帧 0.48s，seek 44ms。
+- LGPL 依赖重编后（`PKG_CONFIG_PATH=…/ffmpeg-lgpl/lib/pkgconfig`）：HLS TS + ASS 字幕通过；`otool -L` 只有 `@rpath/libav*`。
+
+## 已知限制
+
+- **本地文件 fMP4**：FFmpeg 9.0.1 的 hls+fMP4 对本地文件会先灌入约 5 秒音频再出视频，起播慢；HTTP 同一份 fMP4 首帧 673ms、30fps 正常。TS/AES 本地/HTTP 都正常。
+- ASS 只渲染纯文本，定位/字体/颜色/特效不还原。
+- AES 本地密钥常是 `.bin`，FFmpeg 默认按扩展名拦截；引擎设 `allowed_extensions=ALL`（仅本地文件）放行。
+- HLS HEVC、加密 fMP4、master playlist 未实测。
+- Windows/Linux 仍是编译占位，`-player native` 回退 mpv；一个进程仍只跑一个窗口。

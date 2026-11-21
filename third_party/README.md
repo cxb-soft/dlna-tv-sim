@@ -29,8 +29,9 @@ FFMPEG_VERSION=9.0.2 ./scripts/build-native-deps.sh
 | 许可 | LGPL version 2.1 or later（`CONFIG_GPL=0`、`CONFIG_NONFREE=0`、`CONFIG_VERSION3=0`） |
 | 库 | libavformat / libavcodec / libavutil / libswresample / libswscale（动态库 + 头文件 + .pc） |
 | 硬解 | h264_videotoolbox / hevc_videotoolbox（VideoToolbox） |
-| 解码器 | h264、hevc、aac、aac_at、mp3、h264_videotoolbox、hevc_videotoolbox |
-| 解封装 | mov（mp4/m4a/mov）、matroska（mkv/webm）、mp3、aac |
+| 解码器 | h264、hevc、aac、aac_at、mp3、mp2、ac3、eac3、flac、opus、vorbis、subrip、ass、ssa、mov_text、webvtt、h264_videotoolbox、hevc_videotoolbox |
+| 解封装 | mov（mp4/m4a/mov）、matroska（mkv/webm）、mp3、aac、mpegts、hls |
+| 字幕 | SRT/ASS/SSA/mov_text/WebVTT（纯文本渲染，复杂 ASS 排版不还原） |
 | 协议 | file、http、https、tcp、udp、crypto、tls（Secure Transport） |
 | 外部依赖 | 只有系统框架（VideoToolbox/AudioToolbox/CoreMedia/CoreVideo/CoreServices/libSystem），无第三方库 |
 
@@ -43,9 +44,10 @@ FFMPEG_VERSION=9.0.2 ./scripts/build-native-deps.sh
 --enable-avformat --enable-avcodec --enable-avutil --enable-swresample --enable-swscale
 --enable-videotoolbox --enable-audiotoolbox --enable-securetransport
 --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox
---enable-decoder=h264,hevc,aac,aac_at,mp3,h264_videotoolbox,hevc_videotoolbox
---enable-demuxer=mov,matroska,mp3,aac
+--enable-decoder=h264,hevc,aac,aac_at,mp3,mp2,ac3,eac3,flac,opus,vorbis,subrip,ass,ssa,mov_text,webvtt,h264_videotoolbox,hevc_videotoolbox
+--enable-demuxer=mov,matroska,mp3,aac,mpegts,hls
 --enable-parser=h264,hevc,aac,mpegaudio
+--enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc
 --enable-protocol=file,http,https,tcp,udp,crypto
 --install-name-dir=@rpath --extra-ldflags=-Wl,-rpath,@loader_path
 ```

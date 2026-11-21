@@ -12,6 +12,7 @@ typedef struct PePlayer PePlayer;
 typedef struct {
     const char *url;          /* 本地路径或 http(s) 地址 */
     const char *title;        /* 窗口标题，可为 NULL */
+    const char *device_name;  /* 播放器 UI 顶部显示的设备名，可为 NULL */
     int width;                /* 窗口宽，0 表示 1280 */
     int height;               /* 窗口高，0 表示 720 */
     int fullscreen;           /* 1 = 无边框全屏 */
@@ -20,7 +21,22 @@ typedef struct {
     int hardware;             /* 1 = 优先 VideoToolbox，失败自动回软解 */
     const char *renderer;     /* "layer"（默认）；保留扩展位 */
     double start_position;    /* 起播位置（秒），0 表示从头 */
+    double speed;             /* 0.25..4，1 = 原速 */
+    const char *aspect;       /* auto / 16:9 / 4:3 / fill */
+    int loop;                 /* 1 = 单文件循环 */
+    int audio_track;          /* 1 起的音轨编号，0 = 自动 */
+    int subtitle_track;       /* 1 起的字幕轨编号，0 = 关闭 */
 } PeConfig;
+
+/* 一条音轨/字幕轨。id 是给 UI 和 DLNA 用的稳定编号（1 起）。 */
+typedef struct {
+    int id;
+    int stream_index;         /* FFmpeg 流索引 */
+    int channels;             /* 音轨声道数，字幕为 0 */
+    char lang[32];
+    char title[160];
+    char codec[40];
+} PeTrackInfo;
 
 typedef struct {
     double position;          /* 当前播放位置（秒），音频时钟 */
@@ -48,12 +64,24 @@ typedef struct {
     double volume;
     int muted;
     int window_number;        /* NSWindow.windowNumber，用于 screencapture -l */
+
+    /* 高级播放状态 */
+    double speed;
+    int loop;
+    char aspect[8];
+    int audio_track;          /* 当前音轨编号，0 = 无 */
+    int subtitle_track;       /* 当前字幕编号，0 = 关闭 */
+    int audio_tracks;
+    int subtitle_tracks;
+    int buffering;            /* 1 = 起播/seek 后还没出画面 */
+    int io_error;             /* 1 = 读流中断（网络/媒体源错误） */
 } PeStatus;
 
 PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen);
 void pe_play(PePlayer *p);
 void pe_pause(PePlayer *p);
 void pe_toggle_pause(PePlayer *p);
+void pe_restart(PePlayer *p);   /* 播完后回到开头继续 */
 void pe_stop(PePlayer *p);
 void pe_seek(PePlayer *p, double seconds);
 void pe_seek_relative(PePlayer *p, double delta);
@@ -75,6 +103,41 @@ void pe_close(PePlayer *p);
 void pe_destroy(PePlayer *p);
 const char *pe_ffmpeg_version(void);
 double pe_now(void);
+
+/* ---------- 高级播放控制 ---------- */
+
+void pe_set_speed(PePlayer *p, double speed);
+double pe_get_speed(PePlayer *p);
+void pe_set_loop(PePlayer *p, int on);
+int  pe_get_loop(PePlayer *p);
+void pe_set_aspect(PePlayer *p, const char *aspect);
+const char *pe_get_aspect(PePlayer *p);
+
+int pe_audio_track_count(PePlayer *p);
+int pe_audio_track_info(PePlayer *p, int ordinal, PeTrackInfo *out); /* ordinal 0 起 */
+int pe_subtitle_track_count(PePlayer *p);
+int pe_subtitle_track_info(PePlayer *p, int ordinal, PeTrackInfo *out);
+void pe_set_audio_track(PePlayer *p, int id);      /* 1 起，越界忽略 */
+void pe_set_subtitle_track(PePlayer *p, int id);   /* 0 = 关闭 */
+int  pe_get_audio_track(PePlayer *p);
+int  pe_get_subtitle_track(PePlayer *p);
+
+/* 当前正在显示的字幕文本（UTF-8，多行用 \n），返回写入字节数。 */
+int  pe_get_subtitle_text(PePlayer *p, char *buf, int len);
+
+/* 把当前视频帧写成 PNG，成功返回 0。可从任意线程调用。 */
+int  pe_screenshot(PePlayer *p, const char *path, char *errbuf, int errlen);
+
+const char *pe_title(PePlayer *p);
+const char *pe_device_name(PePlayer *p);
+
+/* ---------- 验证/脚本钩子（都投递到主线程执行） ---------- */
+
+void pe_ui_set_visible(PePlayer *p, int visible);
+void pe_ui_hover(PePlayer *p, const char *control);   /* "play"、"progress:0.5" */
+void pe_ui_click(PePlayer *p, const char *control);
+void pe_ui_menu(PePlayer *p, const char *menu);        /* speed/audio/sub/aspect */
+void pe_ui_key(PePlayer *p, const char *key);          /* space/left/right/up/down/m/f/s/esc */
 
 #ifdef __cplusplus
 }
