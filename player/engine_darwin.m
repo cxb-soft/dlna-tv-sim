@@ -1318,8 +1318,8 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
     snprintf(p->title, sizeof(p->title), "%s", cfg->title ? cfg->title : "DLNA 电视");
     snprintf(p->device_name, sizeof(p->device_name), "%s", cfg->device_name ? cfg->device_name : "DLNA 电视");
     snprintf(p->renderer, sizeof(p->renderer), "%s", cfg->renderer ? cfg->renderer : "layer");
-    p->req_w = cfg->width > 0 ? cfg->width : 1280;
-    p->req_h = cfg->height > 0 ? cfg->height : 720;
+    p->req_w = cfg->width > 0 ? cfg->width : 0;
+    p->req_h = cfg->height > 0 ? cfg->height : 0;
     p->req_fs = cfg->fullscreen != 0;
     p->req_hw = cfg->hardware != 0;
     p->volume = cfg->volume < 0 ? 0 : (cfg->volume > 100 ? 100 : cfg->volume);
@@ -1361,14 +1361,19 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
     p->ui = (__bridge_retained void *)ui;
     int win_w = p->req_w;
     int win_h = p->req_h;
-    if (p->video_w > 0 && p->video_h > 0 && p->req_w == 1280 && p->req_h == 720) {
-        // 默认窗口贴合视频比例
-        win_w = p->video_w;
-        win_h = p->video_h;
+    if (win_w <= 0 && win_h <= 0) {
+        win_w = p->video_w > 0 ? p->video_w : 1280;
+        win_h = p->video_h > 0 ? p->video_h : 720;
         if (win_w > 1600) {
-            win_h = (int)((double)p->video_h * 1600.0 / p->video_w);
+            win_h = (int)((double)win_h * 1600.0 / win_w);
             win_w = 1600;
         }
+    } else if (win_w > 0 && win_h <= 0) {
+        win_h = (p->video_w > 0 && p->video_h > 0)
+            ? (int)((double)p->video_h * win_w / p->video_w) : 720;
+    } else if (win_h > 0 && win_w <= 0) {
+        win_w = (p->video_w > 0 && p->video_h > 0)
+            ? (int)((double)p->video_w * win_h / p->video_h) : 1280;
     }
     if (![ui openWindowWidth:win_w height:win_h fullscreen:p->req_fs
                        title:[NSString stringWithUTF8String:p->title]]) {

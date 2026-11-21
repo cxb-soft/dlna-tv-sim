@@ -44,3 +44,28 @@
 - AES 本地密钥常是 `.bin`，FFmpeg 默认按扩展名拦截；引擎设 `allowed_extensions=ALL`（仅本地文件）放行。
 - HLS HEVC、加密 fMP4、master playlist 未实测。
 - Windows/Linux 仍是编译占位，`-player native` 回退 mpv；一个进程仍只跑一个窗口。
+
+## 视觉重做（2026-11-22，父链评审后）
+
+按父链 9 条清单完成一轮视觉重做，实现在 `player/player_ui_darwin.m`：
+
+- 底部 180pt `0 → 0.82` 黑 scrim，顶部 120pt `0.45 → 0`；控件不再直接压在亮画面上。
+- 唯一强调色改为 `#F2C27C → #D99447` 琥珀渐变；其余全部中性白 0.92/0.55/0.28、黑 0.5；去掉了米色块和粉色胶囊。
+- 全部图标换成 SF Symbols（18pt medium、白 0.92）：`play.fill`/`pause.fill`、`gobackward.10`/`goforward.10`、`speaker.wave.2.fill`/`speaker.slash.fill`、全屏双向箭头、`xmark`、菜单 `checkmark`、toast 图标。
+- 顶部：15pt semibold 媒体名 + 11pt 白 0.55「DLNA 电视 · 投屏中」+ 6pt 琥珀点；右上格式信息收进 11pt 深色半透明胶囊。
+- 底部：24pt 边距、4pt 进度条（轨道 0.18/缓冲 0.28/已播琥珀渐变/12pt 白色 hover 点）、11pt tabular 时间、40pt 圆形播放键（白 0.10 → 0.18、按下 0.96）、36pt ±10s/音量、右侧 12pt 圆角胶囊组、全屏/关闭圆形按钮。
+- 菜单：280pt 宽、12pt 圆角、11pt 分组标题、36pt 行高、13pt/11pt 两级文字、hover 白 0.06、选中琥珀对勾；打开 120ms 上移 4pt + 淡入。
+- 动效：控件淡入 180ms ease-out、淡出 220ms，出现整体上移 6pt；hover 120ms；缓冲 2pt 琥珀圆环；toast 深色胶囊 3s。
+- 缓冲判定改为看 `frames_shown` 是否停滞（有视频时），避免 fMP4 音频时钟继续走、视频已停却显示“播放中”。
+
+### 验收截图（真实鼠标，`cliclick`）
+
+- 1280×720：`70_1280_controls.png`、`71_1280_hover.png`、`72_1280_menu.png`、`73_1280_menu_selected.png`、`74_1280_paused.png`、`75_1280_seek.png`、`76_1280_fullscreen_1920.png`、`78_1280_buffering.png`。
+- 1920×1080：`80_1920_controls.png`、`81_1920_hover.png`、`82_1920_menu.png`、`83_1920_menu_selected.png`、`84_1920_paused.png`、`85_1920_seek.png`、`86_1920_fullscreen.png`、`88_1920_buffering.png`。
+- 真实鼠标覆盖：hover 进度、点击音轨胶囊、选中文轨、点击播放/暂停、拖进度、双击全屏；日志出现 `paused=true`、`seek 28ms`、`全屏切换 on=1 窗口 1800x1169`，3 音轨/2 字幕均识别。
+
+### 限制说明
+
+- 本机屏幕逻辑宽 1800（全屏 1800×1169）。1920 大屏组是把 1800×1080 窗口内容放大到 1920×1080（横向 6.7%），全屏组是 1800×1169 等比缩放进 1920×1080（左右留黑）。若必须严格 1920×1080 布局，需要改显示模式后再截。
+- 错误 toast 已实现（深色胶囊 + 图标 + 3s），本轮截图集中验证了缓冲态，没有单独截错误态。
+- 本地 fMP4 起播约 5s 的引擎限制不变；HTTP fMP4 正常。ASS 高级样式、HLS HEVC/加密 fMP4 仍未覆盖。

@@ -28,6 +28,51 @@ static const uint32_t kAmber = 0xEBB15D;
 static const uint32_t kAmberInk = 0x201605;
 static const uint32_t kRed = 0xF0655E;
 static const uint32_t kGreen = 0x5FC08A;
+static const uint32_t kAccentTop = 0xF2C27C;
+static const uint32_t kAccentBottom = 0xD99447;
+
+static NSColor *White(CGFloat a) { return [NSColor colorWithWhite:1.0 alpha:a]; }
+static NSColor *Black(CGFloat a) { return [NSColor colorWithWhite:0.0 alpha:a]; }
+static NSColor *AccentColor(void) { return Col(kAccentTop, 1.0); }
+
+static CGFloat EaseOut(CGFloat t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return 1.0 - pow(1.0 - t, 3.0);
+}
+
+static void FillAccent(NSRect r, CGFloat radius) {
+    NSBezierPath *p = [NSBezierPath bezierPathWithRoundedRect:r xRadius:radius yRadius:radius];
+    [p addClip];
+    NSGradient *g = [[NSGradient alloc] initWithStartingColor:Col(kAccentTop, 1.0)
+                                                    endingColor:Col(kAccentBottom, 1.0)];
+    [g drawInRect:r angle:0];
+}
+
+// SF Symbols：统一 medium 18pt，用目标色重新着色后绘制。
+static NSImage *PeSymbol(NSString *name, CGFloat size, NSColor *color) {
+    NSImage *base = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+    if (!base) return nil;
+    NSImageSymbolConfiguration *cfg =
+        [NSImageSymbolConfiguration configurationWithPointSize:size weight:NSFontWeightMedium];
+    NSImage *img = [base imageWithSymbolConfiguration:cfg];
+    if (!color) return img;
+    return [NSImage imageWithSize:img.size flipped:NO drawingHandler:^BOOL(NSRect rect) {
+        [color setFill];
+        NSRectFillUsingOperation(rect, NSCompositingOperationSourceOver);
+        [img drawInRect:rect fromRect:NSZeroRect operation:NSCompositingOperationDestinationIn fraction:1.0];
+        return YES;
+    }];
+}
+
+static void DrawSymbol(NSString *name, NSRect r, CGFloat size, NSColor *color) {
+    NSImage *img = PeSymbol(name, size, color);
+    if (!img) return;
+    NSSize sz = img.size;
+    NSRect dst = NSMakeRect(NSMidX(r) - sz.width / 2.0, NSMidY(r) - sz.height / 2.0,
+                            sz.width, sz.height);
+    [img drawInRect:dst fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0];
+}
 
 static void FillRound(NSRect r, CGFloat radius, NSColor *color) {
     [color setFill];
@@ -120,9 +165,17 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     NSInteger _menuHover;
     NSMutableArray<NSDictionary *> *_menuItems;
     NSRect _menuAnchor;
+    NSTimeInterval _menuAnimStart;
+    CGFloat _menuAnim;
+    NSTimeInterval _hoverSince;
+    NSTimeInterval _fadeStart;
+    CGFloat _fadeFrom;
+    CGFloat _fadeDur;
+    BOOL _pressedPlay;
     CGFloat _spinnerPhase;
     BOOL _buffering;
     double _lastPos;
+    int64_t _lastFrames;
     NSTimeInterval _stallSince;
     NSString *_toast;
     BOOL _toastError;
@@ -228,39 +281,39 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 - (CGFloat)H { return self.bounds.size.height; }
 - (BOOL)compact { return self.W < 1020; }
 
-- (NSRect)progressRect { return NSMakeRect(28, 94, MAX(120, self.W - 56), 6); }
-- (NSRect)progressHitRect { return NSInsetRect([self progressRect], -2, -10); }
-- (NSRect)playRect { return NSMakeRect(28, 12, 48, 48); }
-- (NSRect)backRect { return NSMakeRect(86, 16, 40, 40); }
-- (NSRect)fwdRect { return NSMakeRect(130, 16, 40, 40); }
-- (NSRect)muteRect { return NSMakeRect(178, 18, 36, 36); }
+- (NSRect)progressRect { return NSMakeRect(24, 88, MAX(120, self.W - 48), 4); }
+- (NSRect)progressHitRect { return NSInsetRect([self progressRect], -4, -12); }
+- (NSRect)playRect { return NSMakeRect(24, 12, 40, 40); }
+- (NSRect)backRect { return NSMakeRect(76, 14, 36, 36); }
+- (NSRect)fwdRect { return NSMakeRect(116, 14, 36, 36); }
+- (NSRect)muteRect { return NSMakeRect(160, 14, 36, 36); }
 - (NSRect)volumeRect {
     if ([self compact]) return NSZeroRect;
-    return NSMakeRect(218, 25, 92, 22);
+    return NSMakeRect(202, 23, 96, 18);
 }
 - (NSRect)volumeHitRect {
     if ([self compact]) return NSZeroRect;
-    return NSInsetRect([self volumeRect], -6, -9);
+    return NSInsetRect([self volumeRect], -6, -11);
 }
 
 - (CGFloat)pillWidth { return [self compact] ? 58 : 70; }
-- (NSRect)closeRect { return NSMakeRect(self.W - 28 - 36, 18, 36, 36); }
-- (NSRect)fsRect { return NSMakeRect(self.W - 28 - 36 - 42, 18, 36, 36); }
+- (NSRect)closeRect { return NSMakeRect(self.W - 24 - 36, 14, 36, 36); }
+- (NSRect)fsRect { return NSMakeRect(self.W - 24 - 36 - 42, 14, 36, 36); }
 - (NSRect)aspectRect {
     CGFloat w = [self pillWidth];
-    return NSMakeRect(self.W - 28 - 36 - 42 - 36 - 8 - w, 19, w, 34);
+    return NSMakeRect(self.W - 24 - 36 - 42 - 36 - 6 - w, 15, w, 34);
 }
 - (NSRect)subRect {
     CGFloat w = [self pillWidth];
-    return NSMakeRect([self aspectRect].origin.x - 6 - w, 19, w, 34);
+    return NSMakeRect([self aspectRect].origin.x - 6 - w, 15, w, 34);
 }
 - (NSRect)audioRect {
     CGFloat w = [self pillWidth];
-    return NSMakeRect([self subRect].origin.x - 6 - w, 19, w, 34);
+    return NSMakeRect([self subRect].origin.x - 6 - w, 15, w, 34);
 }
 - (NSRect)speedRect {
     CGFloat w = [self compact] ? 54 : 62;
-    return NSMakeRect([self audioRect].origin.x - 6 - w, 19, w, 34);
+    return NSMakeRect([self audioRect].origin.x - 6 - w, 15, w, 34);
 }
 
 - (NSRect)hitRect:(NSRect)r {
@@ -319,18 +372,31 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     }
 
     // 缓冲判定：起播/seek 中，或播放位置长时间不前进。
-    BOOL buffering = _st.buffering != 0 || (!_st.paused && !_st.ended && _st.frames_shown == 0);
+    BOOL buffering = _st.buffering != 0;
     if (!_st.paused && !_st.ended) {
-        if (fabs(_st.position - _lastPos) > 0.02) {
-            _lastPos = _st.position;
-            _stallSince = now;
-        } else if (_stallSince == 0) {
-            _stallSince = now;
+        if (_st.has_video) {
+            // 音频时钟可能继续走但视频已停：看 frames_shown 是否停滞。
+            if (_st.frames_shown != _lastFrames) {
+                _lastFrames = _st.frames_shown;
+                _stallSince = now;
+            } else if (_stallSince == 0) {
+                _stallSince = now;
+            }
+        } else {
+            if (fabs(_st.position - _lastPos) > 0.02) {
+                _lastPos = _st.position;
+                _stallSince = now;
+            } else if (_stallSince == 0) {
+                _stallSince = now;
+            }
         }
-        if (_stallSince > 0 && now - _stallSince > 0.9) buffering = YES;
+        if (_st.frames_shown == 0 || (_stallSince > 0 && now - _stallSince > 0.9)) {
+            buffering = YES;
+        }
     } else {
         _stallSince = 0;
         _lastPos = _st.position;
+        _lastFrames = _st.frames_shown;
     }
     _buffering = buffering;
 
@@ -349,8 +415,26 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
         !_draggingProgress && !_draggingVolume) {
         if (now >= _hideAt) _targetVisible = NO;
     }
-    if (!_targetVisible && _fade > 0) _fade = MAX(0.0, _fade - 0.07);
-    if (_targetVisible && _fade < 1) _fade = MIN(1.0, _fade + 0.09);
+    if (_fadeStart == 0) {
+        CGFloat target = _targetVisible ? 1.0 : 0.0;
+        if (fabs(_fade - target) > 0.001) {
+            _fadeFrom = _fade;
+            _fadeStart = now;
+            _fadeDur = _targetVisible ? 0.18 : 0.22;
+        }
+    }
+    if (_fadeStart > 0) {
+        CGFloat t = (CGFloat)((now - _fadeStart) / _fadeDur);
+        CGFloat target = _targetVisible ? 1.0 : 0.0;
+        _fade = _fadeFrom + (target - _fadeFrom) * EaseOut(MAX(0.0, MIN(1.0, t)));
+        if (t >= 1.0) {
+            _fade = target;
+            _fadeStart = 0;
+        }
+    }
+    if (_menu != PeMenuNone && _menuAnim < 1) {
+        _menuAnim = EaseOut(MAX(0.0, MIN(1.0, (CGFloat)((now - _menuAnimStart) / 0.12))));
+    }
 
     if (_toastUntil > 0 && now > _toastUntil) {
         _toastFade = MAX(0.0, _toastFade - 0.08);
@@ -360,14 +444,15 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     }
 
     if (_buffering) _spinnerPhase += 0.18;
-    BOOL animate = _fade > 0 || _buffering || _toastUntil > 0 || _menu != PeMenuNone;
+    BOOL animate = _fade > 0.01 || _fadeStart > 0 || _buffering || _toastUntil > 0 ||
+                   _menu != PeMenuNone || _menuAnim < 1;
     if (animate) [self setNeedsDisplay:YES];
 }
 
 - (void)showToast:(NSString *)text error:(BOOL)error {
     _toast = text;
     _toastError = error;
-    _toastUntil = [NSDate timeIntervalSinceReferenceDate] + 4.5;
+    _toastUntil = [NSDate timeIntervalSinceReferenceDate] + 3.0;
     _toastFade = 0;
     [self setNeedsDisplay:YES];
 }
@@ -380,22 +465,30 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     if (w < 4 || h < 4) return;
 
     if (_fade > 0.01) {
-        // 顶部/底部渐变
+        // 顶部轻渐变 + 底部影院 scrim，保证亮画面上控件仍有对比度。
         NSGradient *top = [[NSGradient alloc] initWithColorsAndLocations:
-            Col(0x000000, 0.62 * _fade), 0.0,
-            Col(0x000000, 0.0), 1.0, nil];
-        [top drawInRect:NSMakeRect(0, h - 104, w, 104) angle:90];
+            Black(0.45 * _fade), 0.0,
+            Black(0.0), 1.0, nil];
+        [top drawInRect:NSMakeRect(0, h - 120, w, 120) angle:90];
         NSGradient *bottom = [[NSGradient alloc] initWithColorsAndLocations:
-            Col(0x000000, 0.0), 0.0,
-            Col(0x000000, 0.72 * _fade), 0.42,
-            Col(0x000000, 0.84 * _fade), 1.0, nil];
-        [bottom drawInRect:NSMakeRect(0, 0, w, 142) angle:90];
+            Black(0.0), 0.0,
+            Black(0.55 * _fade), 0.38,
+            Black(0.82 * _fade), 1.0, nil];
+        [bottom drawInRect:NSMakeRect(0, 0, w, 180) angle:90];
     }
 
     [self drawSubtitles];
 
-    if (_fade > 0.01) [self drawTopBar];
-    if (_fade > 0.01) [self drawBottomBar];
+    if (_fade > 0.01) {
+        CGFloat shift = 6.0 * (1.0 - _fade);
+        [NSGraphicsContext saveGraphicsState];
+        NSAffineTransform *t = [NSAffineTransform transform];
+        [t translateXBy:0 yBy:shift];
+        [t concat];
+        [self drawTopBar];
+        [self drawBottomBar];
+        [NSGraphicsContext restoreGraphicsState];
+    }
     if (_menu != PeMenuNone) [self drawMenu];
     if (_buffering) [self drawSpinner];
     if (_toastUntil > 0 && _toastFade > 0.01) [self drawToast];
@@ -404,132 +497,156 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 - (void)drawTopBar {
     CGFloat w = self.W, h = self.H;
     CGFloat a = _fade;
-    DrawText(self.mediaTitle, NSMakeRect(28, h - 52, w - 300, 26),
-             [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold],
-             Col(kText, 1.0), NSTextAlignmentLeft, -0.2, a);
-    NSRect dot = NSMakeRect(28, h - 70, 5, 5);
-    FillRound(dot, 2.5, Col(kAmber, 0.9 * a));
+    DrawText(self.mediaTitle, NSMakeRect(24, h - 46, MAX(120, w - 300), 22),
+             [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold],
+             White(0.92), NSTextAlignmentLeft, -0.1, a);
+    FillRound(NSMakeRect(24, h - 64, 6, 6), 3, Col(kAccentTop, 0.95 * a));
     DrawText([NSString stringWithFormat:@"%@ · 投屏中", self.deviceName],
-             NSMakeRect(40, h - 78, w - 320, 18),
-             [NSFont systemFontOfSize:11.5 weight:NSFontWeightRegular],
-             Col(kTextDim, 1.0), NSTextAlignmentLeft, 0, a);
-    if (w > 760) {
-        DrawText(_videoMeta, NSMakeRect(w - 328, h - 48, 300, 18),
-                 [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular],
-                 Col(kTextFaint, 1.0), NSTextAlignmentRight, 0, a);
+             NSMakeRect(36, h - 70, MAX(120, w - 320), 16),
+             [NSFont systemFontOfSize:11 weight:NSFontWeightRegular],
+             White(0.55), NSTextAlignmentLeft, 0.1, a);
+    if (w > 760 && _videoMeta.length) {
+        NSFont *f = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
+        NSSize ts = [_videoMeta sizeWithAttributes:@{NSFontAttributeName: f}];
+        CGFloat cw = ts.width + 22, ch = 24;
+        NSRect cap = NSMakeRect(w - 24 - cw, h - 42, cw, ch);
+        FillRound(cap, 8, Black(0.38 * a));
+        StrokeRound(cap, 8, White(0.10 * a), 1);
+        DrawText(_videoMeta, NSMakeRect(cap.origin.x + 11, cap.origin.y, cw - 22, ch),
+                 f, White(0.55), NSTextAlignmentCenter, 0.1, a);
     }
 }
 
+- (CGFloat)hoverAmount:(PeCtrlId)ctrl {
+    if (_hoverCtrl != ctrl) return 0;
+    if (_hoverSince <= 0) return 1;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    return EaseOut(MAX(0.0, MIN(1.0, (CGFloat)((now - _hoverSince) / 0.12))));
+}
+
+- (void)drawSymbolButton:(NSRect)r name:(NSString *)name hover:(CGFloat)h {
+    if (h > 0.01) FillRound(NSInsetRect(r, 1, 1), 18, White(0.10 * h * _fade));
+    DrawSymbol(name, r, 18, White(0.92 * _fade));
+}
+
 - (void)drawBottomBar {
-    CGFloat a = _fade;
+    CGFloat a = _fade, w = self.W;
     NSRect pr = [self progressRect];
     double dur = _st.duration > 0 ? _st.duration : 0;
     double pos = _st.position;
     CGFloat frac = dur > 0 ? (CGFloat)(pos / dur) : 0;
-    if (frac < 0) frac = 0;
-    if (frac > 1) frac = 1;
+    frac = MAX(0, MIN(1, frac));
 
-    // 轨道
-    FillRound(pr, 3, Col(0xFFFFFF, 0.16 * a));
-    // 缓冲
+    FillRound(pr, 2, White(0.18 * a));
     if (dur > 0) {
         double buf = pos + _st.buffered_ms / 1000.0;
         CGFloat bf = (CGFloat)(buf / dur);
-        if (bf > 1) bf = 1;
+        bf = MAX(0, MIN(1, bf));
         if (bf > frac) {
             NSRect br = pr;
             br.size.width = pr.size.width * bf;
-            FillRound(br, 3, Col(0xFFFFFF, 0.24 * a));
+            FillRound(br, 2, White(0.28 * a));
         }
     }
-    // 已播
     NSRect played = pr;
     played.size.width = pr.size.width * frac;
-    if (played.size.width > 1) FillRound(played, 3, Col(kAmber, 0.95 * a));
+    if (played.size.width > 1) {
+        [NSGraphicsContext saveGraphicsState];
+        FillAccent(played, 2);
+        [NSGraphicsContext restoreGraphicsState];
+    }
 
-    // 悬停/拖动预览
     BOOL showPreview = (_draggingProgress || (_hoverCtrl == PeCtrlProgress && _mouseInside));
     CGFloat previewFrac = _draggingProgress ? _dragFrac : _hoverFrac;
     if (showPreview && dur > 0) {
+        CGFloat hA = _draggingProgress ? 1.0 : [self hoverAmount:PeCtrlProgress];
         CGFloat x = pr.origin.x + pr.size.width * previewFrac;
-        NSRect line = NSMakeRect(x - 0.75, pr.origin.y - 5, 1.5, pr.size.height + 10);
-        FillRound(line, 0.75, Col(0xFFFFFF, 0.85 * a));
+        FillRound(NSMakeRect(x - 0.75, pr.origin.y - 4, 1.5, 12), 0.75, White(0.85 * a * hA));
         NSString *tip = FmtTime(previewFrac * dur);
         NSFont *f = [NSFont monospacedDigitSystemFontOfSize:11.5 weight:NSFontWeightMedium];
         NSSize ts = [tip sizeWithAttributes:@{NSFontAttributeName: f}];
         CGFloat tw = ts.width + 18, th = 24;
-        CGFloat tx = x - tw / 2;
-        tx = MAX(10, MIN(self.W - tw - 10, tx));
-        NSRect bubble = NSMakeRect(tx, pr.origin.y + 16, tw, th);
+        CGFloat tx = MAX(12, MIN(self.W - tw - 12, x - tw / 2));
+        NSRect bubble = NSMakeRect(tx, pr.origin.y + 20, tw, th);
         NSShadow *sh = [[NSShadow alloc] init];
         sh.shadowBlurRadius = 12;
         sh.shadowOffset = NSMakeSize(0, -2);
-        sh.shadowColor = Col(0x000000, 0.5 * a);
+        sh.shadowColor = Black(0.5 * a);
         [NSGraphicsContext saveGraphicsState];
         [sh set];
         FillRound(bubble, 8, Col(kPanelAlt, 0.96 * a));
         [NSGraphicsContext restoreGraphicsState];
-        StrokeRound(bubble, 8, Col(kLineStrong, 0.8 * a), 1);
-        DrawText(tip, bubble, f, Col(kText, 1.0), NSTextAlignmentCenter, 0.2, a);
-        if (_draggingProgress) {
-            FillRound(NSMakeRect(x - 5, pr.origin.y - 2, 10, 10), 5, Col(kAmber, a));
-        }
+        StrokeRound(bubble, 8, White(0.10 * a), 1);
+        DrawText(tip, bubble, f, White(0.92), NSTextAlignmentCenter, 0.2, a);
+        NSShadow *dotShadow = [[NSShadow alloc] init];
+        dotShadow.shadowBlurRadius = 8;
+        dotShadow.shadowColor = Black(0.55 * a);
+        [NSGraphicsContext saveGraphicsState];
+        [dotShadow set];
+        FillRound(NSMakeRect(x - 6, pr.origin.y - 4, 12, 12), 6, White(1.0 * a));
+        [NSGraphicsContext restoreGraphicsState];
     }
 
-    // 时间
-    NSFont *mono = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightMedium];
-    DrawText(FmtTime(pos), NSMakeRect(28, 66, 110, 18), mono, Col(kText, 1.0),
-             NSTextAlignmentLeft, 0.2, a);
-    NSString *right = dur > 0 ? FmtTime(dur) : FmtTime(pos);
-    DrawText(right, NSMakeRect(self.W - 28 - 220, 66, 220, 18), mono, Col(kTextDim, 1.0),
-             NSTextAlignmentRight, 0.2, a);
+    NSFont *mono = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightMedium];
+    DrawText(FmtTime(pos), NSMakeRect(24, 64, 160, 16), mono, White(0.92),
+             NSTextAlignmentLeft, 0.3, a);
+    DrawText(dur > 0 ? FmtTime(dur) : @"--:--", NSMakeRect(w - 24 - 160, 64, 160, 16),
+             mono, White(0.55), NSTextAlignmentRight, 0.3, a);
 
-    // 播放/暂停
     NSRect play = [self playRect];
-    BOOL playHover = (_hoverCtrl == PeCtrlPlay);
-    FillRound(play, 24, Col(kAmber, (playHover ? 1.0 : 0.96) * a));
-    [self drawPlayPause:NSInsetRect(play, 15, 15) color:Col(kAmberInk, a) paused:_st.paused];
+    CGFloat ph = [self hoverAmount:PeCtrlPlay];
+    NSRect playDraw = _pressedPlay ? NSInsetRect(play, 0.8, 0.8) : play;
+    FillRound(playDraw, 20, White((0.10 + 0.08 * ph) * a));
+    DrawSymbol(_st.paused ? @"play.fill" : @"pause.fill", NSInsetRect(playDraw, 10, 10),
+               18, White(0.92 * a));
 
-    [self drawIconButton:[self backRect] hover:_hoverCtrl == PeCtrlBack];
-    [self drawSeekIcon:[self backRect] forward:NO color:Col(kText, 0.94 * a) alpha:a];
-    [self drawIconButton:[self fwdRect] hover:_hoverCtrl == PeCtrlForward];
-    [self drawSeekIcon:[self fwdRect] forward:YES color:Col(kText, 0.94 * a) alpha:a];
-
-    [self drawIconButton:[self muteRect] hover:_hoverCtrl == PeCtrlMute];
-    [self drawSpeaker:[self muteRect] muted:_st.muted != 0 color:Col(kText, 0.94 * a) alpha:a];
+    [self drawSymbolButton:[self backRect] name:@"gobackward.10" hover:[self hoverAmount:PeCtrlBack]];
+    [self drawSymbolButton:[self fwdRect] name:@"goforward.10" hover:[self hoverAmount:PeCtrlForward]];
+    [self drawSymbolButton:[self muteRect]
+                      name:(_st.muted ? @"speaker.slash.fill" : @"speaker.wave.2.fill")
+                     hover:[self hoverAmount:PeCtrlMute]];
 
     if (![self compact]) {
         NSRect vr = [self volumeRect];
-        FillRound(NSMakeRect(vr.origin.x, vr.origin.y + 9, vr.size.width, 4), 2, Col(0xFFFFFF, 0.18 * a));
+        FillRound(NSMakeRect(vr.origin.x, vr.origin.y + 7, vr.size.width, 4), 2, White(0.18 * a));
         CGFloat vf = (CGFloat)_st.volume / 100.0;
         if (_st.muted) vf = 0;
-        FillRound(NSMakeRect(vr.origin.x, vr.origin.y + 9, vr.size.width * vf, 4), 2, Col(kAmber, 0.9 * a));
-        FillRound(NSMakeRect(vr.origin.x + vr.size.width * vf - 5, vr.origin.y + 6, 10, 10), 5,
-                  Col(kText, a));
+        if (vf > 0.01) {
+            NSRect fill = NSMakeRect(vr.origin.x, vr.origin.y + 7, vr.size.width * vf, 4);
+            [NSGraphicsContext saveGraphicsState];
+            FillAccent(fill, 2);
+            [NSGraphicsContext restoreGraphicsState];
+        }
+        NSRect thumb = NSMakeRect(vr.origin.x + vr.size.width * vf - 5, vr.origin.y + 4, 10, 10);
+        NSShadow *tsh = [[NSShadow alloc] init];
+        tsh.shadowBlurRadius = 6;
+        tsh.shadowColor = Black(0.45 * a);
+        [NSGraphicsContext saveGraphicsState];
+        [tsh set];
+        FillRound(thumb, 5, White(0.95 * a));
+        [NSGraphicsContext restoreGraphicsState];
     }
 
-    // 右侧胶囊
-    BOOL speedActive = fabs(_st.speed - 1.0) > 0.01;
-    [self drawPill:[self speedRect] title:SpeedLabel(_st.speed)
-             hover:_hoverCtrl == PeCtrlSpeed active:speedActive];
     NSString *audioTitle = @"音轨";
-    if (_st.audio_tracks > 0 && ![self compact]) {
-        audioTitle = [NSString stringWithFormat:@"音轨 %d", _st.audio_track];
-    }
-    [self drawPill:[self audioRect] title:audioTitle hover:_hoverCtrl == PeCtrlAudio
-            active:_menu == PeMenuAudio];
+    if (_st.audio_tracks > 1) audioTitle = [NSString stringWithFormat:@"音轨 %d", _st.audio_track];
     NSString *subTitle = _st.subtitle_track > 0
         ? [NSString stringWithFormat:@"字幕 %d", _st.subtitle_track] : @"字幕";
-    if ([self compact] && _st.subtitle_track > 0) subTitle = @"字幕";
-    [self drawPill:[self subRect] title:subTitle hover:_hoverCtrl == PeCtrlSub
-            active:_st.subtitle_track > 0 || _menu == PeMenuSub];
+    [self drawPill:[self speedRect] title:SpeedLabel(_st.speed)
+             hover:[self hoverAmount:PeCtrlSpeed] active:fabs(_st.speed - 1.0) > 0.01];
+    [self drawPill:[self audioRect] title:audioTitle
+             hover:[self hoverAmount:PeCtrlAudio]
+            active:(_menu == PeMenuAudio || _st.audio_tracks > 1)];
+    [self drawPill:[self subRect] title:subTitle
+             hover:[self hoverAmount:PeCtrlSub]
+            active:(_st.subtitle_track > 0 || _menu == PeMenuSub)];
     [self drawPill:[self aspectRect] title:[NSString stringWithUTF8String:_st.aspect]
-             hover:_hoverCtrl == PeCtrlAspect active:strcmp(_st.aspect, "auto") != 0];
+             hover:[self hoverAmount:PeCtrlAspect] active:strcmp(_st.aspect, "auto") != 0];
 
-    [self drawIconButton:[self fsRect] hover:_hoverCtrl == PeCtrlFullscreen];
-    [self drawFullscreen:[self fsRect] color:Col(kText, 0.94 * a) alpha:a];
-    [self drawIconButton:[self closeRect] hover:_hoverCtrl == PeCtrlClose];
-    [self drawClose:[self closeRect] color:Col(kText, 0.9 * a) alpha:a];
+    [self drawSymbolButton:[self fsRect]
+                      name:(_st.fullscreen ? @"arrow.down.right.and.arrow.up.left"
+                                           : @"arrow.up.left.and.arrow.down.right")
+                     hover:[self hoverAmount:PeCtrlFullscreen]];
+    [self drawSymbolButton:[self closeRect] name:@"xmark" hover:[self hoverAmount:PeCtrlClose]];
 }
 
 - (void)drawIconButton:(NSRect)r hover:(BOOL)hover {
@@ -537,12 +654,10 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     FillRound(NSInsetRect(r, -2, -2), 9, Col(0xFFFFFF, 0.10 * _fade));
 }
 
-- (void)drawPill:(NSRect)r title:(NSString *)title hover:(BOOL)hover active:(BOOL)active {
-    NSColor *bg = active ? Col(kAmber, 0.16 * _fade) : Col(0xFFFFFF, (hover ? 0.12 : 0.06) * _fade);
-    FillRound(r, 9, bg);
-    StrokeRound(r, 9, active ? Col(kAmber, 0.35 * _fade) : Col(0xFFFFFF, 0.08 * _fade), 1);
-    NSColor *fg = active ? Col(kAmber, 1.0) : Col(kText, 1.0);
-    if (hover && !active) fg = Col(0xFFFFFF, 1.0);
+- (void)drawPill:(NSRect)r title:(NSString *)title hover:(CGFloat)h active:(BOOL)active {
+    FillRound(r, 12, White((0.08 + 0.06 * h) * _fade));
+    StrokeRound(r, 12, White(0.12 * _fade), 1);
+    NSColor *fg = active ? AccentColor() : White(0.92);
     DrawText(title, r, [NSFont systemFontOfSize:12 weight:NSFontWeightMedium],
              fg, NSTextAlignmentCenter, 0.1, _fade);
 }
@@ -681,52 +796,56 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     NSSize size = [text boundingRectWithSize:NSMakeSize(maxW, 400)
                                     options:NSStringDrawingUsesLineFragmentOrigin
                                  attributes:attrs].size;
-    CGFloat bottom = (_fade > 0.4 ? 150 : 52);
+    CGFloat bottom = (_fade > 0.4 ? 196 : 56);
     NSRect r = NSMakeRect((self.W - size.width) / 2.0, bottom, size.width + 4, size.height + 4);
     [text drawWithRect:r options:NSStringDrawingUsesLineFragmentOrigin attributes:attrs];
 }
 
 - (void)drawSpinner {
     CGFloat cx = self.W / 2.0, cy = self.H / 2.0;
-    CGFloat radius = 17;
+    CGFloat radius = 15;
     NSRect ring = NSMakeRect(cx - radius, cy - radius, radius * 2, radius * 2);
     NSBezierPath *track = [NSBezierPath bezierPathWithOvalInRect:ring];
-    track.lineWidth = 3;
-    [Col(0xFFFFFF, 0.14) setStroke];
+    track.lineWidth = 2;
+    [White(0.14) setStroke];
     [track stroke];
     NSBezierPath *arc = [NSBezierPath bezierPath];
     CGFloat start = _spinnerPhase;
     [arc appendBezierPathWithArcWithCenter:NSMakePoint(cx, cy) radius:radius
                                 startAngle:start * 180 / M_PI
                                   endAngle:(start + 1.5) * 180 / M_PI];
-    arc.lineWidth = 3;
+    arc.lineWidth = 2;
     arc.lineCapStyle = NSLineCapStyleRound;
-    [Col(kAmber, 0.95) setStroke];
+    [AccentColor() setStroke];
     [arc stroke];
-    DrawText(@"正在缓冲", NSMakeRect(cx - 80, cy - radius - 30, 160, 18),
-             [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
-             Col(kTextDim, 1.0), NSTextAlignmentCenter, 0.3, 1.0);
+    DrawText(@"正在缓冲", NSMakeRect(cx - 80, cy - radius - 28, 160, 16),
+             [NSFont systemFontOfSize:11 weight:NSFontWeightMedium],
+             White(0.55), NSTextAlignmentCenter, 0.3, 1.0);
 }
 
 - (void)drawToast {
     NSFont *f = [NSFont systemFontOfSize:12.5 weight:NSFontWeightMedium];
-    NSSize ts = [_toast sizeWithAttributes:@{NSFontAttributeName: f}];
-    CGFloat tw = MIN(self.W - 80, ts.width + 58);
-    CGFloat th = 42;
-    NSRect r = NSMakeRect((self.W - tw) / 2.0, self.H - 128, tw, th);
+    NSString *title = _toast ?: @"";
+    NSSize ts = [title sizeWithAttributes:@{NSFontAttributeName: f}];
+    CGFloat tw = MIN(self.W - 80, ts.width + 64);
+    CGFloat th = 40;
+    NSRect r = NSMakeRect((self.W - tw) / 2.0, self.H - 112, tw, th);
+    CGFloat a = _toastFade;
     NSShadow *sh = [[NSShadow alloc] init];
     sh.shadowBlurRadius = 16;
     sh.shadowOffset = NSMakeSize(0, -3);
-    sh.shadowColor = Col(0x000000, 0.55);
+    sh.shadowColor = Black(0.5 * a);
     [NSGraphicsContext saveGraphicsState];
     [sh set];
-    FillRound(r, 10, Col(kPanelAlt, 0.97));
+    FillRound(r, 12, Black(0.78 * a));
     [NSGraphicsContext restoreGraphicsState];
-    StrokeRound(r, 10, Col(kLineStrong, 0.9), 1);
-    CGFloat dotX = r.origin.x + 18;
-    FillRound(NSMakeRect(dotX, NSMidY(r) - 3, 6, 6), 3, _toastError ? Col(kRed, 1) : Col(kGreen, 1));
-    DrawText(_toast, NSMakeRect(dotX + 14, r.origin.y, tw - 38, th), f,
-             Col(kText, 1.0), NSTextAlignmentLeft, 0, _toastFade);
+    StrokeRound(r, 12, White(0.10 * a), 1);
+    NSString *icon = _toastError ? @"exclamationmark.triangle.fill" : @"checkmark.circle.fill";
+    NSColor *ic = _toastError ? Col(kRed, 1.0) : AccentColor();
+    DrawSymbol(icon, NSMakeRect(r.origin.x + 14, r.origin.y + 11, 18, 18), 18,
+               [ic colorWithAlphaComponent:a]);
+    DrawText(title, NSMakeRect(r.origin.x + 40, r.origin.y, tw - 52, th), f,
+             White(0.92), NSTextAlignmentLeft, 0, a);
 }
 
 // ---------------- 菜单 ----------------
@@ -809,17 +928,19 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     _menu = menu;
     _menuAnchor = anchor;
     [self buildMenu:menu];
-    CGFloat width = 232;
+    CGFloat width = 280;
     CGFloat headerH = 30;
     CGFloat rowH = 36;
     CGFloat height = headerH + rowH * (CGFloat)_menuItems.count + 10;
     CGFloat x = NSMidX(anchor) - width / 2.0;
     x = MAX(16, MIN(self.W - width - 16, x));
-    CGFloat y = NSMaxY(anchor) + 10;
+    CGFloat y = MAX(NSMaxY(anchor) + 10, 120);
     if (y + height > self.H - 20) y = NSMinY(anchor) - height - 10;
     if (y < 20) y = 20;
     _menuRect = NSMakeRect(x, y, width, height);
     _menuHover = -1;
+    _menuAnimStart = [NSDate timeIntervalSinceReferenceDate];
+    _menuAnim = 0;
     _targetVisible = YES;
     _hideAt = [NSDate timeIntervalSinceReferenceDate] + 30;
     [self setNeedsDisplay:YES];
@@ -827,49 +948,46 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 
 - (void)drawMenu {
     NSRect r = _menuRect;
+    CGFloat ma = MAX(0.01, _menuAnim);
+    CGFloat off = 4.0 * (1.0 - ma);
+    NSRect rr = NSOffsetRect(r, 0, -off);
+
     NSShadow *sh = [[NSShadow alloc] init];
-    sh.shadowBlurRadius = 22;
-    sh.shadowOffset = NSMakeSize(0, -6);
-    sh.shadowColor = Col(0x000000, 0.6);
+    sh.shadowBlurRadius = 18;
+    sh.shadowOffset = NSMakeSize(0, -4);
+    sh.shadowColor = Black(0.45);
     [NSGraphicsContext saveGraphicsState];
     [sh set];
-    FillRound(r, 12, Col(kPanelAlt, 0.985));
+    FillRound(rr, 12, Col(kPanelAlt, 0.985 * ma));
     [NSGraphicsContext restoreGraphicsState];
-    StrokeRound(r, 12, Col(kLineStrong, 0.95), 1);
+    StrokeRound(rr, 12, White(0.10 * ma), 1);
 
-    DrawText(_menuHeader, NSMakeRect(r.origin.x + 16, NSMaxY(r) - 26, r.size.width - 32, 16),
-             [NSFont systemFontOfSize:10.5 weight:NSFontWeightSemibold],
-             Col(kTextFaint, 1.0), NSTextAlignmentLeft, 0.8, 1.0);
+    DrawText(_menuHeader, NSMakeRect(rr.origin.x + 16, NSMaxY(rr) - 26, rr.size.width - 32, 16),
+             [NSFont systemFontOfSize:11 weight:NSFontWeightMedium],
+             White(0.45 * ma), NSTextAlignmentLeft, 0.8, 1.0);
 
     CGFloat rowH = 36;
-    CGFloat y = NSMaxY(r) - 30 - rowH;
+    CGFloat y = NSMaxY(rr) - 30 - rowH;
     for (NSInteger i = 0; i < (NSInteger)_menuItems.count; i++) {
         NSDictionary *item = _menuItems[i];
-        NSRect row = NSMakeRect(r.origin.x + 6, y, r.size.width - 12, rowH);
+        NSRect row = NSMakeRect(rr.origin.x + 6, y, rr.size.width - 12, rowH);
         if ((NSInteger)_menuHover == i) {
-            FillRound(row, 8, Col(0xFFFFFF, 0.08));
+            FillRound(row, 8, White(0.06 * ma));
         }
         BOOL sel = [item[@"selected"] boolValue];
-        NSColor *labelColor = sel ? Col(kAmber, 1.0) : Col(kText, 1.0);
-        DrawText(item[@"label"], NSMakeRect(row.origin.x + 12, row.origin.y + 2, row.size.width - 60, 20),
-                 [NSFont systemFontOfSize:12.5 weight:NSFontWeightMedium],
-                 labelColor, NSTextAlignmentLeft, 0, 1.0);
+        NSColor *labelColor = sel ? AccentColor() : White(0.92);
+        DrawText(item[@"label"], NSMakeRect(row.origin.x + 12, row.origin.y + 3, row.size.width - 54, 20),
+                 [NSFont systemFontOfSize:13 weight:NSFontWeightMedium],
+                 labelColor, NSTextAlignmentLeft, 0, ma);
         NSString *detail = item[@"detail"];
         if (detail.length) {
-            DrawText(detail, NSMakeRect(row.origin.x + 12, row.origin.y + 18, row.size.width - 60, 14),
-                     [NSFont systemFontOfSize:10.5 weight:NSFontWeightRegular],
-                     Col(kTextFaint, 1.0), NSTextAlignmentLeft, 0, 1.0);
+            DrawText(detail, NSMakeRect(row.origin.x + 12, row.origin.y + 19, row.size.width - 54, 14),
+                     [NSFont systemFontOfSize:11 weight:NSFontWeightRegular],
+                     White(0.50), NSTextAlignmentLeft, 0, ma);
         }
         if (sel) {
-            NSBezierPath *check = [NSBezierPath bezierPath];
-            CGFloat cx = NSMaxX(row) - 20, cy = NSMidY(row);
-            [check moveToPoint:NSMakePoint(cx - 5, cy)];
-            [check lineToPoint:NSMakePoint(cx - 1, cy - 4)];
-            [check lineToPoint:NSMakePoint(cx + 5, cy + 4)];
-            check.lineWidth = 1.8;
-            check.lineCapStyle = NSLineCapStyleRound;
-            [Col(kAmber, 1.0) setStroke];
-            [check stroke];
+            DrawSymbol(@"checkmark", NSMakeRect(NSMaxX(row) - 28, NSMidY(row) - 8, 16, 16),
+                       12, [AccentColor() colorWithAlphaComponent:ma]);
         }
         y -= rowH;
     }
@@ -880,7 +998,6 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 - (void)showControls {
     _targetVisible = YES;
     _hideAt = [NSDate timeIntervalSinceReferenceDate] + 2.5;
-    if (_fade < 0.35) _fade = 0.35;
     [self setNeedsDisplay:YES];
 }
 
@@ -888,6 +1005,7 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 - (void)mouseExited:(NSEvent *)event {
     _mouseInside = NO;
     _hoverCtrl = PeCtrlNone;
+    _hoverSince = [NSDate timeIntervalSinceReferenceDate];
     [self setNeedsDisplay:YES];
 }
 
@@ -906,6 +1024,7 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     PeCtrlId c = [self controlAtPoint:_mouse];
     if (c != _hoverCtrl) {
         _hoverCtrl = c;
+        _hoverSince = [NSDate timeIntervalSinceReferenceDate];
     }
     if (c == PeCtrlProgress) {
         NSRect pr = [self progressRect];
@@ -957,6 +1076,7 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
         return;
     }
     if (c != PeCtrlNone) {
+        if (c == PeCtrlPlay) _pressedPlay = YES;
         [self activateControl:c frac:0];
         return;
     }
@@ -984,6 +1104,8 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     if (_draggingProgress) {
         NSRect pr = [self progressRect];
         _dragFrac = MAX(0, MIN(1, (_mouse.x - pr.origin.x) / MAX(1, pr.size.width)));
+        _hoverFrac = _dragFrac;
+        _hoverCtrl = PeCtrlProgress;
         [self setNeedsDisplay:YES];
     } else if (_draggingVolume) {
         [self setVolumeFromPoint:_mouse];
@@ -992,10 +1114,14 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 
 - (void)mouseUp:(NSEvent *)event {
     _mouse = [self convertPoint:event.locationInWindow fromView:nil];
+    _pressedPlay = NO;
+    [self setNeedsDisplay:YES];
     if (_draggingProgress) {
         double dur = _st.duration;
         if (dur > 0) pe_seek(_player, _dragFrac * dur);
         _draggingProgress = NO;
+        _hoverFrac = _dragFrac;
+        _hoverCtrl = PeCtrlProgress;
         _hideAt = [NSDate timeIntervalSinceReferenceDate] + 2.5;
         [self setNeedsDisplay:YES];
         return;
@@ -1200,6 +1326,7 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
         _mouse = NSMakePoint(NSMidX([self rectForControl:c]), NSMidY([self rectForControl:c]));
         _mouseInside = YES;
     }
+    _hoverSince = [NSDate timeIntervalSinceReferenceDate] - 0.2;
     _hoverCtrl = c;
     [self setNeedsDisplay:YES];
 }
@@ -1226,6 +1353,8 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     else if ([m isEqualToString:@"sub"]) [self openMenu:PeMenuSub anchor:[self subRect]];
     else if ([m isEqualToString:@"aspect"]) [self openMenu:PeMenuAspect anchor:[self aspectRect]];
     else _menu = PeMenuNone;
+    _menuAnimStart = [NSDate timeIntervalSinceReferenceDate] - 0.2;
+    _menuAnim = 1.0;
     [self setNeedsDisplay:YES];
 }
 
