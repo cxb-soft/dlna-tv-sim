@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../controller/app_controller.dart';
 import '../theme.dart';
 import '../util/format.dart';
+import '../services/update_service.dart';
 import 'widgets.dart';
 
 class SidePanels extends StatelessWidget {
@@ -112,7 +113,11 @@ class _CastPanelState extends State<CastPanel> {
                 ),
                 GestureDetector(
                   onTap: controller.clearCastError,
-                  child: const Icon(Icons.close_rounded, size: 13, color: C.textFaint),
+                  child: const Icon(
+                    Icons.close_rounded,
+                    size: 13,
+                    color: C.textFaint,
+                  ),
                 ),
               ],
             ),
@@ -120,7 +125,10 @@ class _CastPanelState extends State<CastPanel> {
           const SizedBox(height: 14),
           Row(
             children: [
-              Text('最近', style: T.meta.copyWith(fontSize: 11, color: C.textFaint)),
+              Text(
+                '最近',
+                style: T.meta.copyWith(fontSize: 11, color: C.textFaint),
+              ),
               const Spacer(),
               if (recents.isNotEmpty)
                 Text(
@@ -175,7 +183,11 @@ class _RecentRow extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(10, 7, 4, 7),
           child: Row(
             children: [
-              const Icon(Icons.play_circle_outline_rounded, size: 15, color: C.textFaint),
+              const Icon(
+                Icons.play_circle_outline_rounded,
+                size: 15,
+                color: C.textFaint,
+              ),
               const SizedBox(width: 8),
               Expanded(
                 child: Column(
@@ -280,15 +292,17 @@ class _DevicePanelState extends State<DevicePanel> {
   Widget build(BuildContext context) {
     final controller = widget.controller;
     final state = controller.state;
-    final addresses = state == null
-        ? ''
-        : state.addresses
-            .take(3)
-            .map((ip) => '$ip:${state.port}')
-            .join('\n');
-    final extra = (state?.addresses.length ?? 0) > 3
-        ? '\n还有 ${state!.addresses.length - 3} 个地址'
-        : '';
+    final addresses =
+        state == null
+            ? ''
+            : state.addresses
+                .take(3)
+                .map((ip) => '$ip:${state.port}')
+                .join('\n');
+    final extra =
+        (state?.addresses.length ?? 0) > 3
+            ? '\n还有 ${state!.addresses.length - 3} 个地址'
+            : '';
 
     return Panel(
       title: '设备',
@@ -338,25 +352,26 @@ class _DevicePanelState extends State<DevicePanel> {
             label: 'UUID',
             value: state?.uuid ?? '',
             mono: true,
-            trailing: state == null || state.uuid.isEmpty
-                ? null
-                : IconSoftButton(
-                    icon: Icons.copy_rounded,
-                    size: 24,
-                    iconSize: 12,
-                    tooltip: '复制 UUID',
-                    onPressed: () {
-                      Clipboard.setData(ClipboardData(text: state.uuid));
-                      ScaffoldMessenger.of(context)
-                        ..hideCurrentSnackBar()
-                        ..showSnackBar(
-                          const SnackBar(
-                            content: Text('UUID 已复制'),
-                            duration: Duration(seconds: 2),
-                          ),
-                        );
-                    },
-                  ),
+            trailing:
+                state == null || state.uuid.isEmpty
+                    ? null
+                    : IconSoftButton(
+                      icon: Icons.copy_rounded,
+                      size: 24,
+                      iconSize: 12,
+                      tooltip: '复制 UUID',
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: state.uuid));
+                        ScaffoldMessenger.of(context)
+                          ..hideCurrentSnackBar()
+                          ..showSnackBar(
+                            const SnackBar(
+                              content: Text('UUID 已复制'),
+                              duration: Duration(seconds: 2),
+                            ),
+                          );
+                      },
+                    ),
           ),
           KeyValueRow(
             label: '运行',
@@ -385,12 +400,13 @@ class DiagPanel extends StatelessWidget {
 
     return Panel(
       title: '网络自检',
-      trailing: diag == null
-          ? null
-          : Text(
-              diag.checkedAt.isEmpty ? '' : '上次 ${diag.checkedAt}',
-              style: T.mono.copyWith(fontSize: 10.5, color: C.textFaint),
-            ),
+      trailing:
+          diag == null
+              ? null
+              : Text(
+                diag.checkedAt.isEmpty ? '' : '上次 ${diag.checkedAt}',
+                style: T.mono.copyWith(fontSize: 10.5, color: C.textFaint),
+              ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -398,9 +414,7 @@ class DiagPanel extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(
-                  diag == null
-                      ? '手机搜不到这台电视时，先跑一次自检。'
-                      : '组播通不通，决定手机能不能自动发现设备。',
+                  diag == null ? '手机搜不到这台电视时，先跑一次自检。' : '组播通不通，决定手机能不能自动发现设备。',
                   style: T.bodyDim.copyWith(fontSize: 11.5, color: C.textFaint),
                 ),
               ),
@@ -409,7 +423,10 @@ class DiagPanel extends StatelessWidget {
                 height: 32,
                 child: SoftButton(
                   onPressed: ready && !busy ? controller.runDiag : null,
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -420,7 +437,11 @@ class DiagPanel extends StatelessWidget {
                           child: CircularProgressIndicator(strokeWidth: 1.5),
                         )
                       else
-                        const Icon(Icons.radar_rounded, size: 14, color: C.textDim),
+                        const Icon(
+                          Icons.radar_rounded,
+                          size: 14,
+                          color: C.textDim,
+                        ),
                       const SizedBox(width: 5),
                       Text(
                         busy ? '检测中' : (diag == null ? '开始自检' : '重新自检'),
@@ -442,12 +463,14 @@ class DiagPanel extends StatelessWidget {
             const SizedBox(height: 6),
             DotLabel(
               label: '子网广播',
-              color: diag.broadcastOk
-                  ? C.green
-                  : (diag.broadcastAddr.isEmpty ? C.textFaint : C.red),
-              value: diag.broadcastOk
-                  ? '正常'
-                  : (diag.broadcastAddr.isEmpty ? '无网卡' : '失败'),
+              color:
+                  diag.broadcastOk
+                      ? C.green
+                      : (diag.broadcastAddr.isEmpty ? C.textFaint : C.red),
+              value:
+                  diag.broadcastOk
+                      ? '正常'
+                      : (diag.broadcastAddr.isEmpty ? '无网卡' : '失败'),
             ),
             const SizedBox(height: 6),
             DotLabel(
@@ -499,6 +522,20 @@ class DiagPanel extends StatelessWidget {
                 ),
               ),
             ],
+          ],
+          if (diag != null && !diag.multicastOk) ...[
+            const SizedBox(height: 8),
+            SoftButton(
+              onPressed:
+                  () => openExternalUrl(
+                    'x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork',
+                  ),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              child: Text(
+                '打开「本地网络」设置',
+                style: T.button.copyWith(fontSize: 11.5),
+              ),
+            ),
           ],
           if (controller.diagError != null) ...[
             const SizedBox(height: 8),
