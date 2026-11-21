@@ -325,18 +325,18 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 
 - (NSRect)rectForControl:(PeCtrlId)ctrl {
     switch (ctrl) {
-        case PeCtrlPlay: return [self playRect];
-        case PeCtrlBack: return [self backRect];
-        case PeCtrlForward: return [self fwdRect];
+        case PeCtrlPlay: return [self hitRect:[self playRect]];
+        case PeCtrlBack: return [self hitRect:[self backRect]];
+        case PeCtrlForward: return [self hitRect:[self fwdRect]];
         case PeCtrlProgress: return [self progressHitRect];
         case PeCtrlVolume: return [self volumeHitRect];
-        case PeCtrlMute: return [self muteRect];
-        case PeCtrlSpeed: return [self speedRect];
-        case PeCtrlAudio: return [self audioRect];
-        case PeCtrlSub: return [self subRect];
-        case PeCtrlAspect: return [self aspectRect];
-        case PeCtrlFullscreen: return [self fsRect];
-        case PeCtrlClose: return [self closeRect];
+        case PeCtrlMute: return [self hitRect:[self muteRect]];
+        case PeCtrlSpeed: return [self hitRect:[self speedRect]];
+        case PeCtrlAudio: return [self hitRect:[self audioRect]];
+        case PeCtrlSub: return [self hitRect:[self subRect]];
+        case PeCtrlAspect: return [self hitRect:[self aspectRect]];
+        case PeCtrlFullscreen: return [self hitRect:[self fsRect]];
+        case PeCtrlClose: return [self hitRect:[self closeRect]];
         default: return NSZeroRect;
     }
 }
