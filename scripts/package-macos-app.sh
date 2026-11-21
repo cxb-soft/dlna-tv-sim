@@ -36,6 +36,21 @@ codesign --force --options runtime --sign "$SIGN_ID" "$APP/Contents/Resources/en
 # 框架必须和主程序同 Team ID，否则 hardened runtime 下 dyld 拒绝加载
 codesign --force --deep --options runtime --sign "$SIGN_ID" "$APP"
 
+# 公证：没有凭据时跳过（NOTARIZE=0 可强制跳过）
+NOTARY_KEY="${NOTARY_KEY:-$HOME/.appstoreconnect/private_keys/AuthKey_MG4AM2TW96.p8}"
+NOTARY_KEY_ID="${NOTARY_KEY_ID:-MG4AM2TW96}"
+NOTARY_ISSUER="${NOTARY_ISSUER:-e2b55696-56a1-4da2-9cf8-1d0ef3b98edd}"
+if [ "${NOTARIZE:-1}" = "1" ] && [ -f "$NOTARY_KEY" ]; then
+  echo "→ 公证（notarytool）"
+  rm -f /tmp/dlna-notarize.zip
+  ditto -c -k --keepParent "$APP" /tmp/dlna-notarize.zip
+  xcrun notarytool submit /tmp/dlna-notarize.zip \
+    --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait \
+    | tail -4
+  xcrun stapler staple "$APP" | tail -2
+  spctl -a -vv "$APP" 2>&1 | head -2
+fi
+
 echo "→ 打包 zip"
 rm -f dist/dlna-tv-sim-macos-app.zip
 ditto -c -k --sequesterRsrc --keepParent "$APP" dist/dlna-tv-sim-macos-app.zip

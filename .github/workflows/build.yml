@@ -108,7 +108,7 @@ jobs:
   release:
     name: release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, macos-app]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
