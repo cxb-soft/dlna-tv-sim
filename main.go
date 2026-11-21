@@ -14,6 +14,10 @@ import (
 var version = "0.4.2"
 
 func main() {
+	// macOS 的 AppKit 事件循环必须在进程主线程；自研播放核心（-player native）
+	// 把窗口和 NSApp run 放在这里。即使不用 native，占住主线程也没有副作用。
+	runtime.LockOSThread()
+
 	cfgPath, err := configPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "拿不到配置目录: %v\n", err)
@@ -28,7 +32,7 @@ func main() {
 	port := flag.Int("http-port", 0, "HTTP 端口（默认 8090，0 表示用配置里的）")
 	name := flag.String("name", "", "电视名称，写进配置")
 	uuidArg := flag.String("uuid", "", "固定设备 UUID，写进配置")
-	player := flag.String("player", "", "播放引擎：auto（默认）/ mpv / vlc / web")
+	player := flag.String("player", "", "播放引擎：auto（默认）/ mpv / vlc / web / native（macOS 自研核心）")
 	noSSDP := flag.Bool("no-ssdp", false, "不启动 SSDP 发现（只跑 HTTP，排查用）")
 	noOpen := flag.Bool("no-open", false, "启动后不自动打开控制台网页")
 	verbose := flag.Bool("v", false, "详细日志（含每个 SSDP / SOAP / VLC 细节）")
@@ -68,6 +72,7 @@ func main() {
 	}
 
 	dev := NewDevice(cfg, cfgPath, *verbose)
+	dev.native.Start()
 	if err := dev.Listen(); err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 		fmt.Fprintf(os.Stderr, "提示：用 -http-port 8091 换一个端口再试。\n")
@@ -92,8 +97,15 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
-	fmt.Println("\n收到退出信号，正在关闭…")
+	go func() {
+		<-sig
+		fmt.Println("\n收到退出信号，正在关闭…")
+		dev.native.Shutdown()
+	}()
+
+	// 主线程常驻播放器事件循环（自研核心需要）；收到退出信号后返回。
+	dev.native.Run()
+
 	if sd != nil {
 		sd.Close()
 	}
@@ -158,6 +170,14 @@ func engineLabel(player string) string {
 			return "VLC 全屏引擎（" + p + "）"
 		}
 		return "网页播放器（没找到 VLC，-player vlc 失效）"
+	case "native":
+		if nativeAvailable() {
+			return "自研播放核心（进程内解码）"
+		}
+		if p := findMPV(); p != "" {
+			return "mpv 全屏引擎（" + p + "，这个平台没有自研核心）"
+		}
+		return "网页播放器（这个平台没有自研核心，也没找到 mpv）"
 	case "mpv":
 		if p := findMPV(); p != "" {
 			return "mpv 全屏引擎（" + p + "）"

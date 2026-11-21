@@ -203,10 +203,13 @@ static enum AVPixelFormat pe_get_format(AVCodecContext *ctx, const enum AVPixelF
 @property (nonatomic, strong) NSMutableArray *uiQueue;
 @property (nonatomic, strong) NSLock *uiLock;
 @property (nonatomic, strong) NSTimer *uiTimer;
+@property (nonatomic, assign) BOOL stopRunPending;
 
 - (void)postUIBlock:(void (^)(void))block;
 - (void)drainUIQueue;
 - (void)applyStopRun;
+- (void)hideWindow;
+- (void)requestStopRun;
 
 - (BOOL)openWindowWidth:(int)w height:(int)h fullscreen:(BOOL)fs title:(NSString *)title;
 - (BOOL)startAudio;
@@ -702,6 +705,29 @@ static void *render_main(void *arg) {
             pthread_mutex_unlock(&p->mu);
             continue;
         }
+        // 读到结尾且队列/音频全部放完：上报 Ended 并冻住时钟，
+        // 由上层（DLNA 引擎）决定什么时候关窗。
+        if (p->eof && !p->ended) {
+            static double last_eof_check = 0;
+            double nows = now_sec();
+            if (nows - last_eof_check >= 1.0) {
+                last_eof_check = nows;
+                PE_LOG(p, "eof 收尾检查：vcount=%d alen=%d sched=%d clock=%.3f dur=%.3f",
+                       p->vcount, (int)p->alen, p->sched_buffers, clock_locked(p), p->duration);
+            }
+        }
+        if (p->eof && p->vcount == 0 && p->alen == 0 && p->sched_buffers == 0) {
+            double clk = clock_locked(p);
+            if (p->duration <= 0 || clk >= p->duration - 0.15) {
+                p->ended = 1;
+                p->clock_frozen = p->duration > 0 ? p->duration : clk;
+                pthread_cond_broadcast(&p->cond);
+                PE_LOG(p, "播放结束：位置 %.3fs（eof=%d io_error=%d）",
+                       p->clock_frozen, p->eof, p->io_error);
+                pthread_mutex_unlock(&p->mu);
+                continue;
+            }
+        }
         if (p->vcount == 0) {
             pthread_mutex_unlock(&p->mu);
             usleep(3000);
@@ -759,6 +785,9 @@ static void *audio_main(void *arg) {
             continue;
         }
         double need = p->clock_started ? 0.02 : PE_PREFILL_SECONDS;
+        // 结尾时环形缓冲里常常只剩不足 20ms 的尾巴；不把它送出去，
+        // alen 永远不为 0，上层就收不到 Ended。
+        if (p->eof && p->alen > 0) need = 0;
         if ((double)p->alen / PE_AUDIO_RATE < need || p->sched_buffers >= PE_MAX_SCHEDULES) {
             cond_wait_ms(p, 10);
             pthread_mutex_unlock(&p->mu);
@@ -1190,8 +1219,12 @@ void pe_run(PePlayer *p) {
     p->run_returned = 1;
     pthread_mutex_unlock(&p->mu);
     if (ui) {
+        PE_LOG(p, "准备 teardown（ui 非空）");
         [ui teardown];
         CFRelease((__bridge CFTypeRef)ui);
+        PE_LOG(p, "teardown 完成");
+    } else {
+        PE_LOG(p, "没有 ui 可 teardown");
     }
 }
 
@@ -1233,8 +1266,26 @@ void pe_close(PePlayer *p) {
     pthread_mutex_lock(&p->mu);
     PeUI *ui = (__bridge PeUI *)p->ui;
     pthread_mutex_unlock(&p->mu);
-    if (ui) [ui stopAudio];
-    pe_stop_run(p);
+    if (ui) {
+        // 窗口的 orderOut/close 必须在主线程事件循环还在跑的时候执行，
+        // 而且要再跑一拍 run loop 才能从窗口服务器上真正撤下来。
+        if (p->run_started && !pthread_main_np()) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            [ui postUIBlock:^{
+                [ui hideWindow];
+                [ui requestStopRun];
+                dispatch_semaphore_signal(sem);
+            }];
+            long timedout = dispatch_semaphore_wait(
+                sem, dispatch_time(DISPATCH_TIME_NOW, 2000 * NSEC_PER_MSEC));
+            PE_LOG(p, "关窗请求%s", timedout == 0 ? "已交给主线程" : "等主线程超时");
+        } else {
+            [ui hideWindow];
+        }
+    }
+    if (!p->run_started || pthread_main_np()) {
+        pe_stop_run(p);
+    }
 }
 
 // 由 Go 在 pe_run 返回后调用，负责释放媒体资源与结构体。
@@ -1328,6 +1379,13 @@ void pe_destroy(PePlayer *p) {
     __weak PeUI *weakSelf = self;
     self.uiTimer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *t) {
         (void)t;
+        // 先把上一拍留下的“停事件循环”处理掉：此时上一次 run loop 迭代
+        // 已经完整跑过，窗口移除也提交给窗口服务器了。
+        if (weakSelf.stopRunPending) {
+            weakSelf.stopRunPending = NO;
+            pe_stop_run(NULL);
+            return;
+        }
         [weakSelf drainUIQueue];
         if (p && pe_now() - p->last_ui_heartbeat > 30.0) {
             p->last_ui_heartbeat = pe_now();
@@ -1559,6 +1617,19 @@ static int gFullscreenDepth = 0;
     [self.uiLock unlock];
 }
 
+- (void)hideWindow {
+    if (!self.window) return;
+    self.window.delegate = nil;
+    // 事件循环马上就要停；避免窗口服务器留着残留窗口时还吃鼠标事件。
+    self.window.ignoresMouseEvents = YES;
+    [self.window orderOut:nil];
+    [self.window close];
+}
+
+- (void)requestStopRun {
+    self.stopRunPending = YES;
+}
+
 - (void)drainUIQueue {
     NSArray *blocks;
     [self.uiLock lock];
@@ -1594,6 +1665,9 @@ static int gFullscreenDepth = 0;
         [self.window orderOut:nil];
         [self.window close];
         self.window = nil;
+        // 事件循环随后就要停：手动提交一次 CA 事务，把“窗口已移除”
+        // 真正推给窗口服务器，否则它会留一块黑屏盖在桌面上。
+        [CATransaction flush];
     }
     if (self.sws) {
         sws_freeContext(self.sws);

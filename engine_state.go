@@ -42,7 +42,7 @@ func (d *Device) onPlaybackEnded() {
 	}
 }
 
-// fallbackFrom 在某个引擎起不来时换下一个：mpv → VLC → 网页。
+// fallbackFrom 在某个引擎起不来时换下一个：native → mpv → VLC → 网页。
 func (d *Device) fallbackFrom(failed string) {
 	d.mu.RLock()
 	uri := d.uri
@@ -51,6 +51,15 @@ func (d *Device) fallbackFrom(failed string) {
 
 	var next screen
 	switch failed {
+	case "native":
+		// 自研核心打不开（坏地址、不支持的格式）时退到 mpv，行为与默认引擎一致。
+		if p := findMPV(); p != "" {
+			next = &mpvScreen{dev: d, path: p}
+		} else if p := findVLC(); p != "" {
+			next = &vlcScreen{dev: d, path: p}
+		} else {
+			next = &webScreen{dev: d}
+		}
 	case "mpv":
 		if p := findVLC(); p != "" {
 			next = &vlcScreen{dev: d, path: p}

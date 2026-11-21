@@ -90,6 +90,8 @@ type Player struct {
 	runStarted bool
 	runDone    chan struct{}
 	runOnce    sync.Once
+	closing    bool // Close 已经开始，Run 不要再进事件循环
+	destroyed  bool // PePlayer 已释放，Run 绝不能再碰它
 }
 
 // Open 创建窗口并开始播放。必须在主线程调用（见包注释）。
@@ -163,14 +165,15 @@ func HardwareDevice() string {
 	return "videotoolbox"
 }
 
+// do 在持有读锁时执行 C 调用：Close 释放 ptr 前要拿写锁，
+// 这样控件指令不会打到已经销毁的 PePlayer 上。
 func (p *Player) do(fn func(*C.PePlayer)) {
 	p.mu.RLock()
-	ptr := p.ptr
-	p.mu.RUnlock()
-	if ptr == nil {
+	defer p.mu.RUnlock()
+	if p.ptr == nil {
 		return
 	}
-	fn(ptr)
+	fn(p.ptr)
 }
 
 func (p *Player) Play()   { p.do(func(ptr *C.PePlayer) { C.pe_play(ptr) }) }
@@ -237,17 +240,17 @@ func (p *Player) WindowNumber() int {
 	return int(C.pe_window_number(ptr))
 }
 
-// Status 读取一次状态快照。
+// Status 读取一次状态快照。读锁要一直持有到 C 调用返回，
+// 否则 120ms 轮询可能在 Close 销毁播放器后读到已释放的内存。
 func (p *Player) Status() Status {
 	p.mu.RLock()
-	ptr := p.ptr
-	p.mu.RUnlock()
+	defer p.mu.RUnlock()
 	var st Status
-	if ptr == nil {
+	if p.ptr == nil {
 		return st
 	}
 	var cs C.PeStatus
-	C.pe_get_status(ptr, &cs)
+	C.pe_get_status(p.ptr, &cs)
 	st = Status{
 		Position:     float64(cs.position),
 		Duration:     float64(cs.duration),
@@ -349,13 +352,19 @@ func (p *Player) notifyClosed() {
 
 // Run 进入 macOS 事件循环，直到窗口关闭或 Close 被调用。必须主线程调用。
 func (p *Player) Run() {
+	p.runMu.Lock()
+	if p.runStarted || p.closing || p.destroyed {
+		// 已经跑过，或者 Close 抢在前面把播放器收了：没有可跑的事件循环。
+		p.runMu.Unlock()
+		return
+	}
 	p.mu.RLock()
 	ptr := p.ptr
 	p.mu.RUnlock()
 	if ptr == nil {
+		p.runMu.Unlock()
 		return
 	}
-	p.runMu.Lock()
 	p.runStarted = true
 	done := p.runDone
 	p.runMu.Unlock()
@@ -364,16 +373,23 @@ func (p *Player) Run() {
 }
 
 // Close 停止播放、回收线程与窗口。可重复调用。
+//
+// pe_close 只停媒体线程和事件循环，真正释放 PePlayer 要等 Run 返回之后，
+// 并且要拿写锁：轮询 goroutine 可能正在 Status() 里读 C 结构体。
 func (p *Player) Close() {
 	p.closeOnce.Do(func() {
 		p.pollOnce.Do(func() { close(p.pollStop) })
-		p.mu.Lock()
+		p.mu.RLock()
 		ptr := p.ptr
+		p.mu.RUnlock()
 		if ptr == nil {
-			p.mu.Unlock()
 			return
 		}
-		// 先让媒体线程停下来、事件循环退出；未跑过 Run 时直接销毁。
+		// 先标明“正在关”，还没进事件的 Run 就直接返回，不会拿到空指针。
+		p.runMu.Lock()
+		p.closing = true
+		p.runMu.Unlock()
+		// 再让媒体线程停下来、事件循环退出；未跑过 Run 时直接销毁。
 		C.pe_close(ptr)
 		p.runMu.Lock()
 		started := p.runStarted
@@ -382,9 +398,15 @@ func (p *Player) Close() {
 		if started {
 			<-done
 		}
-		C.pe_destroy(ptr)
-		p.ptr = nil
+		p.mu.Lock()
+		if p.ptr == ptr {
+			C.pe_destroy(ptr)
+			p.ptr = nil
+		}
 		p.mu.Unlock()
+		p.runMu.Lock()
+		p.destroyed = true
+		p.runMu.Unlock()
 	})
 }
 

@@ -151,3 +151,47 @@ ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=45" \
   前者更接近“进程内播放”，也是这次 spike 想验证的方向。
 - 需要新增 `screen` 之外的进度回调（现有 `screen` 接口没有 position/duration，
   mpv 是通过 JSON IPC 单独回填的）；`player` 已经用 `OnUpdate` 提供。
+
+## 已接入主引擎（`-player native`，2026-11-21）
+
+接入点在 `native.go`（darwin+cgo）/ `native_unsupported.go`（占位）：
+
+- `nativeScreen` 实现 `screen`；`engine_pick.go` 在 `-player native` 时选它，
+  自动模式仍是 mpv。`main()` 先 `runtime.LockOSThread()`，起完 HTTP/SSDP 后
+  进入 `nativeHost.Run()`：投屏请求经 channel 投给主线程 `player.Open`；
+  播放中的 Play/Pause/Seek/音量直接调引擎（C 侧有锁，可从任意 goroutine 调）；
+  关窗在主线程事件循环里做，并且要让 run loop 再跑一拍才停 NSApp。
+- 状态回填：`OnUpdate` → `Device.setDuration/syncPosition`；`Ended` →
+  `onPlaybackEnded`（回 STOPPED 并收窗）；用户关窗 → `onScreenExit`。
+- 失败回退：`native` 打开失败 → `fallbackFrom("native")` → mpv（再 VLC/网页），
+  日志会写清原因。
+- 引擎侧修补（接入时才暴露）：
+  1. `player_darwin.go`：`Status/do` 持读锁读 C 结构，`Close` 等 `Run` 返回后再
+     拿写锁销毁；`Run/Close` 加 closing/destroyed 栅栏，避免轮询打到已释放内存。
+  2. `engine_darwin.m`：eof 时把环形缓冲里不足 20ms 的音频尾巴也排空（否则
+     `alen` 永不为 0、上层收不到 Ended）；队列放完且时钟到片尾才算 Ended。
+  3. `engine_darwin.m`：关窗必须在事件循环还转的时候 `orderOut/close`，并在
+     下一拍定时器里停 NSApp；直接停循环再关窗会留一块黑屏盖住桌面。
+
+实测（本机 macOS，45s 1080p H.264+AAC，本地 Go Range 服务器，
+`-http-port 8096 -no-ssdp -no-open -player native`）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 投屏 | TRANSITIONING → PLAYING，位置按 1s/s 前进；首帧 75–930ms |
+| 全屏 | 1800×1169（截图 3600×2338） |
+| CPU | 1080p30 硬解 3.1–5.2% |
+| 暂停 | PAUSED_PLAYBACK，位置冻结（21.269 保持不动） |
+| seek 20s | 位置 20.001；1.2s 后暂停在 21.269；截图时间条 bar1=12.7%、bar2=20.0%（t≈21.3s） |
+| Stop | STOPPED/0，窗口撤下、屏幕回桌面；连续 3 轮 cast/stop 后仍能重开 |
+| 自然播完 | 45.247s 上报 Ended → 关窗、STOPPED |
+| 用户关窗 | 点窗口关闭按钮 → onScreenExit、STOPPED |
+| 坏地址 | native 打不开 → 回退 mpv，日志写明原因 |
+
+已知现象/限制：
+
+- 窗口关掉后 `CGWindowList` 可能还留一条 onscreen 记录（AppKit 里 visible=0），
+  屏幕像素已经是桌面；下一次投屏或进程退出后消失，不影响使用。
+- 非 macOS 只有编译占位：`GOOS=windows/linux CGO_ENABLED=0 go build ./...` 通过，
+  `-player native` 会回退 mpv。
+- 本机 FFmpeg 是 GPL 构建，只用于本地验证；发布许可由产品侧决定。

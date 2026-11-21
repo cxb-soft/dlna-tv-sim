@@ -94,6 +94,7 @@ type Device struct {
 	srv          *http.Server
 	sd           *SSDP
 	streamClient *http.Client
+	native       *nativeHost
 }
 
 func NewDevice(cfg Config, cfgPath string, verbose bool) *Device {
@@ -131,6 +132,7 @@ func NewDevice(cfg Config, cfgPath string, verbose bool) *Device {
 		},
 	}
 	d.subs = newSubscriptions(d)
+	d.native = newNativeHost()
 	return d
 }
 
@@ -613,6 +615,11 @@ func (d *Device) engineNameLocked() string {
 	}
 	switch strings.ToLower(strings.TrimSpace(d.cfg.Player)) {
 	case "web":
+		return "web"
+	case "native":
+		if nativeAvailable() {
+			return "native"
+		}
 		return "web"
 	case "vlc":
 		if findVLC() != "" {
