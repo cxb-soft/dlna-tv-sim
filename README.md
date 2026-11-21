@@ -92,6 +92,7 @@
 - 只实现 DLNA/UPnP 的 DMR。AirPlay、Google Cast、Miracast 是另外的协议，不在范围内。
 - 手机 App 的「屏幕镜像」多数走 AirPlay/Cast，不会出现在 DLNA 列表里；要用 App 内的「投屏」按钮。
 - 网页兜底播放受浏览器解码能力限制，只适合 mp4/HLS 这类；ts、mkv 要靠 mpv/VLC。
+- 网页兜底播放要能拖进度，媒体服务器必须支持 HTTP Range；不支持 Range 的源（如 `python -m http.server`）在浏览器里会被判成不可跳转。mpv/VLC 引擎不受影响。
 - 未做厂商私有扩展（Samsung/LG 的附加服务），标准 DMR 行为完整。
 
 ## 开发
