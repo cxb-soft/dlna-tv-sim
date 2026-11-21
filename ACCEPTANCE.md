@@ -56,6 +56,13 @@
 - 环回单播 M-SEARCH → 正确 200 OK（LOCATION/ST/USN/EXT/CACHE-CONTROL）。
 - 网页控制台可打开、可投屏、日志实时。
 
+## 桌面应用（2026-11-21）
+
+- **启动不带终端**：`DLNA 电视.app` 双击启动，Flutter 窗口正常显示，引擎作为子进程拉起（`Contents/Resources/engine/dlna-tv-sim -no-open -http-port 8090`），退出 App 后引擎被回收。
+- **签名**：Developer ID 签名，`codesign --verify --deep --strict` 通过；引擎单独签名（`--deep` 不重签裸二进制）。
+- **更新检查**：真实请求 GitHub Releases，当前 v0.3.0 时能显示「有新版本」横幅并带更新说明。
+- **待确认**：首次启动的本地网络授权弹窗已出现（截图确认），需用户点 Allow 后才能验证组播与手机发现；未点之前 `/api/diag` 仍是 `multicast false`。
+
 ## 未验证
 
 - Windows 实机运行（只做了交叉编译）。

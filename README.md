@@ -9,6 +9,15 @@
 
 > 网页兜底播放器内嵌了 hls.js（Apache-2.0），源码在 `web/hls.min.js`。
 
+## 桌面应用（macOS，推荐）
+
+双击 `DLNA 电视.app` 就能用：Flutter 原生窗口 + 内置 Go 引擎，不依赖浏览器，也不会弹终端。
+
+- 首次启动 macOS 会问一次「允许 DLNA 电视查找本地网络设备」，必须允许，否则手机搜不到这台电视；之后不再询问。
+- 播放仍由 mpv 全屏完成；没装 mpv 时回退网页播放器。
+- 有新版本时窗口顶部会出现更新横幅，点「立即更新」会自动下载、校验 SHA256、替换旧包并重启。
+- 打包：`./scripts/package-macos-app.sh`，产物 `dist/dlna-tv-sim-macos-app.zip`（含引擎、Developer ID 签名）。
+
 ## 快速开始
 
 ### macOS

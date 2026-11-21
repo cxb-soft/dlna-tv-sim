@@ -29,6 +29,12 @@ class UpdateService {
   static const String _apiRoot = 'https://api.github.com/repos';
   static const String _checksumsName = 'SHA256SUMS.txt';
 
+  /// 测试用：设置 DLNA_TV_SIM_UPDATE_API 可把更新接口指到本地模拟服务。
+  static String get _apiRootResolved =>
+      Platform.environment['DLNA_TV_SIM_UPDATE_API']?.trim().isNotEmpty == true
+          ? Platform.environment['DLNA_TV_SIM_UPDATE_API']!.trim()
+          : _apiRoot;
+
   final String currentVersion;
   final String repo;
   final String? assetNameOverride;
@@ -58,7 +64,7 @@ class UpdateService {
 
     try {
       final req = await client
-          .getUrl(Uri.parse('$_apiRoot/$repo/releases/latest'))
+          .getUrl(Uri.parse('$_apiRootResolved/$repo/releases/latest'))
           .timeout(timeout);
       req.headers.set(HttpHeaders.acceptHeader, 'application/vnd.github+json');
       req.headers.set(
