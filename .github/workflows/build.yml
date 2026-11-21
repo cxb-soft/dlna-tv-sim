@@ -1,0 +1,94 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go vet & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+      - run: go vet ./...
+      - run: go test ./...
+
+  build:
+    name: build ${{ matrix.out }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin,  goarch: arm64, out: dlna-tv-sim-macos-arm64 }
+          - { goos: darwin,  goarch: amd64, out: dlna-tv-sim-macos-amd64 }
+          - { goos: windows, goarch: amd64, out: dlna-tv-sim-windows-x64.exe }
+          - { goos: windows, goarch: arm64, out: dlna-tv-sim-windows-arm64.exe }
+          - { goos: linux,   goarch: amd64, out: dlna-tv-sim-linux-amd64 }
+          - { goos: linux,   goarch: arm64, out: dlna-tv-sim-linux-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/${{ matrix.out }}" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: dist/${{ matrix.out }}
+          if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd dist
+          chmod +x dlna-tv-sim-macos-* dlna-tv-sim-linux-* || true
+          cp ../README.md .
+          cp ../README-Windows.txt .
+          cp "../启动电视.command" .
+          chmod +x "启动电视.command"
+          zip -q -j dlna-tv-sim-windows-x64.zip dlna-tv-sim-windows-x64.exe README-Windows.txt
+          zip -q -j dlna-tv-sim-windows-arm64.zip dlna-tv-sim-windows-arm64.exe README-Windows.txt
+          zip -q -j dlna-tv-sim-macos.zip dlna-tv-sim-macos-arm64 dlna-tv-sim-macos-amd64 "启动电视.command" README.md
+          zip -q -j dlna-tv-sim-linux.zip dlna-tv-sim-linux-amd64 dlna-tv-sim-linux-arm64 README.md
+          shasum -a 256 *.zip > SHA256SUMS.txt
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
