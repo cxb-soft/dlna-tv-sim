@@ -63,6 +63,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: macos-14
+    # 仓库当前的 macOS runner 配置不一定可用；正式 .app 在本地公证后手动上传，
+    # 这里只作为可选的构建检查，不让它把整条工作流判红。
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
