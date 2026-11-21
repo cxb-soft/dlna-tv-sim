@@ -9,10 +9,38 @@ APP="ui/build/macos/Build/Products/Release/DLNA 电视.app"
 DEFAULT_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
 SIGN_ID="${SIGN_ID:-${DEFAULT_ID:--}}"
 
+# 自包含原生引擎：默认链接 scripts/build-native-deps.sh 产出的 LGPL FFmpeg，
+# 把 dylib 放进 Contents/Resources/engine/lib（@rpath/@executable_path/lib）。
+# DLNA_NATIVE_ENGINE=0 可退回不含 native 的 CGO_ENABLED=0 构建。
+DEPS_ROOT="${DLNA_DEPS_ROOT:-$HOME/Library/Caches/dlnatvsim-deps}"
+FFMPEG_PREFIX="${DLNA_FFMPEG_PREFIX:-$DEPS_ROOT/ffmpeg-lgpl}"
+NATIVE_ENGINE="${DLNA_NATIVE_ENGINE:-1}"
+
 echo "→ 构建 Go 引擎（arm64），版本 $VERSION"
 mkdir -p dist
-GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath \
-  -ldflags "-s -w -X main.version=$VERSION" -o /tmp/dlna-tv-sim-engine .
+if [ "$NATIVE_ENGINE" = "1" ]; then
+  if [ ! -f "$FFMPEG_PREFIX/lib/libavcodec.dylib" ]; then
+    echo "错误：找不到 LGPL FFmpeg（$FFMPEG_PREFIX）" >&2
+    echo "      先运行 scripts/build-native-deps.sh，或用 DLNA_NATIVE_ENGINE=0 构建不含 native 的引擎。" >&2
+    exit 1
+  fi
+  case "$FFMPEG_PREFIX" in
+    *[[:space:]]*)
+      echo "错误：FFMPEG_PREFIX 不能包含空格（pkg-config 不支持）：$FFMPEG_PREFIX" >&2
+      exit 1
+      ;;
+  esac
+  echo "  链接自包含 LGPL FFmpeg：$FFMPEG_PREFIX"
+  PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+  CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+  CGO_LDFLAGS="-Wl,-rpath,@executable_path/lib ${CGO_LDFLAGS:-}" \
+    go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o /tmp/dlna-tv-sim-engine .
+else
+  echo "  警告：DLNA_NATIVE_ENGINE=0，引擎不含自研播放核心（-player native 不可用）" >&2
+  GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" -o /tmp/dlna-tv-sim-engine .
+fi
 file /tmp/dlna-tv-sim-engine
 
 echo "→ 构建 Flutter 界面（release，arm64）"
@@ -30,8 +58,35 @@ if [ -d uosc ]; then
   cp -R uosc "$APP/Contents/Resources/engine/uosc"
 fi
 
+if [ "$NATIVE_ENGINE" = "1" ]; then
+  echo "→ 嵌入 FFmpeg 动态库（@rpath）"
+  ENGINE_DIR="$APP/Contents/Resources/engine"
+  rm -rf "$ENGINE_DIR/lib"
+  mkdir -p "$ENGINE_DIR/lib"
+  # 保留符号链接：install_name 是 @rpath/libavcodec.63.dylib，实体是 libavcodec.63.1.102.dylib
+  for f in "$FFMPEG_PREFIX"/lib/*.dylib; do cp -a "$f" "$ENGINE_DIR/lib/"; done
+  # 引擎只能依赖 @rpath 与系统框架，不能残留 Homebrew/绝对前缀
+  ABS_RE="$(printf '%s' "$FFMPEG_PREFIX" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+  if otool -L "$ENGINE_DIR/dlna-tv-sim" | tail -n +2 | grep -Eq "/opt/homebrew|/usr/local|$ABS_RE"; then
+    echo "错误：引擎仍链接外部 FFmpeg：" >&2
+    otool -L "$ENGINE_DIR/dlna-tv-sim" | tail -n +2 >&2
+    exit 1
+  fi
+  if ! otool -l "$ENGINE_DIR/dlna-tv-sim" | grep -A2 LC_RPATH | grep -q '@executable_path/lib'; then
+    echo "错误：引擎缺少 @executable_path/lib 的 rpath" >&2
+    exit 1
+  fi
+  otool -L "$ENGINE_DIR/dlna-tv-sim" | sed -n '1,12p'
+fi
+
 echo "→ 签名（${SIGN_ID}）"
-# --deep 不会重签 Resources 里的裸二进制，引擎要单独签，否则 TCC 认不出它属于这个 App
+# --deep 不会重签 Resources 里的裸二进制，引擎和 dylib 要单独签，否则 TCC 认不出它属于这个 App
+if [ "$NATIVE_ENGINE" = "1" ]; then
+  for lib in "$APP/Contents/Resources/engine/lib/"*.dylib; do
+    [ -L "$lib" ] && continue
+    codesign --force --options runtime --sign "$SIGN_ID" "$lib"
+  done
+fi
 codesign --force --options runtime --sign "$SIGN_ID" "$APP/Contents/Resources/engine/dlna-tv-sim"
 # 框架必须和主程序同 Team ID，否则 hardened runtime 下 dyld 拒绝加载
 codesign --force --deep --options runtime --sign "$SIGN_ID" "$APP"

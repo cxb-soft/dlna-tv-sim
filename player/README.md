@@ -112,9 +112,8 @@ ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=45" \
   同一个进程里关掉再开新片未验证。
 - 启动时会一次性建窗 + 启音频引擎，约 0.2–1.0s；HEVC 冷启动偶发更慢。
 - 窗口不会主动抢前台（移除了 `activateIgnoringOtherApps:`，它会阻塞主线程）。
-- **许可证**：本机 Homebrew FFmpeg 是 GPL 构建（`--enable-gpl`），spike 直接
-  链接没问题；正式发布要么换 LGPL 动态链接的 FFmpeg，要么改用系统框架解码，
-  这是产品侧要拍板的。
+- **许可证**：开发机默认仍链接 Homebrew FFmpeg（GPL 构建，仅本地验证）。
+  发布用的自包含 LGPL 构建见 `third_party/README.md` 与文末「自包含 LGPL FFmpeg」。
 
 ## 踩过的坑（接入前值得知道）
 
@@ -194,4 +193,26 @@ ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=45" \
   屏幕像素已经是桌面；下一次投屏或进程退出后消失，不影响使用。
 - 非 macOS 只有编译占位：`GOOS=windows/linux CGO_ENABLED=0 go build ./...` 通过，
   `-player native` 会回退 mpv。
-- 本机 FFmpeg 是 GPL 构建，只用于本地验证；发布许可由产品侧决定。
+- 本机 Homebrew FFmpeg 是 GPL 构建，只用于开发/本地验证；发布包已改用
+  自包含 LGPL 构建（见下节）。
+
+## 自包含 LGPL FFmpeg（发布用，2026-11-21）
+
+发布版 `-player native` 不再链接 `/opt/homebrew`，改用本地源码构建的
+FFmpeg 9.0.2 LGPL 动态库，随 App 放进 `Contents/Resources/engine/lib/`：
+
+```bash
+./scripts/build-native-deps.sh     # 构建 LGPL FFmpeg 到 ~/Library/Caches/dlnatvsim-deps/ffmpeg-lgpl
+./scripts/package-macos-app.sh     # 引擎用 cgo 构建，嵌入 dylib 并签名
+DLNA_NATIVE_ENGINE=0 ./scripts/package-macos-app.sh   # 旧行为：不含 native
+```
+
+- 引擎与 dylib 的 `otool -L` 只出现 `@rpath/...` 与系统框架；引擎带
+  `LC_RPATH=@executable_path/lib`，dylib 带 `@loader_path`，互相依赖在 App 内解析。
+- 开发机不设 `PKG_CONFIG_PATH` 时仍按原样链接 Homebrew，`go run ./player/cmd/play`
+  等开发流程不变。
+- 许可文本、替换库与源码获取方式见 `third_party/README.md`；仓库内副本在
+  `third_party/licenses/ffmpeg/`。
+- 实测（App 内引擎、`env -i` 干净环境）：H.264/HEVC 均 `videotoolbox_vld` 硬解，
+  seek 20s 首帧 pts=20.000，Stop 后正常关窗退出；运行时加载的 libav* 全部来自
+  App 内 `engine/lib`。

@@ -4,6 +4,10 @@ dist/
 *.sock
 *.log
 
+# 自包含 LGPL FFmpeg：构建脚本默认装在仓库外，这里兜底忽略仓库内产物
+/third_party/ffmpeg-lgpl/
+/third_party/build/
+
 # macOS
 .DS_Store
 
