@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="$(grep -E '^var version = ' main.go | sed -E 's/.*"(.*)".*/\1/' | head -1)"
-APP="ui/build/macos/Build/Products/Release/dlna_tv_sim.app"
+APP="ui/build/macos/Build/Products/Release/DLNA 电视.app"
 DEFAULT_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
 SIGN_ID="${SIGN_ID:-${DEFAULT_ID:--}}"
 
@@ -30,7 +30,7 @@ if [ -d uosc ]; then
   cp -R uosc "$APP/Contents/Resources/engine/uosc"
 fi
 
-echo "→ 签名（$SIGN_ID）"
+echo "→ 签名（${SIGN_ID}）"
 # --deep 不会重签 Resources 里的裸二进制，引擎要单独签，否则 TCC 认不出它属于这个 App
 codesign --force --options runtime --sign "$SIGN_ID" "$APP/Contents/Resources/engine/dlna-tv-sim"
 # 框架必须和主程序同 Team ID，否则 hardened runtime 下 dyld 拒绝加载
