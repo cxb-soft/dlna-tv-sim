@@ -15,7 +15,8 @@ class EngineBootException implements Exception {
   final String? detail;
 
   @override
-  String toString() => detail == null || detail!.isEmpty ? message : '$message\n$detail';
+  String toString() =>
+      detail == null || detail!.isEmpty ? message : '$message\n$detail';
 }
 
 class EngineHandle {
@@ -42,8 +43,9 @@ class EngineManager {
 
   /// 把引擎 PID 交给 macOS 原生层：Dart 的退出回调不一定来得及跑完，
   /// 由 AppKit 在 applicationWillTerminate 里发 SIGTERM 兜底。
-  static const MethodChannel _nativeChannel =
-      MethodChannel('com.cxbsoft.dlna-tv-sim/engine');
+  static const MethodChannel _nativeChannel = MethodChannel(
+    'com.cxbsoft.dlna-tv-sim/engine',
+  );
 
   Process? _child;
   int? _exitCode;
@@ -57,7 +59,10 @@ class EngineManager {
 
   String get logTail => _tail.toString();
 
-  Future<EngineHandle> ensureRunning({void Function(String)? onProgress}) async {
+  Future<EngineHandle> ensureRunning({
+    void Function(String)? onProgress,
+    String? player,
+  }) async {
     onProgress?.call('正在检查 $port 端口…');
     if (await _probe()) {
       return EngineHandle(port: port, adopted: true);
@@ -73,7 +78,7 @@ class EngineManager {
     }
 
     onProgress?.call('正在启动引擎…');
-    await _spawn(binary);
+    await _spawn(binary, player: player);
 
     final deadline = DateTime.now().add(const Duration(seconds: 15));
     while (DateTime.now().isBefore(deadline)) {
@@ -102,14 +107,17 @@ class EngineManager {
   }
 
   Future<bool> _probe() async {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(milliseconds: 500)
-      ..findProxy = ((_) => 'DIRECT');
+    final client =
+        HttpClient()
+          ..connectionTimeout = const Duration(milliseconds: 500)
+          ..findProxy = ((_) => 'DIRECT');
     try {
       final req = await client
           .getUrl(Uri.parse('http://127.0.0.1:$port/api/state'))
           .timeout(const Duration(milliseconds: 700));
-      final resp = await req.close().timeout(const Duration(milliseconds: 1200));
+      final resp = await req.close().timeout(
+        const Duration(milliseconds: 1200),
+      );
       final body = await resp
           .transform(utf8.decoder)
           .join()
@@ -122,7 +130,7 @@ class EngineManager {
     }
   }
 
-  Future<void> _spawn(String binary) async {
+  Future<void> _spawn(String binary, {String? player}) async {
     final dir = await AppPaths.logDir().create(recursive: true);
     _logPath = '${dir.path}/engine.log';
     final logFile = File(_logPath);
@@ -139,11 +147,16 @@ class EngineManager {
       throw EngineBootException('写不了引擎日志：$_logPath');
     }
 
+    final args = <String>['-no-open', '-http-port', '$port'];
+    if (player != null && player.trim().isNotEmpty) {
+      args.addAll(['-player', player.trim()]);
+    }
+
     final Process proc;
     try {
       proc = await Process.start(
         binary,
-        ['-no-open', '-http-port', '$port'],
+        args,
         runInShell: false,
         workingDirectory: File(binary).parent.path,
         includeParentEnvironment: true,
@@ -162,7 +175,9 @@ class EngineManager {
     await _registerPid(proc.pid);
 
     sink.writeln('');
-    sink.writeln('=== ${DateTime.now().toIso8601String()} 启动 $binary (端口 $port) ===');
+    sink.writeln(
+      '=== ${DateTime.now().toIso8601String()} 启动 $binary (端口 $port) ===',
+    );
 
     void pipe(Stream<List<int>> stream) {
       stream.transform(utf8.decoder).listen((chunk) {
@@ -173,11 +188,15 @@ class EngineManager {
 
     pipe(proc.stdout);
     pipe(proc.stderr);
-    unawaited(proc.exitCode.then((code) {
-      _exitCode = code;
-      sink.writeln('=== ${DateTime.now().toIso8601String()} 引擎退出，退出码 $code ===');
-      unawaited(sink.flush().then((_) => sink.close()).catchError((_) {}));
-    }));
+    unawaited(
+      proc.exitCode.then((code) {
+        _exitCode = code;
+        sink.writeln(
+          '=== ${DateTime.now().toIso8601String()} 引擎退出，退出码 $code ===',
+        );
+        unawaited(sink.flush().then((_) => sink.close()).catchError((_) {}));
+      }),
+    );
   }
 
   void _remember(String chunk) {
@@ -194,10 +213,7 @@ class EngineManager {
     final tail = _tail.toString().trim();
     final lines = tail.split('\n');
     final last = lines.length > 14 ? lines.sublist(lines.length - 14) : lines;
-    return [
-      '引擎日志：$_logPath',
-      if (last.isNotEmpty) ...last,
-    ].join('\n');
+    return ['引擎日志：$_logPath', if (last.isNotEmpty) ...last].join('\n');
   }
 
   /// 只结束自己拉起来的引擎；复用别人的实例时不动它。
@@ -246,8 +262,14 @@ class EngineLocator {
     }
     if (Platform.isWindows) {
       return _isArm
-          ? const ['dlna-tv-sim-windows-arm64.exe', 'dlna-tv-sim-windows-x64.exe']
-          : const ['dlna-tv-sim-windows-x64.exe', 'dlna-tv-sim-windows-arm64.exe'];
+          ? const [
+            'dlna-tv-sim-windows-arm64.exe',
+            'dlna-tv-sim-windows-x64.exe',
+          ]
+          : const [
+            'dlna-tv-sim-windows-x64.exe',
+            'dlna-tv-sim-windows-arm64.exe',
+          ];
     }
     return _isArm
         ? const ['dlna-tv-sim-linux-arm64', 'dlna-tv-sim-linux-amd64']

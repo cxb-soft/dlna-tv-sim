@@ -35,6 +35,7 @@ class AppController extends ChangeNotifier {
   // ---- 引擎 ----
   EnginePhase _phase = EnginePhase.booting;
   String _bootMessage = '正在准备…';
+  String _preferredEngine = 'auto';
   String? _fatalError;
   String? _fatalDetail;
   EngineState? _state;
@@ -87,6 +88,7 @@ class AppController extends ChangeNotifier {
   EngineState? get state => _state;
   EngineHandle? get handle => _handle;
   bool get adoptedEngine => _handle?.adopted ?? false;
+  String get preferredEngine => _preferredEngine;
   DateTime? get connectedAt => _connectedAt;
 
   List<LogEntry> get logs => List.unmodifiable(_logs);
@@ -115,14 +117,14 @@ class AppController extends ChangeNotifier {
   String get engineLogPath => engine.logPath;
 
   /// 启动：探活 → 复用或拉起引擎 → 首次拉状态 → 开轮询。
-  Future<void> bootstrap() async {
+  Future<void> bootstrap({String? bootMessage}) async {
     _stateTimer?.cancel();
     _logTimer?.cancel();
     _stateTimer = null;
     _logTimer = null;
 
     _phase = EnginePhase.booting;
-    _bootMessage = '正在连接引擎…';
+    _bootMessage = bootMessage ?? '正在连接引擎…';
     _fatalError = null;
     _fatalDetail = null;
     _pollFailures = 0;
@@ -141,6 +143,7 @@ class AppController extends ChangeNotifier {
 
     try {
       final handle = await engine.ensureRunning(
+        player: _preferredEngine,
         onProgress: (message) {
           _bootMessage = message;
           _emit();
@@ -173,17 +176,26 @@ class AppController extends ChangeNotifier {
   }
 
   /// 手动重启：先收掉自己启动的引擎，再走一遍启动流程。
-  Future<void> restartEngine() async {
+  Future<void> restartEngine({String? message}) async {
     _stateTimer?.cancel();
     _logTimer?.cancel();
     _stateTimer = null;
     _logTimer = null;
     _phase = EnginePhase.booting;
-    _bootMessage = '正在重启引擎…';
+    _bootMessage = message ?? '正在重启引擎…';
     _emit();
     await engine.stop();
     client.close();
-    await bootstrap();
+    await bootstrap(bootMessage: message);
+  }
+
+  /// 切换播放引擎。会重启引擎，当前投屏会中断。
+  Future<void> switchEngine(String player) async {
+    if (_phase == EnginePhase.booting) return;
+    if (adoptedEngine) return;
+    if (player == _preferredEngine && _phase == EnginePhase.ready) return;
+    _preferredEngine = player;
+    await restartEngine(message: '正在切换播放引擎…');
   }
 
   void _fail(String message, String? detail) {

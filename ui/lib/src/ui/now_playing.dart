@@ -42,6 +42,8 @@ String _engineTag(String player) {
       return 'VLC';
     case 'web':
       return 'WEB';
+    case 'native':
+      return 'NATIVE';
     default:
       return player.toUpperCase();
   }
@@ -55,6 +57,8 @@ String engineLabel(String player) {
       return 'VLC';
     case 'web':
       return '网页播放';
+    case 'native':
+      return '自研';
     default:
       return player.isEmpty ? '未选择' : player;
   }
@@ -69,7 +73,8 @@ class NowPlayingCard extends StatefulWidget {
   State<NowPlayingCard> createState() => _NowPlayingCardState();
 }
 
-class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProviderStateMixin {
+class _NowPlayingCardState extends State<NowPlayingCard>
+    with SingleTickerProviderStateMixin {
   late final AnimationController _ambient = AnimationController(
     vsync: this,
     duration: const Duration(seconds: 8),
@@ -209,7 +214,10 @@ class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProvid
                     _screenTopBar(state),
                     Expanded(
                       child: Center(
-                        child: hasMedia ? _nowPlayingBody(state!) : _idleBody(state),
+                        child:
+                            hasMedia
+                                ? _nowPlayingBody(state!)
+                                : _idleBody(state),
                       ),
                     ),
                     _progressRow(state),
@@ -258,7 +266,8 @@ class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProvid
     final subtitle = <String>[
       if (state.status.isNotEmpty) state.status,
       if (state.probe.contentType.isNotEmpty) state.probe.contentType,
-      if (state.probe.contentType.isEmpty && state.sourceLabel.isNotEmpty) state.sourceLabel,
+      if (state.probe.contentType.isEmpty && state.sourceLabel.isNotEmpty)
+        state.sourceLabel,
     ].join('  ·  ');
 
     return Padding(
@@ -289,7 +298,10 @@ class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProvid
   }
 
   Widget _idleBody(EngineState? state) {
-    final name = (state?.friendlyName.isNotEmpty ?? false) ? state!.friendlyName : '这台电视';
+    final name =
+        (state?.friendlyName.isNotEmpty ?? false)
+            ? state!.friendlyName
+            : '这台电视';
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 18),
       child: Column(
@@ -344,15 +356,14 @@ class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProvid
             child: Slider(
               value: value,
               max: max,
-              onChanged: seekable
-                  ? (v) => setState(() => _seekDrag = v)
-                  : null,
-              onChangeEnd: seekable
-                  ? (v) {
-                      setState(() => _seekDrag = null);
-                      widget.controller.control('seek', v);
-                    }
-                  : null,
+              onChanged: seekable ? (v) => setState(() => _seekDrag = v) : null,
+              onChangeEnd:
+                  seekable
+                      ? (v) {
+                        setState(() => _seekDrag = null);
+                        widget.controller.control('seek', v);
+                      }
+                      : null,
             ),
           ),
         ),
@@ -370,14 +381,20 @@ class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProvid
     final hasMedia = state?.hasMedia ?? false;
     final playing = state?.playing ?? false;
     final muted = state?.mute ?? false;
-    final volume = (_volumeDrag ?? (state?.volume ?? 0).toDouble()).clamp(0.0, 100.0).toDouble();
+    final volume =
+        (_volumeDrag ?? (state?.volume ?? 0).toDouble())
+            .clamp(0.0, 100.0)
+            .toDouble();
 
     return Row(
       children: [
         IconSoftButton(
           icon: Icons.replay_10_rounded,
           tooltip: '后退 10 秒',
-          onPressed: hasMedia ? () => controller.playerAction('seekrel', value: -10) : null,
+          onPressed:
+              hasMedia
+                  ? () => controller.playerAction('seekrel', value: -10)
+                  : null,
         ),
         const SizedBox(width: 6),
         _PlayButton(
@@ -395,14 +412,20 @@ class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProvid
         IconSoftButton(
           icon: Icons.forward_10_rounded,
           tooltip: '前进 10 秒',
-          onPressed: hasMedia ? () => controller.playerAction('seekrel', value: 10) : null,
+          onPressed:
+              hasMedia
+                  ? () => controller.playerAction('seekrel', value: 10)
+                  : null,
         ),
         const SizedBox(width: 16),
         IconSoftButton(
           icon: muted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
           tooltip: muted ? '取消静音' : '静音',
           active: muted,
-          onPressed: state == null ? null : () => controller.control('mute', muted ? 0 : 1),
+          onPressed:
+              state == null
+                  ? null
+                  : () => controller.control('mute', muted ? 0 : 1),
         ),
         SizedBox(
           width: 88,
@@ -438,9 +461,13 @@ class _NowPlayingCardState extends State<NowPlayingCard> with SingleTickerProvid
           icon: Icons.repeat_rounded,
           tooltip: (state?.loop ?? false) ? '关闭循环' : '循环播放',
           active: state?.loop ?? false,
-          onPressed: state == null
-              ? null
-              : () => controller.playerAction('loop', value: state.loop ? 0 : 1),
+          onPressed:
+              state == null
+                  ? null
+                  : () => controller.playerAction(
+                    'loop',
+                    value: state.loop ? 0 : 1,
+                  ),
         ),
       ],
     );
@@ -491,13 +518,17 @@ class _PlayButtonState extends State<_PlayButton> {
 
   @override
   Widget build(BuildContext context) {
-    final background = !widget.enabled
-        ? C.lineStrong
-        : (_hover ? const Color(0xFFF3BE70) : C.amber);
+    final background =
+        !widget.enabled
+            ? C.lineStrong
+            : (_hover ? const Color(0xFFF3BE70) : C.amber);
     return Tooltip(
       message: widget.playing ? '暂停' : '播放',
       child: MouseRegion(
-        cursor: widget.enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+        cursor:
+            widget.enabled
+                ? SystemMouseCursors.click
+                : SystemMouseCursors.basic,
         onEnter: (_) => setState(() => _hover = true),
         onExit: (_) => setState(() => _hover = false),
         child: GestureDetector(
@@ -509,15 +540,16 @@ class _PlayButtonState extends State<_PlayButton> {
             decoration: BoxDecoration(
               color: background,
               shape: BoxShape.circle,
-              boxShadow: widget.enabled
-                  ? [
-                      BoxShadow(
-                        color: C.amber.withValues(alpha: 0.18),
-                        blurRadius: 16,
-                        offset: const Offset(0, 4),
-                      ),
-                    ]
-                  : null,
+              boxShadow:
+                  widget.enabled
+                      ? [
+                        BoxShadow(
+                          color: C.amber.withValues(alpha: 0.18),
+                          blurRadius: 16,
+                          offset: const Offset(0, 4),
+                        ),
+                      ]
+                      : null,
             ),
             child: Icon(
               widget.playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
@@ -550,27 +582,29 @@ class _SpeedMenu extends StatelessWidget {
       enabled: state != null,
       offset: const Offset(0, -6),
       onSelected: (value) => controller.playerAction('speed', value: value),
-      itemBuilder: (context) => [
-        for (final option in _options)
-          PopupMenuItem<double>(
-            value: option,
-            height: 34,
-            child: Row(
-              children: [
-                Text(
-                  _label(option),
-                  style: T.body.copyWith(
-                    fontSize: 12.5,
-                    color: (option - current).abs() < 0.001 ? C.amber : C.text,
-                  ),
+      itemBuilder:
+          (context) => [
+            for (final option in _options)
+              PopupMenuItem<double>(
+                value: option,
+                height: 34,
+                child: Row(
+                  children: [
+                    Text(
+                      _label(option),
+                      style: T.body.copyWith(
+                        fontSize: 12.5,
+                        color:
+                            (option - current).abs() < 0.001 ? C.amber : C.text,
+                      ),
+                    ),
+                    const Spacer(),
+                    if ((option - current).abs() < 0.001)
+                      const Icon(Icons.check_rounded, size: 14, color: C.amber),
+                  ],
                 ),
-                const Spacer(),
-                if ((option - current).abs() < 0.001)
-                  const Icon(Icons.check_rounded, size: 14, color: C.amber),
-              ],
-            ),
-          ),
-      ],
+              ),
+          ],
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
         decoration: BoxDecoration(
@@ -669,7 +703,11 @@ class _FailureCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(color: C.red.withValues(alpha: 0.26)),
                 ),
-                child: const Icon(Icons.wifi_off_rounded, size: 17, color: C.red),
+                child: const Icon(
+                  Icons.wifi_off_rounded,
+                  size: 17,
+                  color: C.red,
+                ),
               ),
               const SizedBox(width: 12),
               Text('引擎没起来', style: T.title.copyWith(fontSize: 17)),
@@ -684,7 +722,11 @@ class _FailureCard extends StatelessWidget {
           if (detail != null && detail.trim().isNotEmpty) ...[
             const SizedBox(height: 14),
             ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 620, maxHeight: 170, minWidth: 380),
+              constraints: const BoxConstraints(
+                maxWidth: 620,
+                maxHeight: 170,
+                minWidth: 380,
+              ),
               child: Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(12),
