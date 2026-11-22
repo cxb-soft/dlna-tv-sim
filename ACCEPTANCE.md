@@ -63,6 +63,19 @@
 - **更新检查**：真实请求 GitHub Releases，当前 v0.3.0 时能显示「有新版本」横幅并带更新说明。
 - **待确认**：首次启动的本地网络授权弹窗已出现（截图确认），需用户点 Allow 后才能验证组播与手机发现；未点之前 `/api/diag` 仍是 `multicast false`。
 
+## 自研播放引擎（2026-11-22，macOS）
+
+`-player native` 实测（测试实例 8096/8097，独立 HOME，未动 8090）：
+
+- HLS：HTTP TS 首帧 1.2s、seek 43ms；HTTP fMP4 首帧 673ms、30fps、零丢帧；本地 AES-128 首帧 0.48s、seek 44ms；TS/fMP4 均能收到 ended。
+- 音轨/字幕：双音轨 mkv 切 AAC→AC3 110ms；SRT/ASS 切换 42–93ms，cue 文本与时间对得上；字幕为自绘渲染。
+- 倍速 1.5×（0.6s 墙钟推进 0.9s 媒体时间）、比例 16:9/4:3、循环回开头、PNG 截图均实测。
+- 播放器 UI：自绘控件层（scrim、琥珀主题、SF Symbols、进度 hover 气泡、音轨/字幕菜单、自动隐藏、快捷键、缓冲 spinner、错误 toast）；1280×720 与 1800/1920 两组截图在 `/tmp/pe_shots/`；真实鼠标（cliclick）验证 hover/拖进度/菜单/双击全屏，点击热区统一 40pt。
+- App 联调：`/api/cast` → `PLAYING`、engine native、硬解；`/api/player` 能力与真实能力一致；Stop 后回 `STOPPED` 并关窗。
+- 打包：LGPL FFmpeg 9.0.2 动态库随 App（`Contents/Resources/engine/lib/`），`env -i` 干净环境启动、`lsof -p` 确认加载的是 App 内 dylib；App 28MB → 33MB。
+
+未验证：ASS 高级排版（未引 libass）、HLS HEVC/加密 fMP4/master playlist、本地 fMP4 起播慢、Windows/Linux native。
+
 ## 未验证
 
 - Windows 实机运行（只做了交叉编译）。

@@ -87,13 +87,22 @@
 -http-port 8090    HTTP 端口（默认 8090）
 -name "客厅电视"    设备名，会写进配置
 -uuid <uuid>       固定设备 UUID
--player auto       auto | mpv | vlc | web
+-player auto       auto | mpv | vlc | web | native（macOS 自研核心）
 -no-ssdp           只跑 HTTP，不参与发现（排查用）
 -no-open           启动后不自动开浏览器
 -v                 详细日志
 ```
 
 配置文件在 `~/Library/Application Support/dlna-tv-sim/config.json`（Windows 是 `%AppData%\dlna-tv-sim\config.json`），UUID 会持久化，控制点不会把设备当成新的。
+
+## 自研播放引擎（macOS，可选）
+
+`-player native` 会启用进程内的自研播放核心，不依赖外部 mpv/VLC：FFmpeg(LGPL) 解封装、VideoToolbox 硬解、AVSampleBufferDisplayLayer 显示、AVAudioEngine 出声，音频时钟对时；播放器控件也是自绘的（进度、音量、倍速、音轨、字幕、比例、全屏、自动隐藏、快捷键）。
+
+- 支持：mp4/mkv/HLS（TS、fMP4、AES-128）、H.264/HEVC 硬解、AAC/AC3/MP3、SRT/ASS 文本字幕、多音轨、倍速 0.5–2×、画面比例、循环、截图。
+- 默认仍是 mpv；native 是可选引擎，遇到打不开的源会自动回退 mpv。
+- 限制：ASS 只渲染文本（字体/定位/特效不还原）；本地 HLS fMP4 起播约 5 秒（HTTP 正常）；Windows/Linux 暂无 native，会回退 mpv。
+- 打包：`scripts/build-native-deps.sh` 构建 LGPL FFmpeg，`scripts/package-macos-app.sh` 会把 dylib 嵌进 App（体积约 +5MB）。许可义务见 `third_party/README.md`。
 
 ## 已知限制
 
