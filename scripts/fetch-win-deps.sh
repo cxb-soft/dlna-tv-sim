@@ -86,11 +86,17 @@ else
   echo "→ 解压 FFmpeg"
   rm -rf "$CACHE/ffmpeg-src"
   extract_zip "$FF_ZIP" "$CACHE/ffmpeg-src"
-  FF_DIR="$(find "$CACHE/ffmpeg-src" -maxdepth 1 -type d -name 'ffmpeg-*' | head -1)"
-  if [ -z "$FF_DIR" ]; then
-    echo "错误：FFmpeg 包里没有 ffmpeg-* 目录" >&2
+  # 不假设压缩包顶层只有一个 ffmpeg-* 目录：直接从 avcodec DLL/lib 反推真正的根，
+  # 否则某些包会复制成 ffmpeg/<ffmpeg-...>/lib，have_deps 就找不到 lib。
+  FF_BIN="$(find "$CACHE/ffmpeg-src" -maxdepth 5 -type f -name 'avcodec-*.dll' | head -1)"
+  if [ -z "$FF_BIN" ]; then
+    FF_BIN="$(find "$CACHE/ffmpeg-src" -maxdepth 5 -type f -name 'libavcodec*.lib' | head -1)"
+  fi
+  if [ -z "$FF_BIN" ]; then
+    echo "错误：FFmpeg 包里没有找到 avcodec DLL/lib" >&2
     exit 1
   fi
+  FF_DIR="$(dirname "$(dirname "$FF_BIN")")"
   rm -rf "$WIN_ROOT/ffmpeg"
   mkdir -p "$WIN_ROOT/ffmpeg"
   cp -R "$FF_DIR/." "$WIN_ROOT/ffmpeg/"
