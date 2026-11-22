@@ -95,8 +95,19 @@ else
   mkdir -p "$WIN_ROOT/ffmpeg"
   cp -R "$FF_DIR/." "$WIN_ROOT/ffmpeg/"
 
-  # BtbN 的 shared 包给的是 MSVC 的 .lib 和 .def；MinGW/cgo 要 .dll.a。
-  # 这里从 .def 生成 import library，否则 CI 新解压后会缺 libavcodec.dll.a。
+  # BtbN 的 shared 包给的是 MSVC 的 .lib；有的包也不带 .def。
+  # 没有 .def 时先用 gendef 从 DLL 导出表生成，再交给 dlltool。
+  if ! compgen -G "$WIN_ROOT/ffmpeg/lib/*.def" >/dev/null 2>&1; then
+    GENDEF="$(command -v gendef || command -v x86_64-w64-mingw32-gendef || true)"
+    if [ -n "$GENDEF" ]; then
+      for dll in "$WIN_ROOT/ffmpeg/bin/"*.dll; do
+        [ -f "$dll" ] || continue
+        (cd "$WIN_ROOT/ffmpeg/lib" && "$GENDEF" "$dll" >/dev/null 2>&1) || true
+      done
+    fi
+  fi
+
+  # 用 .def 生成 MinGW 的 import library，否则 CI 新解压后会缺 libavcodec.dll.a。
   if command -v x86_64-w64-mingw32-dlltool >/dev/null 2>&1; then
     for def in "$WIN_ROOT/ffmpeg/lib"/*.def; do
       [ -f "$def" ] || continue
@@ -107,6 +118,10 @@ else
   fi
 
   if ! have_deps; then
+    echo "诊断：dlltool=$(command -v x86_64-w64-mingw32-dlltool || echo none) gendef=$(command -v gendef || echo none)" >&2
+    echo "诊断：sdl2/lib" >&2; ls -1 "$WIN_ROOT/sdl2/lib" 2>&1 | head -5 >&2
+    echo "诊断：ffmpeg/lib" >&2; ls -1 "$WIN_ROOT/ffmpeg/lib" 2>&1 | head -15 >&2
+    echo "诊断：headers" >&2; ls -l "$WIN_ROOT/ffmpeg/include/libavcodec/avcodec.h" "$WIN_ROOT/sdl2/include/SDL2/SDL.h" 2>&1 >&2
     echo "错误：解压后仍然缺少开发库，检查下载包是否完整" >&2
     exit 1
   fi

@@ -57,7 +57,7 @@ jobs:
         if: matrix.native
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64
+          sudo apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-tools
       - name: Fetch Windows native deps
         if: matrix.native
         run: ./scripts/fetch-win-deps.sh
