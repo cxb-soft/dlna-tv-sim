@@ -155,76 +155,81 @@ class _EngineChip extends StatelessWidget {
       MapEntry('web', '网页播放'),
     ];
 
-    return PopupMenuButton<String>(
-      enabled: enabled,
-      tooltip:
-          controller.adoptedEngine
-              ? '当前引擎不是本应用启动的，无法切换'
-              : state == null
-              ? '引擎未连接'
-              : '引擎 v${state.version} · ${state.player} · 点击切换播放引擎',
-      offset: const Offset(0, 38),
-      color: C.panelAlt,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(10),
-        side: const BorderSide(color: C.line),
-      ),
-      onSelected: (value) {
-        if (value == 'restart') {
-          controller.restartEngine();
-          return;
-        }
-        controller.switchEngine(value);
-      },
-      itemBuilder:
-          (context) => [
-            for (final option in options)
-              CheckedPopupMenuItem<String>(
-                value: option.key,
-                checked: controller.preferredEngine == option.key,
+    return Semantics(
+      button: true,
+      label: '播放引擎：${state == null ? '未连接' : engineLabel(state.player)}',
+      hint: '点击选择 mpv、自研 native 或网页播放',
+      child: PopupMenuButton<String>(
+        enabled: enabled,
+        tooltip:
+            controller.adoptedEngine
+                ? '当前引擎不是本应用启动的，无法切换'
+                : state == null
+                ? '引擎未连接'
+                : '引擎 v${state.version} · ${state.player} · 点击切换播放引擎',
+        offset: const Offset(0, 38),
+        color: C.panelAlt,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: const BorderSide(color: C.line),
+        ),
+        onSelected: (value) {
+          if (value == 'restart') {
+            controller.restartEngine();
+            return;
+          }
+          controller.switchEngine(value);
+        },
+        itemBuilder:
+            (context) => [
+              for (final option in options)
+                CheckedPopupMenuItem<String>(
+                  value: option.key,
+                  checked: controller.preferredEngine == option.key,
+                  height: 40,
+                  child: Text(
+                    option.value,
+                    style: TextStyle(fontSize: 12.5, color: C.text),
+                  ),
+                ),
+              const PopupMenuDivider(),
+              const PopupMenuItem<String>(
+                value: 'restart',
                 height: 40,
-                child: Text(
-                  option.value,
-                  style: TextStyle(fontSize: 12.5, color: C.text),
+                child: Text('重启引擎', style: TextStyle(fontSize: 12.5)),
+              ),
+            ],
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          decoration: BoxDecoration(
+            color: C.panelAlt,
+            borderRadius: BorderRadius.circular(9),
+            border: Border.all(color: C.line),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 5,
+                height: 5,
+                decoration: BoxDecoration(
+                  color: dotColor,
+                  shape: BoxShape.circle,
                 ),
               ),
-            const PopupMenuDivider(),
-            const PopupMenuItem<String>(
-              value: 'restart',
-              height: 40,
-              child: Text('重启引擎', style: TextStyle(fontSize: 12.5)),
-            ),
-          ],
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-        decoration: BoxDecoration(
-          color: C.panelAlt,
-          borderRadius: BorderRadius.circular(9),
-          border: Border.all(color: C.line),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 5,
-              height: 5,
-              decoration: BoxDecoration(
-                color: dotColor,
-                shape: BoxShape.circle,
+              const SizedBox(width: 7),
+              Text(
+                parts.join('  ·  '),
+                style: T.mono.copyWith(fontSize: 10.5, color: C.textDim),
               ),
-            ),
-            const SizedBox(width: 7),
-            Text(
-              parts.join('  ·  '),
-              style: T.mono.copyWith(fontSize: 10.5, color: C.textDim),
-            ),
-            const SizedBox(width: 5),
-            const Icon(
-              Icons.arrow_drop_down_rounded,
-              size: 16,
-              color: C.textFaint,
-            ),
-          ],
+              const SizedBox(width: 5),
+              const Icon(
+                Icons.arrow_drop_down_rounded,
+                size: 16,
+                color: C.textFaint,
+              ),
+            ],
+          ),
         ),
       ),
     );

@@ -11,6 +11,9 @@ class AppDelegate: FlutterAppDelegate {
     NSApp.appearance = NSAppearance(named: .darkAqua)
     startLocalNetworkProbe()
     super.applicationDidFinishLaunching(notification)
+    if let window = NSApp.windows.first(where: { $0 is MainFlutterWindow }) as? MainFlutterWindow {
+      DispatchQueue.main.async { window.installEngineMenu() }
+    }
   }
 
   /// 触发 macOS 的「本地网络」授权。

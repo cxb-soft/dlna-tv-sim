@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-var version = "0.5.0"
+var version = "0.5.1"
 
 func main() {
 	// macOS 的 AppKit 事件循环 / Windows 的 SDL 事件循环都必须在进程主线程；

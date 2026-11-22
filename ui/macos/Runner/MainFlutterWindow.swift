@@ -21,6 +21,8 @@ final class EngineProcessRegistry {
 }
 
 class MainFlutterWindow: NSWindow {
+  private var engineMenu: EngineMenuController?
+
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
     let windowFrame = self.frame
@@ -59,5 +61,144 @@ class MainFlutterWindow: NSWindow {
     RegisterGeneratedPlugins(registry: flutterViewController)
 
     super.awakeFromNib()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+      self?.installEngineMenu()
+    }
+  }
+
+  func installEngineMenu(retries: Int = 10) {
+    logEngineMenu("installEngineMenu retries=\(retries) vc=\(contentViewController != nil)")
+    if let engineMenu {
+      engineMenu.install()
+      return
+    }
+    guard let flutterViewController = contentViewController as? FlutterViewController else {
+      if retries > 0 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+          self?.installEngineMenu(retries: retries - 1)
+        }
+      }
+      return
+    }
+    let menu = EngineMenuController(messenger: flutterViewController.engine.binaryMessenger)
+    engineMenu = menu
+    menu.install()
+  }
+}
+
+private func logEngineMenu(_ message: String) {
+  let line = "\(Date()) \(message)\n"
+  guard let data = line.data(using: .utf8) else { return }
+  let url = URL(fileURLWithPath: "/tmp/dlna-engine-menu.log")
+  if FileManager.default.fileExists(atPath: url.path),
+     let handle = try? FileHandle(forWritingTo: url) {
+    handle.seekToEndOfFile()
+    handle.write(data)
+    try? handle.close()
+  } else {
+    try? data.write(to: url)
+  }
+}
+
+/// 原生「播放引擎」菜单：Flutter 在 macOS 的 AX 桥目前读不到内容，
+/// 菜单栏是 AppKit 原生可访问控件，VoiceOver / AX 可直接读取和按下。
+final class EngineMenuController: NSObject {
+  private let channel: FlutterMethodChannel
+  private var playerItems: [String: NSMenuItem] = [:]
+  private var restartItem: NSMenuItem?
+  private var preferred = "auto"
+  private var adopted = false
+
+  init(messenger: FlutterBinaryMessenger) {
+    channel = FlutterMethodChannel(
+      name: "com.cxbsoft.dlna-tv-sim/engine_menu",
+      binaryMessenger: messenger
+    )
+    super.init()
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else {
+        result(nil)
+        return
+      }
+      if call.method == "engineState", let args = call.arguments as? [String: Any] {
+        self.preferred = args["preferred"] as? String ?? "auto"
+        self.adopted = args["adopted"] as? Bool ?? false
+        self.applyState()
+        result(nil)
+      } else {
+        result(FlutterMethodNotImplemented)
+      }
+    }
+  }
+
+  func install(attempt: Int = 0) {
+    guard let mainMenu = NSApp.mainMenu else {
+      logEngineMenu("menu install mainMenu nil attempt=\(attempt)")
+      if attempt < 10 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+          self?.install(attempt: attempt + 1)
+        }
+      }
+      return
+    }
+    logEngineMenu("menu install mainMenu items=\(mainMenu.items.count) attempt=\(attempt)")
+    if mainMenu.items.contains(where: { $0.title == "播放引擎" }) {
+      logEngineMenu("menu install already present")
+      return
+    }
+
+    let top = NSMenuItem(title: "播放引擎", action: nil, keyEquivalent: "")
+    let submenu = NSMenu(title: "播放引擎")
+    let options: [(String, String)] = [
+      ("auto", "自动（优先 mpv）"),
+      ("mpv", "mpv"),
+      ("native", "自研 native"),
+      ("web", "网页播放"),
+    ]
+    for (player, title) in options {
+      let item = NSMenuItem(
+        title: title,
+        action: #selector(selectEngine(_:)),
+        keyEquivalent: ""
+      )
+      item.target = self
+      item.representedObject = player
+      submenu.addItem(item)
+      playerItems[player] = item
+    }
+    submenu.addItem(.separator())
+    let restart = NSMenuItem(
+      title: "重启引擎",
+      action: #selector(restartEngine),
+      keyEquivalent: ""
+    )
+    restart.target = self
+    submenu.addItem(restart)
+    restartItem = restart
+
+    top.submenu = submenu
+    mainMenu.addItem(top)
+    logEngineMenu("menu install added items=\(mainMenu.items.count)")
+    applyState()
+  }
+
+  @objc private func selectEngine(_ sender: NSMenuItem) {
+    guard !adopted, let player = sender.representedObject as? String else { return }
+    preferred = player
+    applyState()
+    channel.invokeMethod("switchEngine", arguments: player)
+  }
+
+  @objc private func restartEngine() {
+    guard !adopted else { return }
+    channel.invokeMethod("restartEngine", arguments: nil)
+  }
+
+  private func applyState() {
+    for (player, item) in playerItems {
+      item.state = player == preferred ? .on : .off
+      item.isEnabled = !adopted
+    }
+    restartItem?.isEnabled = !adopted
   }
 }
