@@ -169,6 +169,10 @@ type nativeScreen struct {
 
 	mu  sync.Mutex
 	cur *nativeSession
+
+	// 播放器还没打开时到达的 Seek（控制点常把 Play/Seek 连着发），开好后再应用。
+	pendingSeek    time.Duration
+	hasPendingSeek bool
 }
 
 func (n *nativeScreen) Kind() string { return "native" }
@@ -237,6 +241,13 @@ func (n *nativeScreen) Show(uri, title string, volume int, mute bool) {
 		n.dev.logf("screen", "自研播放核心没有留下播放器，回退 mpv")
 		n.dev.fallbackFrom("native")
 		return
+	}
+	n.mu.Lock()
+	pend, hasPend := n.pendingSeek, n.hasPendingSeek
+	n.pendingSeek, n.hasPendingSeek = 0, false
+	n.mu.Unlock()
+	if hasPend {
+		sess.p.Seek(pend.Seconds())
 	}
 	n.updateTracks(sess.p)
 	st := sess.p.Status()
@@ -352,9 +363,15 @@ func (n *nativeScreen) Stop() {
 }
 
 func (n *nativeScreen) Seek(d time.Duration) {
-	if s := n.session(); s != nil {
-		s.p.Seek(d.Seconds())
+	s := n.session()
+	if s == nil {
+		n.mu.Lock()
+		n.pendingSeek = d
+		n.hasPendingSeek = true
+		n.mu.Unlock()
+		return
 	}
+	s.p.Seek(d.Seconds())
 }
 
 func (n *nativeScreen) SetVolume(v int) {

@@ -53,18 +53,21 @@ type Device struct {
 	verbose bool
 
 	// AVTransport
-	state     string
-	status    string
-	uri       string
-	uriMeta   string
-	nextURI   string
-	nextMeta  string
-	duration  time.Duration
-	trackNo   int
-	pos       time.Duration
-	posAt     time.Time
-	playSpeed string
-	playMode  string
+	state    string
+	status   string
+	uri      string
+	uriMeta  string
+	nextURI  string
+	nextMeta string
+	duration time.Duration
+	trackNo  int
+	pos      time.Duration
+	posAt    time.Time
+	// 控制点常在 Play 之后立刻发 Seek，此时播放器可能还没开好；先记下来，开屏后应用。
+	pendingSeek    time.Duration
+	hasPendingSeek bool
+	playSpeed      string
+	playMode       string
 
 	// RenderingControl
 	volume int
@@ -339,6 +342,7 @@ func (d *Device) SetURI(uri, meta string) {
 		d.uri, d.uriMeta = "", ""
 		d.nextURI, d.nextMeta = "", ""
 		d.duration, d.pos, d.posAt = 0, 0, time.Now()
+		d.pendingSeek, d.hasPendingSeek = 0, false
 		d.state, d.trackNo = stateNoMedia, 0
 		d.mu.Unlock()
 		// 不少控制点结束投屏是「把 URI 置空」而不是发 Stop，这里也要把播放器收掉。
@@ -351,6 +355,7 @@ func (d *Device) SetURI(uri, meta string) {
 	d.nextURI, d.nextMeta = "", ""
 	d.duration = durationFromMeta(meta)
 	d.pos, d.posAt = 0, time.Now()
+	d.pendingSeek, d.hasPendingSeek = 0, false
 	d.trackNo = 1
 	if d.state != stateStopped {
 		d.state = stateStopped
@@ -469,9 +474,14 @@ func (d *Device) Seek(target time.Duration) *upnpError {
 	}
 	d.pos = target
 	d.posAt = time.Now()
-	d.mu.Unlock()
-	if d.scr != nil {
-		d.scr.Seek(target)
+	if d.scr == nil {
+		d.pendingSeek = target
+		d.hasPendingSeek = true
+		d.mu.Unlock()
+	} else {
+		scr := d.scr
+		d.mu.Unlock()
+		scr.Seek(target)
 	}
 	d.logf("avt", "Seek → %s", formatTime(target))
 	d.emit(serviceAVTransport)

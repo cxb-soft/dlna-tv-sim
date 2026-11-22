@@ -811,8 +811,8 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     ps.alignment = NSTextAlignmentCenter;
     ps.lineSpacing = 4;
     NSShadow *shadow = [[NSShadow alloc] init];
-    shadow.shadowBlurRadius = 6;
-    shadow.shadowOffset = NSMakeSize(0, -1);
+    shadow.shadowBlurRadius = 2;
+    shadow.shadowOffset = NSMakeSize(0, 0);
     shadow.shadowColor = Col(0x000000, 0.9);
     NSDictionary *attrs = @{
         NSFontAttributeName: [NSFont systemFontOfSize:26 weight:NSFontWeightSemibold],

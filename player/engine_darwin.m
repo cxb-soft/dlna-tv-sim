@@ -176,6 +176,7 @@ struct PePlayer {
     pthread_mutex_t ass_mu;
     CGImageRef ass_image;
     int ass_frame_w, ass_frame_h;
+    double ass_last_image_at;
 
     // 缓冲/错误
     int buffering;
@@ -1540,6 +1541,9 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
 
     p->ass_lib = ass_library_init();
     if (p->ass_lib) {
+        // 默认不要字幕阴影：ASS 里常见的深色投影在电视上显得糊，用户明确要求去掉。
+        char *ov[] = {(char *)"Shadow=0", NULL};
+        ass_set_style_overrides(p->ass_lib, ov);
         p->ass_renderer = ass_renderer_init(p->ass_lib);
         if (p->ass_renderer) {
             ass_set_fonts(p->ass_renderer, NULL, "PingFang SC",
@@ -2048,6 +2052,12 @@ void *pe_copy_subtitle_image(PePlayer *p) {
     ASS_Image *imgs = ass_render_frame(p->ass_renderer, p->ass_track,
                                        (long long)llround(pos * 1000.0), &changed);
     if (!imgs) {
+        // cue 结束或暂时取不到图：短暂保留上一张，避免每句字幕在边界闪一下。
+        if (p->ass_image && CFAbsoluteTimeGetCurrent() - p->ass_last_image_at < 0.25) {
+            CGImageRef ret = CGImageRetain(p->ass_image);
+            pthread_mutex_unlock(&p->ass_mu);
+            return ret;
+        }
         if (p->ass_image) { CGImageRelease(p->ass_image); p->ass_image = NULL; }
         pthread_mutex_unlock(&p->ass_mu);
         return NULL;
@@ -2094,6 +2104,7 @@ void *pe_copy_subtitle_image(PePlayer *p) {
     if (!img) { pthread_mutex_unlock(&p->ass_mu); return NULL; }
     if (p->ass_image) CGImageRelease(p->ass_image);
     p->ass_image = CGImageRetain(img);
+    p->ass_last_image_at = CFAbsoluteTimeGetCurrent();
     CGImageRelease(img);
     CGImageRef ret = CGImageRetain(p->ass_image);
     pthread_mutex_unlock(&p->ass_mu);
@@ -2424,7 +2435,7 @@ void pe_destroy(PePlayer *p) {
 
 - (BOOL)openWindowWidth:(int)w height:(int)h fullscreen:(BOOL)fs title:(NSString *)title {
     [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     NSRect rect = NSMakeRect(0, 0, w, h);
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
