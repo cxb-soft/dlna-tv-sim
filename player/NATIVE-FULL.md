@@ -43,7 +43,7 @@
 - ASS 只渲染纯文本，定位/字体/颜色/特效不还原。
 - AES 本地密钥常是 `.bin`，FFmpeg 默认按扩展名拦截；引擎设 `allowed_extensions=ALL`（仅本地文件）放行。
 - HLS HEVC、加密 fMP4、master playlist 未实测。
-- Windows/Linux 仍是编译占位，`-player native` 回退 mpv；一个进程仍只跑一个窗口。
+- Linux 仍是编译占位，`-player native` 回退 mpv；Windows 已有独立实现（见 `player/win/README.md`）。一个进程仍只跑一个窗口。
 
 ## 视觉重做（2026-11-22，父链评审后）
 

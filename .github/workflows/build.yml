@@ -33,7 +33,7 @@ jobs:
         include:
           - { goos: darwin,  goarch: arm64, out: dlna-tv-sim-macos-arm64 }
           - { goos: darwin,  goarch: amd64, out: dlna-tv-sim-macos-amd64 }
-          - { goos: windows, goarch: amd64, out: dlna-tv-sim-windows-x64.exe }
+          - { goos: windows, goarch: amd64, out: dlna-tv-sim-windows-x64.exe, native: true }
           - { goos: windows, goarch: arm64, out: dlna-tv-sim-windows-arm64.exe }
           - { goos: linux,   goarch: amd64, out: dlna-tv-sim-linux-amd64 }
           - { goos: linux,   goarch: arm64, out: dlna-tv-sim-linux-arm64 }
@@ -44,6 +44,7 @@ jobs:
           go-version: stable
           check-latest: true
       - name: Build
+        if: ${{ matrix.native != true }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -52,6 +53,42 @@ jobs:
         run: |
           mkdir -p dist
           go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/${{ matrix.out }}" .
+      - name: Install mingw-w64
+        if: matrix.native
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Fetch Windows native deps
+        if: matrix.native
+        run: ./scripts/fetch-win-deps.sh
+      - name: Build native engine (console)
+        if: matrix.native
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
+          STAGE: dist/win64-runtime
+        run: ./scripts/build-windows-native.sh
+      - name: Build native engine (windowsgui)
+        if: matrix.native
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
+          GUI: "1"
+          OUT: dist/engine/dlna-tv-sim.exe
+          STAGE: dist/engine
+        run: ./scripts/build-windows-native.sh
+      - name: Upload native runtime DLLs
+        if: matrix.native
+        uses: actions/upload-artifact@v4
+        with:
+          name: win64-native-runtime
+          path: dist/win64-runtime/*
+          if-no-files-found: error
+      - name: Upload app engine
+        if: matrix.native
+        uses: actions/upload-artifact@v4
+        with:
+          name: win64-app-engine
+          path: dist/engine/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out }}
@@ -111,7 +148,7 @@ jobs:
   windows-app:
     name: Windows app bundle
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, build]
     runs-on: windows-latest
     # 同 macos-app：拿不到完整的 Windows 工具链时不让整条工作流判红
     continue-on-error: true
@@ -128,12 +165,11 @@ jobs:
         with:
           channel: stable
           cache: true
-      - name: Build engine (no console window)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist\engine | Out-Null
-          $env:CGO_ENABLED = "0"
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$env:GITHUB_REF_NAME" -o dist\engine\dlna-tv-sim.exe .
+      - name: Download native engine (built on Linux with mingw)
+        uses: actions/download-artifact@v4
+        with:
+          name: win64-app-engine
+          path: dist/engine
       - name: Fetch mpv
         shell: pwsh
         run: |
@@ -154,7 +190,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Recurse "ui\build\windows\x64\runner\Release\*" $stage
           New-Item -ItemType Directory -Force -Path "$stage\engine" | Out-Null
-          Copy-Item "dist\engine\dlna-tv-sim.exe" "$stage\engine\"
+          Copy-Item -Recurse "dist\engine\*" "$stage\engine\"
+          if (-not (Test-Path "$stage\engine\SDL2.dll")) { throw "SDL2.dll missing from engine bundle" }
           Copy-Item -Recurse "uosc" "$stage\engine\uosc"
           New-Item -ItemType Directory -Force -Path "$stage\engine\mpv" | Out-Null
           Copy-Item "mpv\mpv.exe" "$stage\engine\mpv\"
@@ -218,6 +255,13 @@ jobs:
             mkdir -p "stage-$arch/mpv/mpv"
             cp "dlna-tv-sim-windows-$arch.exe" "stage-$arch/"
             cp README-Windows.txt LICENSE-mpv.txt "stage-$arch/"
+            if [ "$arch" = "x64" ]; then
+              # 自研播放核心的运行库（由 build 作业的 win64-native-runtime 提供）
+              if compgen -G "*.dll" >/dev/null; then cp *.dll "stage-$arch/"; fi
+              for f in LICENSE-FFmpeg.txt LICENSE-SDL2.txt COPYING.LGPLv2.1; do
+                if [ -f "$f" ]; then cp "$f" "stage-$arch/"; fi
+              done
+            fi
             cp "$mpvdir/mpv.exe" "stage-$arch/mpv/"
             if [ -f "$mpvdir/d3dcompiler_43.dll" ]; then
               cp "$mpvdir/d3dcompiler_43.dll" "stage-$arch/mpv/"
@@ -227,6 +271,10 @@ jobs:
             fi
             (cd "stage-$arch" && zip -q -r "../dlna-tv-sim-windows-$arch.zip" .)
             unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "mpv/mpv.exe"
+            if [ "$arch" = "x64" ]; then
+              unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "SDL2.dll"
+              unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "avcodec-.*\.dll"
+            fi
             rm -rf "stage-$arch"
           }
           stage_windows x64 ../mpv-x64

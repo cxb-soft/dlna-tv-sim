@@ -1,8 +1,8 @@
-# player —— 自研播放核心（macOS spike）
+# player —— 自研播放核心（macOS / Windows）
 
-这是 DLNA 电视模拟器的**进程内播放核心**验证件：不拉起 mpv/VLC，自己做
-解封装、硬解、出声和音画同步。当前范围是 macOS + H.264/HEVC + AAC，
-目标是验证可行性并把接口、指标和坑摸清楚，不是可直接发布的产品。
+这是 DLNA 电视模拟器的**进程内播放核心**：不拉起 mpv/VLC，自己做解封装、
+解码、出声和音画同步。macOS 用 VideoToolbox 硬解，Windows 用 FFmpeg 软解 +
+SDL2（D3D11 渲染 / WASAPI 音频）；两边共用 `engine.h` 接口和 Go 侧 API。
 
 ```
 FFmpeg 解封装 ──┬─ 视频包 → VideoToolbox 硬解 → CVPixelBuffer → AVSampleBufferDisplayLayer
@@ -18,6 +18,9 @@ FFmpeg 解封装 ──┬─ 视频包 → VideoToolbox 硬解 → CVPixelBuffe
 | `engine_darwin.m` | 媒体引擎 + 窗口/显示层/音频输出（ObjC + FFmpeg） |
 | `player_darwin.go` | Go 封装：参数、状态快照、`OnUpdate`/`OnClose` 回调 |
 | `player_unsupported.go` | 非 darwin/cgo 的编译占位 |
+| `engine_windows.c` | Windows 引擎：FFmpeg 软解 + SDL2 渲染/音频/控件（见 `win/README.md`） |
+| `player_windows.go` | Windows 的 Go 封装（与 darwin 版同一套 API） |
+| `win/engine_selftest.c` | 无 Windows 实机时，在本机用同一份引擎代码做运行时自测 |
 | `cmd/play/main.go` | 验证命令行，支持脚本化播放/暂停/seek/截图 |
 
 ## 线程模型
@@ -103,7 +106,7 @@ ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=45" \
 
 ## 已知问题与限制
 
-- 只支持 macOS；Windows/Linux 只有编译占位。
+- macOS / Windows 有实现；Linux 只有编译占位。
 - 只做播放核心：没有字幕、音轨切换、倍速、比例、截图、循环。
 - HLS（m3u8）没有验证；FFmpeg 理论上能打开，但分片/网络中断路径没测。
 - 播放结束只上报 `Ended` 并暂停，没有自动关窗；DLNA 侧需要自己决定收窗时机。
@@ -153,7 +156,8 @@ ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=45" \
 
 ## 已接入主引擎（`-player native`，2026-11-21）
 
-接入点在 `native.go`（darwin+cgo）/ `native_unsupported.go`（占位）：
+接入点在 `native.go`（darwin+cgo）/ `native_windows.go`（windows+cgo）/
+`native_stub.go`（其余平台占位）：
 
 - `nativeScreen` 实现 `screen`；`engine_pick.go` 在 `-player native` 时选它，
   自动模式仍是 mpv。`main()` 先 `runtime.LockOSThread()`，起完 HTTP/SSDP 后
@@ -191,8 +195,9 @@ ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=45" \
 
 - 窗口关掉后 `CGWindowList` 可能还留一条 onscreen 记录（AppKit 里 visible=0），
   屏幕像素已经是桌面；下一次投屏或进程退出后消失，不影响使用。
-- 非 macOS 只有编译占位：`GOOS=windows/linux CGO_ENABLED=0 go build ./...` 通过，
-  `-player native` 会回退 mpv。
+- Linux 只有编译占位：`GOOS=linux CGO_ENABLED=0 go build ./...` 通过，
+  `-player native` 会回退 mpv。Windows 用 `GOOS=windows CGO_ENABLED=1` + mingw
+  构建（见 `win/README.md`）。
 - 本机 Homebrew FFmpeg 是 GPL 构建，只用于开发/本地验证；发布包已改用
   自包含 LGPL 构建（见下节）。
 

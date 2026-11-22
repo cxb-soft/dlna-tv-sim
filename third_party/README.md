@@ -142,3 +142,11 @@ cat "$PREFIX/BUILD-INFO.txt"
 - 实测：App 引擎 `otool -L` 仅系统框架 + `@rpath/libass.9.dylib`/`@rpath/libav*`；干净目录 `/tmp/dlna-clean`、`env -i` + 独立 HOME + 8098 起引擎，`lsof` 加载 App 内 `libass.9.dylib`；播放 `/tmp/sub_ass_fixed.mkv` 到 10.226s 暂停，红字 `\an4\pos(200,500)` 位于左中（`/tmp/pe_shots/clean_102_libass.png`），日志 `/tmp/clean_libass_test2.log`；App 39MB，zip 16MB。
 - **源码构建未接入**：当前 libass/依赖是 Homebrew 同版本二进制嵌入，不是从源码重编；发版前若要完全源码构建，需补 autoconf/automake/meson 工具链并复测。许可文本已放 `third_party/licenses/`（libass ISC、freetype FTL/GPLv2、harfbuzz MIT、fribidi LGPL-2.1+、libunibreak zlib、brotli MIT）；FFmpeg 许可在 `third_party/licenses/ffmpeg/`。
 - FFmpeg 仍是 LGPL 2.1+ 动态库，未引入 GPL/nonfree 组件；libass 使用 ISC，不改变 FFmpeg 的 LGPL 构建。
+
+## Windows 自研核心的第三方组件
+
+Windows 包里的 `SDL2.dll`（SDL2 2.32.0，zlib 许可证）和
+`avcodec-63.dll` / `avformat-63.dll` / `avutil-61.dll` / `swresample-7.dll` /
+`swscale-10.dll`（FFmpeg 9.0 LGPL shared，BtbN 构建）由
+`scripts/fetch-win-deps.sh` 下载到 `$DLNA_DEPS_ROOT/win64`。发布包会带上
+`LICENSE-SDL2.txt` 和 `LICENSE-FFmpeg.txt`；不要换成 GPL 构建。

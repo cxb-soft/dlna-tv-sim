@@ -11,11 +11,12 @@ import (
 	"syscall"
 )
 
-var version = "0.4.5"
+var version = "0.5.0"
 
 func main() {
-	// macOS 的 AppKit 事件循环必须在进程主线程；自研播放核心（-player native）
-	// 把窗口和 NSApp run 放在这里。即使不用 native，占住主线程也没有副作用。
+	// macOS 的 AppKit 事件循环 / Windows 的 SDL 事件循环都必须在进程主线程；
+	// 自研播放核心（-player native）把窗口和事件循环放在这里。即使不用 native，
+	// 占住主线程也没有副作用。
 	runtime.LockOSThread()
 
 	cfgPath, err := configPath()
@@ -32,7 +33,7 @@ func main() {
 	port := flag.Int("http-port", 0, "HTTP 端口（默认 8090，0 表示用配置里的）")
 	name := flag.String("name", "", "电视名称，写进配置")
 	uuidArg := flag.String("uuid", "", "固定设备 UUID，写进配置")
-	player := flag.String("player", "", "播放引擎：auto（默认）/ mpv / vlc / web / native（macOS 自研核心）")
+	player := flag.String("player", "", "播放引擎：auto（默认）/ mpv / vlc / web / native（自研核心，macOS/Windows）")
 	noSSDP := flag.Bool("no-ssdp", false, "不启动 SSDP 发现（只跑 HTTP，排查用）")
 	noOpen := flag.Bool("no-open", false, "启动后不自动打开控制台网页")
 	verbose := flag.Bool("v", false, "详细日志（含每个 SSDP / SOAP / VLC 细节）")
