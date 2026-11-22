@@ -23,14 +23,21 @@ type mpvScreen struct {
 	path string
 	sock string
 
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	conn    io.ReadWriteCloser
-	started bool
-	exiting bool
-	volume  int
-	mute    bool
-	stderr  *limitedBuffer
+	mu           sync.Mutex
+	cmd          *exec.Cmd
+	conn         io.ReadWriteCloser
+	started      bool
+	exiting      bool
+	volume       int
+	mute         bool
+	stderr       *limitedBuffer
+	uri          string
+	retries      int
+	lastPos      time.Duration
+	lastTick     time.Time
+	paused       bool
+	reloading    bool
+	stallReloads int
 }
 
 func (m *mpvScreen) Kind() string { return "mpv" }
@@ -38,6 +45,8 @@ func (m *mpvScreen) Kind() string { return "mpv" }
 func (m *mpvScreen) Show(uri, title string, volume int, mute bool) {
 	m.mu.Lock()
 	m.volume, m.mute = volume, mute
+	m.uri = uri
+	m.retries = 0
 	m.mu.Unlock()
 
 	if err := m.start(uri); err != nil {
@@ -223,6 +232,9 @@ func (m *mpvScreen) start(uri string) error {
 		"--idle=yes",
 		"--force-window=yes",
 		"--keep-open=no",
+		// 网络源断一下不要直接结束：给 FFmpeg 重连机会，并限制单次等待。
+		"--network-timeout=15",
+		"--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5",
 		"--input-ipc-server=" + sock,
 	}
 	if dir := findUoscDir(); dir != "" {
@@ -236,7 +248,9 @@ func (m *mpvScreen) start(uri string) error {
 	cmd := exec.Command(m.path, args...)
 	cmd.Stdout = io.Discard
 	stderr := &limitedBuffer{limit: 4096}
-	cmd.Stderr = stderr
+	cmd.Stderr = io.MultiWriter(stderr, &lineLogWriter{
+		log: func(line string) { m.dev.logf("mpv", "%s", line) },
+	})
 	m.mu.Lock()
 	m.stderr = stderr
 	m.mu.Unlock()
@@ -269,6 +283,10 @@ func (m *mpvScreen) start(uri string) error {
 	m.mu.Unlock()
 
 	go m.readLoop(conn)
+	m.mu.Lock()
+	m.lastTick = time.Now()
+	m.mu.Unlock()
+	go m.watchStall()
 	go func() {
 		err := cmd.Wait()
 		m.mu.Lock()
@@ -295,6 +313,88 @@ func (m *mpvScreen) start(uri string) error {
 	m.send(map[string]any{"command": []any{"observe_property", 8, "loop-file"}})
 	m.dev.logf("screen", "mpv 已启动（%s）", m.path)
 	return nil
+}
+
+// retryAfterError 在网络中途断开时，从当前进度重新加载同一个地址。
+// mpv 把断流报成 end-file(error)，不当成正常播完。
+func (m *mpvScreen) retryAfterError() bool {
+	m.mu.Lock()
+	uri, exiting, pos := m.uri, m.exiting, m.lastPos
+	if exiting || uri == "" || m.retries >= 3 {
+		m.mu.Unlock()
+		return false
+	}
+	m.retries++
+	retries := m.retries
+	m.mu.Unlock()
+
+	m.dev.logf("screen", "取流中断，2 秒后重试（第 %d/3 次），从 %s 继续", retries, formatTime(pos))
+	m.send(map[string]any{"command": []any{"show-text", "网络中断，正在重试…", 3000}})
+	go func(uri string, pos time.Duration) {
+		time.Sleep(2 * time.Second)
+		m.mu.Lock()
+		exiting := m.exiting
+		m.mu.Unlock()
+		if exiting {
+			return
+		}
+		m.send(map[string]any{"command": []any{"set_property", "start", pos.Seconds()}})
+		m.send(map[string]any{"command": []any{"loadfile", uri, "replace"}})
+		m.send(map[string]any{"command": []any{"set_property", "pause", false}})
+	}(uri, pos)
+	return true
+}
+
+// watchStall 盯住“有窗口、没进度”的卡死：mpv 有时卡在读数据上，
+// 既不发 end-file 也不前进，点播放也无效。25 秒没有 time-pos 就重新加载。
+func (m *mpvScreen) watchStall() {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		m.mu.Lock()
+		started, exiting, paused, reloading := m.started, m.exiting, m.paused, m.reloading
+		last := m.lastTick
+		m.mu.Unlock()
+		if !started || exiting || paused || reloading || last.IsZero() {
+			continue
+		}
+		if time.Since(last) < 25*time.Second {
+			continue
+		}
+
+		m.mu.Lock()
+		if m.reloading || m.paused || !m.started || m.exiting || time.Since(m.lastTick) < 25*time.Second {
+			m.mu.Unlock()
+			continue
+		}
+		m.reloading = true
+		m.stallReloads++
+		n := m.stallReloads
+		pos := m.lastPos
+		m.lastTick = time.Now()
+		m.mu.Unlock()
+
+		m.dev.logf("screen", "播放停滞：25 秒没有进度更新，重新加载（第 %d 次），从 %s 继续", n, formatTime(pos))
+		m.send(map[string]any{"command": []any{"show-text", "播放停滞，正在重新加载…", 3000}})
+		go m.reloadAt(pos)
+	}
+}
+
+func (m *mpvScreen) reloadAt(pos time.Duration) {
+	m.mu.Lock()
+	uri := m.uri
+	m.mu.Unlock()
+	if uri == "" {
+		return
+	}
+	m.send(map[string]any{"command": []any{"set_property", "start", pos.Seconds()}})
+	m.send(map[string]any{"command": []any{"loadfile", uri, "replace"}})
+	m.send(map[string]any{"command": []any{"set_property", "pause", false}})
+	time.AfterFunc(8*time.Second, func() {
+		m.mu.Lock()
+		m.reloading = false
+		m.mu.Unlock()
+	})
 }
 
 type mpvEvent struct {
@@ -328,7 +428,21 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 			case "time-pos":
 				var sec float64
 				if json.Unmarshal(ev.Data, &sec) == nil && sec >= 0 {
-					m.dev.syncPosition(time.Duration(sec * float64(time.Second)))
+					d := time.Duration(sec * float64(time.Second))
+					m.mu.Lock()
+					m.lastPos = d
+					m.lastTick = time.Now()
+					m.stallReloads = 0
+					m.mu.Unlock()
+					m.dev.syncPosition(d)
+				}
+			case "pause":
+				var b bool
+				if json.Unmarshal(ev.Data, &b) == nil {
+					m.mu.Lock()
+					m.paused = b
+					m.lastTick = time.Now()
+					m.mu.Unlock()
 				}
 			case "track-list":
 				m.dev.setTracks(parseMPVTracks(ev.Data))
@@ -353,12 +467,26 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 					m.dev.noteLoop(v != "no")
 				}
 			}
+		case "file-loaded":
+			m.mu.Lock()
+			m.retries = 0
+			m.reloading = false
+			m.stallReloads = 0
+			m.lastTick = time.Now()
+			m.mu.Unlock()
 		case "end-file":
-			if ev.Reason == "eof" || ev.Reason == "error" {
-				m.dev.logf("screen", "播放结束（%s）", ev.Reason)
+			switch ev.Reason {
+			case "eof":
+				m.dev.logf("screen", "播放结束（eof）")
+				m.dev.onPlaybackEnded()
+			case "error":
 				if msg := m.stderrText(); msg != "" {
-					m.dev.logf("screen", "mpv 报错: %s", firstLine(msg))
+					m.dev.logf("mpv", "取流报错: %s", firstLine(msg))
 				}
+				if m.retryAfterError() {
+					break
+				}
+				m.dev.logf("screen", "重试 3 次仍失败，结束播放")
 				m.dev.onPlaybackEnded()
 			}
 		case "shutdown":

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"sync"
 )
@@ -34,6 +35,35 @@ func (b *limitedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return string(b.buf)
+}
+
+// lineLogWriter 把写入的字节按行拆开交给 log，避免 mpv 的多行错误
+// 在事件日志里粘成一大块。只用于 mpv 的 stderr（已限定只输出 error）。
+type lineLogWriter struct {
+	mu  sync.Mutex
+	buf []byte
+	log func(string)
+}
+
+func (w *lineLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := strings.TrimSpace(string(w.buf[:i]))
+		w.buf = w.buf[i+1:]
+		if line != "" && w.log != nil {
+			w.log(line)
+		}
+	}
+	if len(w.buf) > 8192 {
+		w.buf = w.buf[len(w.buf)-4096:]
+	}
+	return len(p), nil
 }
 
 // firstLine 取第一行有内容的话，给日志用。

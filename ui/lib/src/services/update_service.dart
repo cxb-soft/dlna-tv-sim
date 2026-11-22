@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 
 import '../models/update_info.dart';
+import 'proxy_resolver.dart';
 
 class UpdateCheckException implements Exception {
   UpdateCheckException(this.message);
@@ -57,10 +58,11 @@ class UpdateService {
   Future<UpdateInfo?> check({
     Duration timeout = const Duration(seconds: 10),
   }) async {
+    final proxy = await ProxyResolver.resolve();
     final client =
         HttpClient()
           ..connectionTimeout = const Duration(seconds: 6)
-          ..findProxy = ((_) => 'DIRECT');
+          ..findProxy = ((uri) => ProxyResolver.forUri(uri, proxy));
 
     try {
       final req = await client
@@ -197,10 +199,11 @@ class UpdateService {
     String path,
     void Function(double progress)? onProgress,
   ) async {
+    final proxy = await ProxyResolver.resolve();
     final client =
         HttpClient()
           ..connectionTimeout = const Duration(seconds: 10)
-          ..findProxy = ((_) => 'DIRECT');
+          ..findProxy = ((uri) => ProxyResolver.forUri(uri, proxy));
     try {
       final req = await client.getUrl(Uri.parse(url));
       req.headers.set(
@@ -229,10 +232,11 @@ class UpdateService {
   }
 
   Future<String> _downloadText(String url) async {
+    final proxy = await ProxyResolver.resolve();
     final client =
         HttpClient()
           ..connectionTimeout = const Duration(seconds: 10)
-          ..findProxy = ((_) => 'DIRECT');
+          ..findProxy = ((uri) => ProxyResolver.forUri(uri, proxy));
     try {
       final req = await client.getUrl(Uri.parse(url));
       req.headers.set(

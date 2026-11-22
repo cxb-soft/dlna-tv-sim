@@ -2,7 +2,7 @@ import 'dart:io';
 
 /// 应用版本：与 Go 引擎的 `version` 变量、pubspec 的 version 保持一致。
 /// GitHub Release 的 tag 用 `v0.3.0` 这种形式，更新检查只比较数字部分。
-const String kAppVersion = '0.4.3';
+const String kAppVersion = '0.4.4';
 
 /// 允许用环境变量覆盖版本号，发布前演练更新提示时用（例如假装自己是 0.2.0）。
 String resolveAppVersion() {

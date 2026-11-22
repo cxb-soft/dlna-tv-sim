@@ -1,0 +1,159 @@
+import 'dart:convert';
+import 'dart:io';
+
+/// 解析当前系统代理，供更新请求使用。
+///
+/// 优先级：环境变量（HTTPS_PROXY/HTTP_PROXY/ALL_PROXY）→ macOS 系统设置 →
+/// Windows Internet 设置 → 直连。返回值是 Dart `HttpClient.findProxy` 认识的
+/// 形式，例如 `PROXY 127.0.0.1:7890` 或 `DIRECT`。
+class ProxyResolver {
+  ProxyResolver._();
+
+  static Future<String>? _cached;
+
+  /// 只解析一次，之后复用；代理设置变化后重启应用即可生效。
+  static Future<String> resolve() => _cached ??= _resolve();
+
+  static Future<String> _resolve() async {
+    final fromEnv = _fromEnvironment(Platform.environment);
+    if (fromEnv != null) return fromEnv;
+
+    if (Platform.isMacOS) {
+      final fromSystem = await _readMacOSProxy();
+      if (fromSystem != null) return fromSystem;
+    } else if (Platform.isWindows) {
+      final fromSystem = await _readWindowsProxy();
+      if (fromSystem != null) return fromSystem;
+    }
+    return 'DIRECT';
+  }
+
+  /// 本地地址永远直连，避免把访问引擎的请求绕进代理。
+  static String forUri(Uri uri, String proxy) {
+    if (proxy == 'DIRECT') return proxy;
+    final host = uri.host.toLowerCase();
+    if (host == 'localhost' ||
+        host == '127.0.0.1' ||
+        host == '::1' ||
+        host.endsWith('.local')) {
+      return 'DIRECT';
+    }
+    return proxy;
+  }
+
+  static String? _fromEnvironment(Map<String, String> env) {
+    for (final key in const [
+      'HTTPS_PROXY',
+      'https_proxy',
+      'HTTP_PROXY',
+      'http_proxy',
+      'ALL_PROXY',
+      'all_proxy',
+    ]) {
+      final value = env[key]?.trim();
+      if (value == null || value.isEmpty) continue;
+      final parsed = parseProxyUrl(value);
+      if (parsed != null) return parsed;
+    }
+    return null;
+  }
+
+  /// 接受 `127.0.0.1:7890`、`http://127.0.0.1:7890` 这类写法。
+  static String? parseProxyUrl(String value) {
+    var v = value.trim();
+    if (v.isEmpty) return null;
+    if (!v.contains('://')) v = 'http://$v';
+    final uri = Uri.tryParse(v);
+    if (uri == null || uri.host.isEmpty) return null;
+    final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
+    return 'PROXY ${uri.host}:$port';
+  }
+
+  static Future<String?> _readMacOSProxy() async {
+    try {
+      final result = await Process.run('/usr/sbin/scutil', [
+        '--proxy',
+      ], stdoutEncoding: utf8);
+      if (result.exitCode != 0) return null;
+      return parseMacOSProxy(result.stdout as String);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 解析 `scutil --proxy` 的输出。优先 HTTPS，其次 HTTP；SOCKS 不在这里处理。
+  static String? parseMacOSProxy(String text) {
+    final map = <String, String>{};
+    for (final line in text.split('\n')) {
+      final i = line.indexOf(':');
+      if (i < 0) continue;
+      map[line.substring(0, i).trim()] = line.substring(i + 1).trim();
+    }
+
+    String? pick(String enableKey, String hostKey, String portKey) {
+      if (map[enableKey] != '1') return null;
+      final host = map[hostKey];
+      final port = map[portKey];
+      if (host == null || host.isEmpty || port == null || port.isEmpty) {
+        return null;
+      }
+      return 'PROXY $host:$port';
+    }
+
+    return pick('HTTPSEnable', 'HTTPSProxy', 'HTTPSPort') ??
+        pick('HTTPEnable', 'HTTPProxy', 'HTTPPort');
+  }
+
+  static Future<String?> _readWindowsProxy() async {
+    try {
+      final result = await Process.run('reg', [
+        'query',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+      ], stdoutEncoding: utf8);
+      if (result.exitCode != 0) return null;
+      return parseWindowsProxy(result.stdout as String);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 解析注册表查询输出：ProxyEnable=0x1，ProxyServer 可能是
+  /// `127.0.0.1:7890` 或 `http=...;https=...`。
+  static String? parseWindowsProxy(String text) {
+    var enabled = false;
+    String? server;
+
+    for (final line in text.split('\n')) {
+      final t = line.trim();
+      if (t.contains('ProxyEnable')) {
+        final m = RegExp(
+          r'ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)',
+        ).firstMatch(t);
+        if (m != null) enabled = int.parse(m.group(1)!, radix: 16) != 0;
+      } else if (t.contains('ProxyServer')) {
+        final m = RegExp(r'ProxyServer\s+REG_SZ\s+(.+)$').firstMatch(t);
+        if (m != null) server = m.group(1)!.trim();
+      }
+    }
+    if (!enabled || server == null || server.isEmpty) return null;
+
+    String? httpsEntry;
+    String? httpEntry;
+    String? bareEntry;
+    for (final raw in server.split(';')) {
+      final part = raw.trim();
+      if (part.isEmpty) continue;
+      final lower = part.toLowerCase();
+      if (lower.startsWith('https=')) {
+        httpsEntry ??= part.substring(6);
+      } else if (lower.startsWith('http=')) {
+        httpEntry ??= part.substring(5);
+      } else if (!part.contains('=')) {
+        bareEntry ??= part;
+      }
+    }
+    final entry = httpsEntry ?? httpEntry ?? bareEntry;
+    if (entry == null || entry.isEmpty) return null;
+    return parseProxyUrl(entry);
+  }
+}
