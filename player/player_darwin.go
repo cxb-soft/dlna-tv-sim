@@ -11,7 +11,7 @@
 package player
 
 /*
-#cgo pkg-config: libavformat libavcodec libavutil libswscale libswresample
+#cgo pkg-config: libass libavformat libavcodec libavutil libswscale libswresample
 #cgo CFLAGS: -fobjc-arc -Wno-deprecated-declarations
 #cgo LDFLAGS: -framework Cocoa -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework QuartzCore
 #include <stdlib.h>
@@ -43,7 +43,9 @@ type Options struct {
 	Aspect         string  // auto / 16:9 / 4:3 / fill
 	Loop           bool    // 单文件循环
 	AudioTrack     int     // 1 起，0 自动
-	SubtitleTrack  int     // 1 起，0 关闭
+	SubtitleTrack  int     // 1 起，0 自动选第一条；显式关闭用 SetSubtitleTrack(0)
+	UserAgent      string  // HTTP User-Agent，空用 FFmpeg 默认
+	Referer        string  // HTTP Referer，空不发送
 }
 
 // Status 是播放器当前状态快照，供 UI/回调使用。
@@ -158,6 +160,10 @@ func Open(opts Options) (*Player, error) {
 	}
 	cAspect := C.CString(aspect)
 	defer C.free(unsafe.Pointer(cAspect))
+	cUA := C.CString(opts.UserAgent)
+	defer C.free(unsafe.Pointer(cUA))
+	cReferer := C.CString(opts.Referer)
+	defer C.free(unsafe.Pointer(cReferer))
 
 	var cerr [512]C.char
 	cfg := C.PeConfig{
@@ -171,6 +177,8 @@ func Open(opts Options) (*Player, error) {
 		muted:          cBool(opts.Mute),
 		hardware:       cBool(!opts.SoftwareDecode),
 		renderer:       cRenderer,
+		user_agent:     cUA,
+		referer:        cReferer,
 		start_position: C.double(opts.StartPosition),
 		speed:          C.double(opts.Speed),
 		aspect:         cAspect,

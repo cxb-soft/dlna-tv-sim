@@ -13,6 +13,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreImage/CoreImage.h>
+#include <ass/ass.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -64,6 +65,9 @@ struct PePlayer {
     char title[256];
     int req_w, req_h, req_fs, req_vol, req_mute, req_hw;
     int req_audio_track, req_sub_track;
+    char user_agent[512];
+    char referer[1024];
+    int sub_auto;
     char renderer[16];
     double start_pos;
 
@@ -164,6 +168,14 @@ struct PePlayer {
     // 字幕 cue（媒体时间）
     PeSubCue *cues;
     int ncues, cues_cap;
+
+    // libass：ASS/SRT 统一下发，渲染为 RGBA 位图
+    ASS_Library *ass_lib;
+    ASS_Renderer *ass_renderer;
+    ASS_Track *ass_track;
+    pthread_mutex_t ass_mu;
+    CGImageRef ass_image;
+    int ass_frame_w, ass_frame_h;
 
     // 缓冲/错误
     int buffering;
@@ -332,6 +344,11 @@ static void clear_sub_cues_locked(PePlayer *p) {
     free(p->cues);
     p->cues = NULL;
     p->ncues = p->cues_cap = 0;
+    if (p->ass_track) {
+        pthread_mutex_lock(&p->ass_mu);
+        ass_flush_events(p->ass_track);
+        pthread_mutex_unlock(&p->ass_mu);
+    }
 }
 
 static void add_sub_cue_locked(PePlayer *p, double start, double end, const char *text) {
@@ -526,6 +543,75 @@ static void enum_tracks(PePlayer *p) {
     }
 }
 
+// 新建一条 libass 轨道。FFmpeg 的 SRT/ASS 解码器都产出 ASS 事件文本，
+// 统一用 ass_process_chunk 投递，由 libass 负责 \pos/\an/\fs/颜色/描边。
+static void ass_reset_track(PePlayer *p) {
+    if (!p || !p->ass_lib) return;
+    pthread_mutex_lock(&p->ass_mu);
+    if (p->ass_track) { ass_free_track(p->ass_track); p->ass_track = NULL; }
+    if (p->ass_image) { CGImageRelease(p->ass_image); p->ass_image = NULL; }
+    int vw = p->video_w > 0 ? p->video_w : 1920;
+    int vh = p->video_h > 0 ? p->video_h : 1080;
+    if (p->ass_renderer) {
+        ass_set_frame_size(p->ass_renderer, vw, vh);
+        ass_set_storage_size(p->ass_renderer, vw, vh);
+    }
+    p->ass_frame_w = vw;
+    p->ass_frame_h = vh;
+    p->ass_track = ass_new_track(p->ass_lib);
+    if (p->ass_track) {
+        ass_set_check_readorder(p->ass_track, 0);
+        int have_private = 0;
+        if (p->sst && p->sst->codecpar->extradata && p->sst->codecpar->extradata_size > 0) {
+            ass_process_codec_private(p->ass_track,
+                (const char *)p->sst->codecpar->extradata,
+                p->sst->codecpar->extradata_size);
+            have_private = 1;
+            PE_LOG(p, "libass 读取 ASS 样式头 %d 字节", p->sst->codecpar->extradata_size);
+        }
+        if (!have_private) {
+            char header[2048];
+            snprintf(header, sizeof(header),
+                "[Script Info]\n"
+                "ScriptType: v4.00+\n"
+                "PlayResX: %d\n"
+                "PlayResY: %d\n"
+                "WrapStyle: 0\n"
+                "ScaledBorderAndShadow: yes\n\n"
+                "[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+                "Style: Default,PingFang SC,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,40,1\n\n"
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+                vw, vh);
+            ass_process_data(p->ass_track, header, (int)strlen(header));
+        }
+    }
+    pthread_mutex_unlock(&p->ass_mu);
+}
+
+static void ass_fmt_time(double sec, char *out, size_t len) {
+    if (sec < 0) sec = 0;
+    int total = (int)llround(sec * 100.0);
+    int h = total / 360000;
+    int m = (total / 6000) % 60;
+    int s = (total / 100) % 60;
+    int cs = total % 100;
+    snprintf(out, len, "%d:%02d:%02d.%02d", h, m, s, cs);
+}
+
+static void ass_feed_chunk(PePlayer *p, const char *raw, const char *style, double start, double end) {
+    if (!p || !p->ass_track || !raw || !raw[0]) return;
+    char st[32], et[32], line[8192];
+    const char *sty = (style && style[0]) ? style : "Default";
+    ass_fmt_time(start, st, sizeof(st));
+    ass_fmt_time(end, et, sizeof(et));
+    snprintf(line, sizeof(line), "Dialogue: 0,%s,%s,%s,,0,0,0,,%s\n", st, et, sty, raw);
+    pthread_mutex_lock(&p->ass_mu);
+    if (p->ass_track) ass_process_data(p->ass_track, line, (int)strlen(line));
+    pthread_mutex_unlock(&p->ass_mu);
+}
+
 static int open_subtitle_decoder(PePlayer *p) {
     if (p->sctx) avcodec_free_context(&p->sctx);
     p->sctx = NULL;
@@ -533,8 +619,9 @@ static int open_subtitle_decoder(PePlayer *p) {
     pthread_mutex_lock(&p->mu);
     clear_sub_cues_locked(p);
     pthread_mutex_unlock(&p->mu);
+    p->sst = p->sidx >= 0 ? p->fmt->streams[p->sidx] : NULL;
+    ass_reset_track(p);
     if (p->sidx < 0) return 0;
-    p->sst = p->fmt->streams[p->sidx];
     const AVCodec *codec = avcodec_find_decoder(p->sst->codecpar->codec_id);
     if (!codec) {
         PE_LOG(p, "没有字幕解码器 codec_id=%d", (int)p->sst->codecpar->codec_id);
@@ -637,6 +724,62 @@ static void subtitle_rect_text(AVSubtitleRect *r, char *out, size_t len) {
     while (n > 0 && (out[n-1] == ' ' || out[n-1] == '\n' || out[n-1] == '\t')) out[--n] = 0;
 }
 
+static void subtitle_rect_raw(AVSubtitleRect *r, char *out, size_t len) {
+    out[0] = 0;
+    const char *src = NULL;
+    if (r->type == SUBTITLE_ASS && r->ass) {
+        const char *d = strstr(r->ass, "Dialogue:");
+        if (d) {
+            src = skip_commas(d + strlen("Dialogue:"), 9);
+        } else {
+            int alt = 0;
+            const char *p = r->ass;
+            for (int i = 0; i < 3 && p; i++) {
+                const char *comma = strchr(p, ',');
+                size_t field = comma ? (size_t)(comma - p) : strlen(p);
+                if (memchr(p, ':', field)) alt = 1;
+                p = comma ? comma + 1 : NULL;
+            }
+            src = skip_commas(r->ass, alt ? 9 : 8);
+        }
+    } else if (r->text) {
+        src = r->text;
+    }
+    if (!src) return;
+    size_t o = 0;
+    if (r->type == SUBTITLE_ASS) {
+        while (*src && o + 1 < len) out[o++] = *src++;
+    } else {
+        for (; *src && o + 1 < len; src++) {
+            if (*src == '\n') {
+                if (o + 2 < len) { out[o++] = '\\'; out[o++] = 'N'; }
+            } else {
+                out[o++] = *src;
+            }
+        }
+    }
+    out[o] = 0;
+}
+
+static void subtitle_rect_style(AVSubtitleRect *r, char *out, size_t len) {
+    out[0] = 0;
+    if (!r || r->type != SUBTITLE_ASS || !r->ass) return;
+    const char *src = r->ass;
+    const char *d = strstr(src, "Dialogue:");
+    const char *field;
+    if (d) {
+        field = skip_commas(d + strlen("Dialogue:"), 3);
+    } else {
+        field = skip_commas(src, 2);
+    }
+    if (!field) return;
+    const char *comma = strchr(field, ',');
+    size_t n = comma ? (size_t)(comma - field) : strlen(field);
+    if (n >= len) n = len - 1;
+    memcpy(out, field, n);
+    out[n] = 0;
+}
+
 static void decode_subtitle_packet(PePlayer *p, AVPacket *pkt) {
     AVSubtitle sub;
     memset(&sub, 0, sizeof(sub));
@@ -658,7 +801,12 @@ static void decode_subtitle_packet(PePlayer *p, AVPacket *pkt) {
         text[0] = 0;
         for (unsigned i = 0; i < sub.num_rects; i++) {
             char tmp[512];
+            char raw[4096];
+            char style[64];
             subtitle_rect_text(sub.rects[i], tmp, sizeof(tmp));
+            subtitle_rect_raw(sub.rects[i], raw, sizeof(raw));
+            subtitle_rect_style(sub.rects[i], style, sizeof(style));
+            if (raw[0]) ass_feed_chunk(p, raw, style, start, end);
             if (!tmp[0]) continue;
             if (text[0]) append_utf8(text, sizeof(text), "\n");
             append_utf8(text, sizeof(text), tmp);
@@ -687,11 +835,16 @@ static int open_media(PePlayer *p) {
     // “不像媒体文件”为由拒绝本地密钥。播放器需要显式放行。
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "allowed_extensions", "ALL", 0);
+    if (p->user_agent[0]) av_dict_set(&opts, "user_agent", p->user_agent, 0);
+    if (p->referer[0]) av_dict_set(&opts, "referer", p->referer, 0);
     int r = avformat_open_input(&p->fmt, p->url, NULL, &opts);
     av_dict_free(&opts);
     if (r < 0) {
         char eb[128];
         PE_LOG(p, "打开输入失败：%s", av_text(r, eb, sizeof(eb)));
+        if (strstr(eb, "401") || strstr(eb, "Unauthorized")) {
+            PE_LOG(p, "认证失败：HTTP 源需要有效 token/API key；UA/Referer 已可配置，但不等于认证凭据");
+        }
         return -1;
     }
     r = avformat_find_stream_info(p->fmt, NULL);
@@ -710,6 +863,9 @@ static int open_media(PePlayer *p) {
     p->sidx = -1;
     if (p->req_sub_track >= 1 && p->req_sub_track <= p->nstracks) {
         p->sidx = p->stracks[p->req_sub_track - 1].stream_index;
+    } else if (p->sub_auto && p->nstracks > 0) {
+        p->sidx = p->stracks[0].stream_index;
+        PE_LOG(p, "默认字幕：自动选第 1 条（流 %d）", p->sidx);
     }
     PE_LOG(p, "容器：%s，时长 %.3fs，视频流=%d 音频流=%d 字幕流=%d",
            p->fmt->iformat->name, p->duration, p->vidx, p->aidx, p->sidx);
@@ -934,6 +1090,38 @@ static void request_seek_locked(PePlayer *p, double target) {
 
 static void perform_seek(PePlayer *p, double target) {
     int64_t ts = (int64_t)(target * AV_TIME_BASE);
+
+    // seek 到目标点时，跨目标的字幕事件（例如 9..13s，目标是 10s）不会被读到。
+    // 先回到目标前 10 秒，只解字幕包，再回到目标点播放。
+    if (p->sctx && p->sidx >= 0) {
+        double pre = target > 10.0 ? target - 10.0 : 0.0;
+        int64_t pre_ts = (int64_t)(pre * AV_TIME_BASE);
+        int r0 = avformat_seek_file(p->fmt, -1, INT64_MIN, pre_ts, INT64_MAX, AVSEEK_FLAG_BACKWARD);
+        if (r0 >= 0) {
+            pthread_mutex_lock(&p->mu);
+            clear_sub_cues_locked(p);
+            pthread_mutex_unlock(&p->mu);
+            avcodec_flush_buffers(p->sctx);
+            AVPacket *spkt = av_packet_alloc();
+            if (spkt) {
+                while (!p->abort && !p->stopping) {
+                    int rr = av_read_frame(p->fmt, spkt);
+                    if (rr < 0) break;
+                    double pts = 0;
+                    if (spkt->pts != AV_NOPTS_VALUE && spkt->stream_index >= 0) {
+                        pts = (double)spkt->pts * av_q2d(p->fmt->streams[spkt->stream_index]->time_base);
+                    }
+                    if (spkt->stream_index == p->sidx) decode_subtitle_packet(p, spkt);
+                    int stop = pts > target + 2.0;
+                    av_packet_unref(spkt);
+                    if (stop) break;
+                }
+                av_packet_free(&spkt);
+            }
+            PE_LOG(p, "seek 字幕预取：%.3f..%.3f", pre, target);
+        }
+    }
+
     int r = avformat_seek_file(p->fmt, -1, INT64_MIN, ts, INT64_MAX, AVSEEK_FLAG_BACKWARD);
     if (r < 0) r = av_seek_frame(p->fmt, -1, ts, AVSEEK_FLAG_BACKWARD);
     if (r < 0) {
@@ -949,7 +1137,7 @@ static void perform_seek(PePlayer *p, double target) {
     }
     pthread_mutex_lock(&p->mu);
     clear_video_queue_locked(p);
-    clear_sub_cues_locked(p);
+    // 字幕预取刚构建好的 cue 不要再清。
     p->discarding = 0;
     p->alen = 0;
     p->aread = p->awrite = 0;
@@ -1327,6 +1515,9 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
     p->start_pos = cfg->start_position > 0 ? cfg->start_position : 0;
     p->req_audio_track = cfg->audio_track;
     p->req_sub_track = cfg->subtitle_track;
+    p->sub_auto = cfg->subtitle_track <= 0;
+    snprintf(p->user_agent, sizeof(p->user_agent), "%s", cfg->user_agent ? cfg->user_agent : "");
+    snprintf(p->referer, sizeof(p->referer), "%s", cfg->referer ? cfg->referer : "");
     p->speed = cfg->speed > 0 ? cfg->speed : 1.0;
     if (p->speed < 0.25) p->speed = 0.25;
     if (p->speed > 4.0) p->speed = 4.0;
@@ -1344,7 +1535,26 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
     p->vhead = p->vtail = NULL;
 
     pthread_mutex_init(&p->mu, NULL);
+    pthread_mutex_init(&p->ass_mu, NULL);
     pthread_cond_init(&p->cond, NULL);
+
+    p->ass_lib = ass_library_init();
+    if (p->ass_lib) {
+        p->ass_renderer = ass_renderer_init(p->ass_lib);
+        if (p->ass_renderer) {
+            ass_set_fonts(p->ass_renderer, NULL, "PingFang SC",
+                          ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
+            ass_set_frame_size(p->ass_renderer, p->req_w > 0 ? p->req_w : 1280,
+                               p->req_h > 0 ? p->req_h : 720);
+            ass_set_storage_size(p->ass_renderer, p->req_w > 0 ? p->req_w : 1280,
+                                 p->req_h > 0 ? p->req_h : 720);
+            PE_LOG(p, "libass %d 初始化完成", ass_library_version());
+        } else {
+            PE_LOG(p, "libass renderer 初始化失败，退回纯文本字幕");
+        }
+    } else {
+        PE_LOG(p, "libass library 初始化失败，退回纯文本字幕");
+    }
 
     PE_LOG(p, "打开 %s", p->url);
     PE_LOG(p, "本线程是否主线程：%d", (int)pthread_main_np());
@@ -1764,6 +1974,7 @@ void pe_set_subtitle_track(PePlayer *p, int id) {
     }
     p->pending_sidx = stream;
     p->sub_switch_pending = 1;
+    p->sub_auto = 0;
     double pos = pos_locked(p);
     request_seek_locked(p, pos);
     pthread_mutex_unlock(&p->mu);
@@ -1806,6 +2017,87 @@ int pe_get_subtitle_text(PePlayer *p, char *buf, int len) {
     }
     pthread_mutex_unlock(&p->mu);
     return o;
+}
+
+static void pe_free_rgba(void *info, const void *data, size_t size) {
+    (void)info; (void)size;
+    free((void *)data);
+}
+
+// 把 libass 返回的 alpha 位图列表合成为整帧 RGBA，返回 CGImageRef（调用方 release）。
+void *pe_copy_subtitle_image(PePlayer *p) {
+    if (!p) return NULL;
+    double pos;
+    pthread_mutex_lock(&p->mu);
+    pos = pos_locked(p);
+    pthread_mutex_unlock(&p->mu);
+
+    pthread_mutex_lock(&p->ass_mu);
+    if (!p->ass_renderer || !p->ass_track || p->video_w <= 0 || p->video_h <= 0) {
+        if (p->ass_image) { CGImageRelease(p->ass_image); p->ass_image = NULL; }
+        pthread_mutex_unlock(&p->ass_mu);
+        return NULL;
+    }
+    if (p->ass_frame_w != p->video_w || p->ass_frame_h != p->video_h) {
+        ass_set_frame_size(p->ass_renderer, p->video_w, p->video_h);
+        ass_set_storage_size(p->ass_renderer, p->video_w, p->video_h);
+        p->ass_frame_w = p->video_w;
+        p->ass_frame_h = p->video_h;
+    }
+    int changed = 0;
+    ASS_Image *imgs = ass_render_frame(p->ass_renderer, p->ass_track,
+                                       (long long)llround(pos * 1000.0), &changed);
+    if (!imgs) {
+        if (p->ass_image) { CGImageRelease(p->ass_image); p->ass_image = NULL; }
+        pthread_mutex_unlock(&p->ass_mu);
+        return NULL;
+    }
+    if (!changed && p->ass_image) {
+        CGImageRef ret = CGImageRetain(p->ass_image);
+        pthread_mutex_unlock(&p->ass_mu);
+        return ret;
+    }
+
+    int w = p->video_w, h = p->video_h;
+    size_t stride = (size_t)w * 4;
+    uint8_t *buf = calloc(stride * (size_t)h, 1);
+    if (!buf) { pthread_mutex_unlock(&p->ass_mu); return NULL; }
+    for (ASS_Image *im = imgs; im; im = im->next) {
+        uint32_t c = im->color;
+        int cr = (c >> 24) & 0xff, cg = (c >> 16) & 0xff, cb = (c >> 8) & 0xff;
+        int ca = 255 - (int)(c & 0xff);
+        for (int y = 0; y < im->h; y++) {
+            int dy = im->dst_y + y;
+            if (dy < 0 || dy >= h) continue;
+            const unsigned char *src = im->bitmap + (size_t)y * (size_t)im->stride;
+            for (int x = 0; x < im->w; x++) {
+                int dx = im->dst_x + x;
+                if (dx < 0 || dx >= w) continue;
+                int a = (ca * (int)src[x]) / 255;
+                if (a <= 0) continue;
+                uint8_t *d = buf + ((size_t)dy * (size_t)w + (size_t)dx) * 4;
+                int inv = 255 - a;
+                d[0] = (uint8_t)((cr * a + d[0] * inv) / 255);
+                d[1] = (uint8_t)((cg * a + d[1] * inv) / 255);
+                d[2] = (uint8_t)((cb * a + d[2] * inv) / 255);
+                d[3] = (uint8_t)(a + (d[3] * inv) / 255);
+            }
+        }
+    }
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, buf, stride * (size_t)h, pe_free_rgba);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGImageRef img = CGImageCreate(w, h, 8, 32, stride, cs,
+        kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast,
+        provider, NULL, false, kCGRenderingIntentDefault);
+    CGColorSpaceRelease(cs);
+    CGDataProviderRelease(provider);
+    if (!img) { pthread_mutex_unlock(&p->ass_mu); return NULL; }
+    if (p->ass_image) CGImageRelease(p->ass_image);
+    p->ass_image = CGImageRetain(img);
+    CGImageRelease(img);
+    CGImageRef ret = CGImageRetain(p->ass_image);
+    pthread_mutex_unlock(&p->ass_mu);
+    return ret;
 }
 
 int pe_screenshot(PePlayer *p, const char *path, char *errbuf, int errlen) {
@@ -2076,6 +2368,11 @@ void pe_destroy(PePlayer *p) {
     if (p->swr) swr_free(&p->swr);
     if (p->hwdev) av_buffer_unref(&p->hwdev);
     if (p->sctx) avcodec_free_context(&p->sctx);
+    if (p->ass_track) ass_free_track(p->ass_track);
+    if (p->ass_image) CGImageRelease(p->ass_image);
+    if (p->ass_renderer) ass_renderer_done(p->ass_renderer);
+    if (p->ass_lib) ass_library_done(p->ass_lib);
+    pthread_mutex_destroy(&p->ass_mu);
     if (p->last_pb) {
         CVPixelBufferRelease(p->last_pb);
         p->last_pb = NULL;

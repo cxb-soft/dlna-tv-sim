@@ -447,6 +447,7 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
     BOOL animate = _fade > 0.01 || _fadeStart > 0 || _buffering || _toastUntil > 0 ||
                    _menu != PeMenuNone || _menuAnim < 1;
     if (animate) [self setNeedsDisplay:YES];
+    if (_st.subtitle_track > 0) [self setNeedsDisplay:YES];
 }
 
 - (void)showToast:(NSString *)text error:(BOOL)error {
@@ -771,6 +772,34 @@ typedef NS_ENUM(NSInteger, PeMenuKind) {
 
 - (void)drawSubtitles {
     if (!_player) return;
+    CGImageRef sub = (CGImageRef)pe_copy_subtitle_image(_player);
+    if (sub) {
+        CGFloat vw = _st.width, vh = _st.height;
+        if (vw >= 2 && vh >= 2) {
+            CGFloat tw = vw, th = vh;
+            NSString *asp = [NSString stringWithUTF8String:_st.aspect];
+            if ([asp isEqualToString:@"16:9"]) { tw = 16; th = 9; }
+            else if ([asp isEqualToString:@"4:3"]) { tw = 4; th = 3; }
+            NSRect vr;
+            if ([asp isEqualToString:@"fill"]) {
+                vr = self.bounds;
+            } else {
+                CGFloat s = MIN(self.W / tw, self.H / th);
+                vr = NSMakeRect((self.W - tw * s) / 2.0, (self.H - th * s) / 2.0, tw * s, th * s);
+            }
+            CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+            if (ctx) {
+                CGContextSaveGState(ctx);
+                CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+                CGContextDrawImage(ctx, CGRectMake(vr.origin.x, vr.origin.y, vr.size.width, vr.size.height), sub);
+                CGContextRestoreGState(ctx);
+            }
+        }
+        CGImageRelease(sub);
+        return;
+    }
+
+    // libass 不可用时的纯文本回退（正常情况下不会走到这里）。
     char buf[4096];
     int n = pe_get_subtitle_text(_player, buf, sizeof(buf));
     if (n <= 0) return;

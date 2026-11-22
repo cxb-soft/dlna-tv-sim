@@ -189,6 +189,9 @@ func main() {
 		mute       = flag.Bool("mute", false, "静音")
 		soft       = flag.Bool("soft", false, "强制软件解码（用于对比硬解 CPU）")
 		startPos   = flag.Float64("start", 0, "起播位置（秒）")
+		sub        = flag.Int("sub", 0, "字幕轨 1 起，0 自动选第一条")
+		ua         = flag.String("ua", "", "HTTP User-Agent（用于 Emby 等鉴权）")
+		referer    = flag.String("referer", "", "HTTP Referer")
 		script     = flag.String("script", "", "自动脚本，如 \"wait 2; pos; pause; wait 2; pos; play; seek 10; wait 2; pos; shot /tmp/a.png\"")
 		verbose    = flag.Bool("verbose", false, "每次状态回调都打印")
 		every      = flag.Float64("status-every", 1.0, "状态打印间隔（秒），0 表示不自动打印")
@@ -217,6 +220,9 @@ func main() {
 		Mute:           *mute,
 		SoftwareDecode: *soft,
 		StartPosition:  *startPos,
+		SubtitleTrack:  *sub,
+		UserAgent:      *ua,
+		Referer:        *referer,
 	})
 	if err != nil {
 		logf("打开失败: %v", err)

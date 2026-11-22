@@ -17,6 +17,9 @@ FFMPEG_PREFIX="${DLNA_FFMPEG_PREFIX:-$DEPS_ROOT/ffmpeg-lgpl}"
 NATIVE_ENGINE="${DLNA_NATIVE_ENGINE:-1}"
 
 echo "→ 构建 Go 引擎（arm64），版本 $VERSION"
+  echo "→ 嵌入 libass 字幕库（0.17.5）"
+  DLNA_FFMPEG_PREFIX="$FFMPEG_PREFIX" ./scripts/embed-libass.sh
+
 mkdir -p dist
 if [ "$NATIVE_ENGINE" = "1" ]; then
   if [ ! -f "$FFMPEG_PREFIX/lib/libavcodec.dylib" ]; then
@@ -65,7 +68,23 @@ if [ "$NATIVE_ENGINE" = "1" ]; then
   mkdir -p "$ENGINE_DIR/lib"
   # 保留符号链接：install_name 是 @rpath/libavcodec.63.dylib，实体是 libavcodec.63.1.102.dylib
   for f in "$FFMPEG_PREFIX"/lib/*.dylib; do cp -a "$f" "$ENGINE_DIR/lib/"; done
+  # 依赖闭包：所有 dylib 的 @rpath 引用必须能在 engine/lib 里找到。
+  missing=""
+  for f in "$ENGINE_DIR/lib"/*.dylib; do
+    while read -r dep; do
+      [ -z "$dep" ] && continue
+      [ -e "$ENGINE_DIR/lib/$dep" ] || missing="$missing $dep"
+    done < <(otool -L "$f" | awk '/@rpath/ {print $1}' | sed 's#@rpath/##')
+  done
+  if [ -n "$missing" ]; then
+    echo "错误：缺少 @rpath 依赖:$missing" >&2
+    exit 1
+  fi
   # 引擎只能依赖 @rpath 与系统框架，不能残留 Homebrew/绝对前缀
+  # libass 可能因 pkg-config/链接缓存记录 Homebrew 绝对路径，打包前改回 @rpath。
+  if otool -L "$ENGINE_DIR/dlna-tv-sim" | grep -q '/opt/homebrew/opt/libass/lib/libass.9.dylib'; then
+    install_name_tool -change /opt/homebrew/opt/libass/lib/libass.9.dylib @rpath/libass.9.dylib "$ENGINE_DIR/dlna-tv-sim"
+  fi
   ABS_RE="$(printf '%s' "$FFMPEG_PREFIX" | sed 's/[.[\*^$()+?{|]/\\&/g')"
   if otool -L "$ENGINE_DIR/dlna-tv-sim" | tail -n +2 | grep -Eq "/opt/homebrew|/usr/local|$ABS_RE"; then
     echo "错误：引擎仍链接外部 FFmpeg：" >&2

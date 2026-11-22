@@ -109,6 +109,17 @@ for f in LICENSE.md COPYING.LGPLv2.1 COPYING.LGPLv3; do
   cp "$SRC/$f" "$PREFIX/share/licenses/ffmpeg/$f"
 done
 
+# FFmpeg 的 brotli 传递依赖：libbrotlidec 依赖 libbrotlicommon；不装进去会导致引擎启动时 dyld 找不到。
+BROTLI_COMMON="/opt/homebrew/opt/brotli/lib/libbrotlicommon.1.dylib"
+if [ -f "$BROTLI_COMMON" ]; then
+  cp -fL "$BROTLI_COMMON" "$PREFIX/lib/"
+  chmod u+w "$PREFIX/lib/libbrotlicommon.1.dylib"
+  install_name_tool -id @rpath/libbrotlicommon.1.dylib "$PREFIX/lib/libbrotlicommon.1.dylib"
+fi
+
+# 注意：libass 目前按同版本二进制嵌入（scripts/embed-libass.sh）；源码构建待补。
+DLNA_FFMPEG_PREFIX="$PREFIX" "$REPO/scripts/embed-libass.sh"
+
 # 自包含检查：不允许出现 Homebrew / 本地库路径
 echo "→ 检查 dylib 依赖"
 bad=0

@@ -21,6 +21,8 @@ type Options struct {
 	Loop           bool
 	AudioTrack     int
 	SubtitleTrack  int
+	UserAgent      string
+	Referer        string
 }
 
 // Track 与 darwin 实现保持同构。

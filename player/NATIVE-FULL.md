@@ -69,3 +69,23 @@
 - 本机屏幕逻辑宽 1800（全屏 1800×1169）。1920 大屏组是把 1800×1080 窗口内容放大到 1920×1080（横向 6.7%），全屏组是 1800×1169 等比缩放进 1920×1080（左右留黑）。若必须严格 1920×1080 布局，需要改显示模式后再截。
 - 错误 toast 已实现（深色胶囊 + 图标 + 3s），本轮截图集中验证了缓冲态，没有单独截错误态。
 - 本地 fMP4 起播约 5s 的引擎限制不变；HTTP fMP4 正常。ASS 高级样式、HLS HEVC/加密 fMP4 仍未覆盖。
+
+## 字幕：libass 与默认轨（2026-11-22）
+
+- 默认字幕轨：`pe_open` 在 `subtitle_track == 0` 时设 `sub_auto=1`，`open_media` 自动选第一条字幕流；UI「字幕」胶囊显示当前轨，用户点「关闭字幕」走 `pe_set_subtitle_track(0)` 显式关闭。CLI 新增 `-sub N`（0=自动）。
+- 渲染：引入 libass 0.17.5（ISC），保留 Matroska/ASS 的 CodecPrivate 样式头与事件 Style 名（`Top`/`Red`/`Default`），把 FFmpeg 的 ASS/SRT 事件文本构造成 `Dialogue` 行交给 libass，解析 `\pos`/`\an`/`\fs`/颜色/描边；引擎合成整帧 RGBA，UI 按视频 content rect 缩放叠加。缺字体时 libass 回退系统 PingFang/Helvetica。
+- 验证截图（1280×720，真实窗口，控件已隐藏）：
+  - 4s：`/tmp/pe_shots/ass_final_4.png`，Top 样式黄色，`\pos(640,80)` 顶部居中。
+  - 10s（原素材）：`/tmp/pe_shots/ass_final_10.png`，Red 样式红色，落在底部居中——**原素材这条事件是字面量 `红色字幕 RED POS(200\,500)`，没有 `{\pos...}` 标签**，libass 按 Red 的 Alignment 2 渲染，不是引擎丢标签。
+  - 18s：`/tmp/pe_shots/ass_final_18.png`，Top 样式黄色，`\an8` 顶部居中。
+  - seek 到 10s：`/tmp/pe_shots/ass_seek_10_fix.png`，预取后仍显示 9–13s 红色字幕。
+  - SRT：`/tmp/pe_shots/ass_srt_2.png`；日志 `/tmp/sub_srt_full.log` 记录 2.000..6.000、8.000..12.000、16.000..20.000 三条 cue。
+- 时间日志：
+  - ASS `/tmp/sub_final_4.log` 3.000..7.000，`/tmp/sub_final_10.log` 9.000..13.000，`/tmp/sub_final_18.log` 17.000..21.000；暂停位置 3.989/10.197/18.197。
+  - seek：`/tmp/seek_fix.log` 出现 `seek 字幕预取：0.000..10.000`，cue 3–7、9–13，暂停后当前字幕非空。
+- seek 预取：`perform_seek` 先 seek 到 target-10，只解字幕包，再 seek 回 target；解决跨目标事件（9–13s，target 10s）被跳过的问题。
+- Emby：`https://goemby.entertang.work/Videos/...` 当前对 native、curl 默认 UA、VLC UA、mpv UA 都是 401；`/tmp/native-sub.log` 里 mpv 同一条流也 401。已加 `-ua`/`-referer` 与 HTTP 401「认证失败」日志；这不是 UA 能单独解决的，需要有效 token/API key 或带认证的 URL。
+- 构建/打包（2026-11-22）：`scripts/embed-libass.sh` 把 Homebrew libass 0.17.5 及 freetype/fribidi/harfbuzz/libunibreak 等 rpath 依赖复制到 deps 前缀；`scripts/package-macos-app.sh` 整目录嵌入 App 并逐个签名。补入 FFmpeg 传递依赖 `libbrotlicommon 1.2.1` 后，`otool -L` 引擎只链 `@rpath/libass.9.dylib`/`@rpath/libav*` 和系统框架。App 39MB、zip 16MB。
+- clean 验证：`/tmp/dlna-clean` 复制 App 后 `env -i` + 独立 HOME + 8098 起引擎；`lsof -p` 显示进程加载 `.../DLNA 电视.app/Contents/Resources/engine/lib/libass.9.dylib`；依赖闭包无缺失；播放 `/tmp/sub_ass_fixed.mkv` 到 10.226s 暂停，红字 `\an4\pos(200,500)` 位于左中（`/tmp/pe_shots/clean_102_libass.png`，日志 `/tmp/clean_libass_test2.log`）。
+- **限制**：libass/依赖当前是同版本 Homebrew 二进制嵌入，不是源码重编；源码 URL/sha256 与许可文本见 `third_party/README.md` 和 `third_party/licenses/`。发版前若要完全源码构建，需补 autoconf/automake/meson 工具链并复测。
+- 当前目录未提交。

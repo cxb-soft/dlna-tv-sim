@@ -132,3 +132,13 @@ cat "$PREFIX/BUILD-INFO.txt"
   发布 zip 11M → 13M。
 - 同一套源码不设 `PKG_CONFIG_PATH` 构建的引擎仍链接 `/opt/homebrew`，
   开发机默认流程不受影响。
+
+## libass 字幕渲染（2026-11-22）
+
+- **libass 0.17.5**，ISC 许可，源码：https://github.com/libass/libass/releases/tag/0.17.5
+- 源码 tarball sha256：`d0b416fa72d2b58e069469b28380cf9257903f062c7bedf9bca6dbd0ec92a75f`；freetype 2.15.0 `93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5`；harfbuzz 15.0.0 `968536e9abd782f07f7954044c0c4020199fcdd39b41d221ec42d2a3be4a44df`；fribidi 1.0.16 `1b1cde5b235d40479e91be2f0e88a309e3214c8ab470ec8a2744d82a5a9ea05c`；libunibreak 7.0 `8c9a6e121736cd0d5c890ae3ae96f3f4010a19aa040f1dbded833a62a87717d3`。
+- 直接/运行依赖（本轮本机）：freetype 2.15.0（FTL 或 GPLv2）、harfbuzz 15.0.0（MIT）、fribidi 1.0.16（LGPL-2.1+）、libunibreak 7.0（zlib）；fontconfig 2.18.3（MIT 类）用于字体查找/回退。均为 Homebrew 安装，未修改。
+- 打包（2026-11-22）：`scripts/embed-libass.sh` 把 Homebrew libass 0.17.5 及 freetype/fribidi/harfbuzz/libunibreak 等 rpath 依赖复制到 deps 前缀，统一改 `@rpath`；`scripts/package-macos-app.sh` 再整目录嵌入 App 并逐个签名。另补入 FFmpeg 的传递依赖 `libbrotlicommon 1.2.1`（brotli，MIT），否则引擎启动会报 `Library not loaded`。
+- 实测：App 引擎 `otool -L` 仅系统框架 + `@rpath/libass.9.dylib`/`@rpath/libav*`；干净目录 `/tmp/dlna-clean`、`env -i` + 独立 HOME + 8098 起引擎，`lsof` 加载 App 内 `libass.9.dylib`；播放 `/tmp/sub_ass_fixed.mkv` 到 10.226s 暂停，红字 `\an4\pos(200,500)` 位于左中（`/tmp/pe_shots/clean_102_libass.png`），日志 `/tmp/clean_libass_test2.log`；App 39MB，zip 16MB。
+- **源码构建未接入**：当前 libass/依赖是 Homebrew 同版本二进制嵌入，不是从源码重编；发版前若要完全源码构建，需补 autoconf/automake/meson 工具链并复测。许可文本已放 `third_party/licenses/`（libass ISC、freetype FTL/GPLv2、harfbuzz MIT、fribidi LGPL-2.1+、libunibreak zlib、brotli MIT）；FFmpeg 许可在 `third_party/licenses/ffmpeg/`。
+- FFmpeg 仍是 LGPL 2.1+ 动态库，未引入 GPL/nonfree 组件；libass 使用 ISC，不改变 FFmpeg 的 LGPL 构建。

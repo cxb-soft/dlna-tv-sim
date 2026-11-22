@@ -20,12 +20,14 @@ typedef struct {
     int muted;                /* 1 = 静音 */
     int hardware;             /* 1 = 优先 VideoToolbox，失败自动回软解 */
     const char *renderer;     /* "layer"（默认）；保留扩展位 */
+    const char *user_agent;   /* HTTP User-Agent，NULL 默认 */
+    const char *referer;      /* HTTP Referer，NULL 不发送 */
     double start_position;    /* 起播位置（秒），0 表示从头 */
     double speed;             /* 0.25..4，1 = 原速 */
     const char *aspect;       /* auto / 16:9 / 4:3 / fill */
     int loop;                 /* 1 = 单文件循环 */
     int audio_track;          /* 1 起的音轨编号，0 = 自动 */
-    int subtitle_track;       /* 1 起的字幕轨编号，0 = 关闭 */
+    int subtitle_track;       /* 1 起的字幕轨编号，0 = 自动选第一条 */
 } PeConfig;
 
 /* 一条音轨/字幕轨。id 是给 UI 和 DLNA 用的稳定编号（1 起）。 */
@@ -124,6 +126,9 @@ int  pe_get_subtitle_track(PePlayer *p);
 
 /* 当前正在显示的字幕文本（UTF-8，多行用 \n），返回写入字节数。 */
 int  pe_get_subtitle_text(PePlayer *p, char *buf, int len);
+
+/* 当前字幕 RGBA 位图（libass 渲染，CGImageRef）；调用方 CGImageRelease。 */
+void *pe_copy_subtitle_image(PePlayer *p);
 
 /* 把当前视频帧写成 PNG，成功返回 0。可从任意线程调用。 */
 int  pe_screenshot(PePlayer *p, const char *path, char *errbuf, int errlen);
