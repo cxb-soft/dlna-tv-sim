@@ -49,7 +49,7 @@ func (m *mpvScreen) Show(uri, title string, volume int, mute bool) {
 	m.retries = 0
 	m.mu.Unlock()
 
-	if err := m.start(uri); err != nil {
+	if err := m.start(); err != nil {
 		m.dev.logf("screen", "mpv 没起来（%v），换下一个引擎", err)
 		m.dev.fallbackFrom("mpv")
 		return
@@ -207,7 +207,7 @@ func (m *mpvScreen) send(payload map[string]any) {
 	}
 }
 
-func (m *mpvScreen) start(uri string) error {
+func (m *mpvScreen) start() error {
 	m.mu.Lock()
 	if m.started && m.conn != nil {
 		m.mu.Unlock()
@@ -244,7 +244,6 @@ func (m *mpvScreen) start(uri string) error {
 	} else {
 		args = append(args, "--osc=yes")
 	}
-	args = append(args, uri)
 	cmd := exec.Command(m.path, args...)
 	cmd.Stdout = io.Discard
 	stderr := &limitedBuffer{limit: 4096}
@@ -468,6 +467,9 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 				}
 			}
 		case "file-loaded":
+			m.dev.logf("screen", "mpv file-loaded")
+			m.dev.startPlayback()
+			m.dev.applyPendingSeek()
 			m.mu.Lock()
 			m.retries = 0
 			m.reloading = false

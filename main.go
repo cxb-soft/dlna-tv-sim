@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-var version = "0.4.4"
+var version = "0.4.5"
 
 func main() {
 	// macOS 的 AppKit 事件循环必须在进程主线程；自研播放核心（-player native）

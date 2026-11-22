@@ -375,13 +375,6 @@ func (d *Device) showOnScreen(uri, title string, volume int, mute bool) {
 		}
 		d.mu.Unlock()
 	}
-	d.mu.Lock()
-	hasPend, pend := d.hasPendingSeek, d.pendingSeek
-	d.hasPendingSeek = false
-	d.mu.Unlock()
-	if hasPend {
-		scr.Seek(pend)
-	}
 	scr.Show(uri, title, volume, mute)
 }
 

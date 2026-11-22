@@ -371,7 +371,23 @@ func (d *Device) Play() *upnpError {
 		d.mu.Unlock()
 		return &upnpError{701, "Transition not available"}
 	}
-	if d.state == statePlaying {
+	switch d.state {
+	case statePlaying:
+		d.mu.Unlock()
+		return nil
+	case statePaused:
+		// 暂停时按播放只恢复，不能重新走 showOnScreen 重开文件。
+		d.state = statePlaying
+		d.posAt = time.Now()
+		scr := d.scr
+		d.mu.Unlock()
+		if scr != nil {
+			scr.Play()
+		}
+		d.logf("avt", "Play（继续）")
+		d.emit(serviceAVTransport)
+		return nil
+	case stateTransitioning:
 		d.mu.Unlock()
 		return nil
 	}
@@ -385,17 +401,37 @@ func (d *Device) Play() *upnpError {
 	d.logf("avt", "Play")
 
 	go func() {
-		time.Sleep(120 * time.Millisecond)
-		d.mu.Lock()
-		if d.state != stateTransitioning {
-			d.mu.Unlock()
-			return
-		}
-		d.state = statePlaying
-		d.posAt = time.Now()
-		d.mu.Unlock()
-		d.emit(serviceAVTransport)
+		// showOnScreen 会阻塞到播放器真正打开；在这之前保持 TRANSITIONING，
+		// 不能先报 PLAYING 让控制点跟着一个虚构的时钟走。
 		d.showOnScreen(uri, mediaTitle(meta, uri), volume, mute)
+		d.mu.Lock()
+		wasTransitioning := d.state == stateTransitioning
+		scr := d.scr
+		_, isMPV := scr.(*mpvScreen)
+		target, hasPending := d.pendingSeek, d.hasPendingSeek
+		if !isMPV {
+			// 非 mpv 播放器在 Show 返回时已经打开文件，可以直接进入播放态。
+			if wasTransitioning {
+				d.state = statePlaying
+				d.posAt = time.Now()
+			}
+			if hasPending {
+				d.hasPendingSeek = false
+				d.pos = target
+				d.posAt = time.Now()
+			}
+		}
+		d.mu.Unlock()
+		if !isMPV {
+			if hasPending && scr != nil {
+				scr.Seek(target)
+			}
+			if wasTransitioning {
+				d.emit(serviceAVTransport)
+			}
+		}
+		// mpv 要等 file-loaded 事件后再进入 PLAYING 并应用挂起 Seek，
+		// 否则 seek 会发在加载完成之前被丢掉。
 		go d.probeMedia(uri)
 	}()
 	return nil
@@ -474,7 +510,8 @@ func (d *Device) Seek(target time.Duration) *upnpError {
 	}
 	d.pos = target
 	d.posAt = time.Now()
-	if d.scr == nil {
+	if d.state == stateTransitioning || d.scr == nil {
+		// 播放器还没打开：先记住，等 showOnScreen 返回后再跳。
 		d.pendingSeek = target
 		d.hasPendingSeek = true
 		d.mu.Unlock()

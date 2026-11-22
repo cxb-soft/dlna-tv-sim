@@ -15,12 +15,44 @@ func (d *Device) setDuration(dur time.Duration) {
 
 func (d *Device) syncPosition(pos time.Duration) {
 	d.mu.Lock()
-	playing := d.state == statePlaying || d.state == stateTransitioning
-	if playing {
+	if d.state == statePlaying {
 		d.pos = pos
 		d.posAt = time.Now()
 	}
 	d.mu.Unlock()
+}
+
+// startPlayback 由播放器在文件真正加载完成后调用，进入 PLAYING。
+func (d *Device) startPlayback() {
+	d.mu.Lock()
+	changed := d.state == stateTransitioning
+	if changed {
+		d.state = statePlaying
+		d.posAt = time.Now()
+	}
+	d.mu.Unlock()
+	if changed {
+		d.emit(serviceAVTransport)
+	}
+}
+
+// applyPendingSeek 在文件加载完成后应用之前收到的 Seek。
+func (d *Device) applyPendingSeek() {
+	d.mu.Lock()
+	if !d.hasPendingSeek {
+		d.mu.Unlock()
+		return
+	}
+	target := d.pendingSeek
+	d.hasPendingSeek = false
+	d.pos = target
+	d.posAt = time.Now()
+	scr := d.scr
+	d.mu.Unlock()
+	if scr != nil {
+		scr.Seek(target)
+	}
+	d.logf("avt", "应用挂起 Seek → %s", formatTime(target))
 }
 
 // onPlaybackEnded：片子播完了，像电视一样回到 STOPPED，并把播放器窗口收掉。
