@@ -95,56 +95,8 @@ jobs:
           path: dist/${{ matrix.out }}
           if-no-files-found: error
 
-  macos-app:
-    name: macOS app bundle
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
-    runs-on: macos-14
-    # 仓库当前的 macOS runner 配置不一定可用；正式 .app 在本地公证后手动上传，
-    # 这里只作为可选的构建检查，不让它把整条工作流判红。
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          check-latest: true
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-      - name: Build engine (universal)
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath \
-            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o /tmp/engine-arm64 .
-          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
-            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o /tmp/engine-amd64 .
-          lipo -create -output /tmp/dlna-tv-sim-universal /tmp/engine-arm64 /tmp/engine-amd64
-      - name: Build Flutter app
-        run: |
-          cd ui
-          flutter pub get
-          flutter build macos --release
-      - name: Bundle engine, sign and zip
-        run: |
-          set -euo pipefail
-          APP="ui/build/macos/Build/Products/Release/dlna_tv_sim.app"
-          mkdir -p "$APP/Contents/Resources/engine"
-          cp /tmp/dlna-tv-sim-universal "$APP/Contents/Resources/engine/dlna-tv-sim"
-          chmod +x "$APP/Contents/Resources/engine/dlna-tv-sim"
-          cp -R uosc "$APP/Contents/Resources/engine/uosc"
-          codesign --force --deep --sign - "$APP"
-          mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/dlna-tv-sim-macos-app.zip
-          ls -lh dist/dlna-tv-sim-macos-app.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dlna-tv-sim-macos-app.zip
-          path: dist/dlna-tv-sim-macos-app.zip
-          if-no-files-found: error
-
+  # macOS .app 由 scripts/package-macos-app.sh 本地打包、公证后手动上传；
+  # CI 不再跑这个必失败的可选 macOS runner job。
   windows-app:
     name: Windows app bundle
     if: startsWith(github.ref, 'refs/tags/v')

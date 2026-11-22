@@ -100,7 +100,7 @@
 `-player native` 会启用进程内的自研播放核心，不依赖外部 mpv/VLC：FFmpeg(LGPL) 解封装、VideoToolbox 硬解、AVSampleBufferDisplayLayer 显示、AVAudioEngine 出声，音频时钟对时；播放器控件也是自绘的（进度、音量、倍速、音轨、字幕、比例、全屏、自动隐藏、快捷键）。
 
 - macOS：mp4/mkv/HLS（TS、fMP4、AES-128）、H.264/HEVC 硬解、AAC/AC3/MP3、SRT/ASS 文本字幕、多音轨、倍速 0.5–2×、画面比例、循环、截图。
-- Windows：FFmpeg 软解 + SDL2（D3D11 渲染）+ WASAPI 音频，音频时钟对时，自绘进度/音量/全屏控件；支持 mp4/mkv/HLS、H.264/HEVC/AV1 软解、AAC/AC3/MP3、多音轨、seek/暂停/倍速/音量/全屏/截图。需要包里自带的 `SDL2.dll`、`avcodec-63.dll`、`avformat-63.dll`、`avutil-61.dll`、`swresample-7.dll`、`swscale-10.dll`。
+- Windows：FFmpeg 软解 + SDL2（D3D11 渲染）+ WASAPI 音频，音频时钟对时，起播首帧后再开声、seek 立即定位，自绘控制条（标题/设备、进度/时间、播放/±10s、音量、倍速/音轨/比例菜单、截图、全屏）；支持 mp4/mkv/HLS、H.264/HEVC/AV1 软解、AAC/AC3/MP3、多音轨、seek/暂停/倍速/音量/全屏/截图。需要包里自带的 `SDL2.dll`、`avcodec-63.dll`、`avformat-63.dll`、`avutil-61.dll`、`swresample-7.dll`、`swscale-10.dll`。
 - 默认仍是 mpv；native 是可选引擎，遇到打不开的源会自动回退 mpv。
 - 限制：macOS 的 ASS 只渲染文本（字体/定位/特效不还原），本地 HLS fMP4 起播约 5 秒（HTTP 正常）；Windows 目前是软解，字幕轨只枚举不渲染，倍速用重采样实现会有音调变化；Linux 暂无 native，会回退 mpv。
 - 打包：`scripts/build-native-deps.sh` 构建 LGPL FFmpeg，`scripts/package-macos-app.sh` 会把 dylib 嵌进 App（体积约 +5MB）。Windows 用 `scripts/fetch-win-deps.sh` 下载 SDL2/FFmpeg，`scripts/build-windows-native.sh` 交叉编译并把 DLL 摊进包。许可义务见 `third_party/README.md`。

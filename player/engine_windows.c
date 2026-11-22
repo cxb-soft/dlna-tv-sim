@@ -25,8 +25,19 @@
 #include <string.h>
 #include <stdarg.h>
 #include <math.h>
+#include <time.h>
 
 #include <SDL.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -63,14 +74,36 @@ typedef struct PeFrameNode {
 } PeFrameNode;
 
 typedef struct PeLayout {
-    int W, H, hb, py;
-    SDL_Rect play;
-    SDL_Rect barhit;
-    SDL_Rect volhit;
-    SDL_Rect fullhit;
+    int W, H;
+    double ui;
+    int top_h, bottom_y;
+    SDL_Rect play, back, fwd, mute, volume, volume_hit;
+    SDL_Rect speed, audio, sub, aspect, shot, full, close;
+    SDL_Rect progress_hit;
     int bar_x, bar_y, bar_w, bar_h;
-    int time_x, time_y, time_scale;
+    int time_x, time_y, dur_x, dur_y;
+    int title_x, title_y, device_x, device_y;
+    int meta_y, row_y;
 } PeLayout;
+
+#define PE_TEXT_CACHE 32
+
+typedef struct PeTextCache {
+    SDL_Texture *tex;
+    int w, h, px, weight;
+    unsigned used;
+    char text[192];
+} PeTextCache;
+
+enum {
+    PE_CTL_NONE = 0, PE_CTL_PLAY, PE_CTL_BACK, PE_CTL_FWD, PE_CTL_PROGRESS,
+    PE_CTL_MUTE, PE_CTL_VOLUME, PE_CTL_SPEED, PE_CTL_AUDIO, PE_CTL_SUB,
+    PE_CTL_ASPECT, PE_CTL_SHOT, PE_CTL_FULL, PE_CTL_CLOSE
+};
+
+enum {
+    PE_MENU_NONE = 0, PE_MENU_SPEED, PE_MENU_AUDIO, PE_MENU_SUB, PE_MENU_ASPECT
+};
 
 struct PePlayer {
     SDL_Window *win;
@@ -104,8 +137,12 @@ struct PePlayer {
     double drift_hist[120];
     int drift_hn, drift_hi;
     double first_frame_ms;
+    double first_audio_ms;
     double open_t0;
     double last_seek_ms;
+    double seek_request_t0, seek_target;
+    int seek_first_frame_logged;
+    int64_t audio_dropped_bytes;
     double discard_before;
 
     char url[2048];
@@ -124,6 +161,7 @@ struct PePlayer {
 
     volatile int stop, run_stop, closed, paused, ended, eof, io_error, buffering;
     volatile int seek_req, switch_audio_req;
+    volatile int video_primed, seeking;
     double seek_pos;
 
     double clock_base;       /* 音频时钟基准（媒体秒） */
@@ -138,11 +176,21 @@ struct PePlayer {
 
     double last_read_ok;
 
-    int show_controls, dragging;
-    double drag_frac;
+    int show_controls, dragging, vol_drag;
+    int hover_ctl, menu, menu_sel;
+    double drag_frac, hover_frac;
     double hide_at;
     int mouse_x, mouse_y;
     int win_w, win_h;
+    char toast[256];
+    int toast_error;
+    double toast_until;
+    int shot_busy;
+    char debug_capture_path[600];
+    volatile int debug_capture_req;
+    PeTextCache text_cache[PE_TEXT_CACHE];
+    unsigned text_tick;
+    double spinner_phase;
 
     PeTrackInfo *atracks;
     int natracks;
@@ -216,6 +264,8 @@ static int pe_ring_len(PePlayer *p) {
 /* 媒体时钟：有音频且已启动时以音频已播放采样为准，否则用墙钟。 */
 static double pe_clock(PePlayer *p) {
     if (p->paused) return p->clock_paused;
+    /* 起播/seek 后首帧未出：位置钉在目标，不让音频/墙钟先跑。 */
+    if (p->seeking || (p->has_video && !p->video_primed)) return p->clock_base;
     double pos;
     if (p->has_audio && p->audio_started && p->adev) {
         pos = p->clock_base +
@@ -285,6 +335,7 @@ static void SDLCALL pe_audio_cb(void *userdata, Uint8 *stream, int len) {
     PePlayer *p = (PePlayer *)userdata;
     SDL_memset(stream, 0, (size_t)len);
     if (!p || p->stop || p->paused) return;
+    if (p->seeking) return;
     int n = (int)p->ring_len;
     if (n > len) n = len;
     n -= n % (PE_AUDIO_CHANNELS * 2);
@@ -309,6 +360,10 @@ static void SDLCALL pe_audio_cb(void *userdata, Uint8 *stream, int len) {
     p->ring_read = r;
     p->ring_len -= (size_t)n;
     p->audio_played += n / (PE_AUDIO_CHANNELS * 2);
+    if (p->first_audio_ms <= 0) {
+        p->first_audio_ms = (pe_now() - p->open_t0) * 1000.0;
+        PE_LOG("首音频 %.0fms（首视频 %.0fms）", p->first_audio_ms, p->first_frame_ms);
+    }
 }
 
 /* ---------- 队列 / 缓冲 ---------- */
@@ -455,7 +510,7 @@ static int pe_append_audio(PePlayer *p, const uint8_t *data, int bytes, double p
         SDL_LockAudioDevice(p->adev);
         size_t space = p->ring_cap - p->ring_len;
         if (space >= (size_t)bytes) {
-            if (!p->audio_started) {
+            if (!p->audio_started && (!p->has_video || p->video_primed)) {
                 double base = pts;
                 if (p->has_audio_hint) {
                     if (fabs(pts - p->audio_base_hint) > 0.15) base = p->audio_base_hint;
@@ -466,7 +521,9 @@ static int pe_append_audio(PePlayer *p, const uint8_t *data, int bytes, double p
                 p->clock_mono_base = base;
                 p->mono_wall_base = pe_now();
                 p->audio_started = 1;
+                p->seeking = 0;
                 if (!p->has_video) p->buffering = 0;
+                if (!p->paused) SDL_PauseAudioDevice(p->adev, 0);
             }
             size_t w = (p->ring_read + p->ring_len) % p->ring_cap;
             size_t first = p->ring_cap - w;
@@ -479,6 +536,11 @@ static int pe_append_audio(PePlayer *p, const uint8_t *data, int bytes, double p
         }
         SDL_UnlockAudioDevice(p->adev);
         if (p->seek_req || p->switch_audio_req) return 0;
+        /* 视频队列见底时优先让解复用继续走；宁可丢这包音频，避免黑屏/seek 卡住。 */
+        if (p->has_video && (!p->video_primed || p->fcount < 4)) {
+            p->audio_dropped_bytes += bytes;
+            return 0;
+        }
         SDL_Delay(5);
     }
     return -1;
@@ -537,6 +599,14 @@ static void pe_do_seek(PePlayer *p, double target) {
     if (p->duration > 0 && target > p->duration) target = p->duration;
     if (target < 0) target = 0;
     double t0 = pe_now();
+    p->video_primed = p->has_video ? 0 : 1;
+    p->seeking = 1;
+    p->audio_started = 0;
+    if (p->adev) SDL_PauseAudioDevice(p->adev, 1);
+    p->seek_target = target;
+    if (p->seek_request_t0 <= 0) p->seek_request_t0 = pe_now();
+    p->seek_first_frame_logged = 0;
+
     int64_t ts = (int64_t)((target + (double)p->start_offset / AV_TIME_BASE) * AV_TIME_BASE);
     if (av_seek_frame(p->fmt, -1, ts, AVSEEK_FLAG_BACKWARD) < 0) {
         PE_LOG("seek %.2f 失败", target);
@@ -572,6 +642,7 @@ static void pe_do_seek(PePlayer *p, double target) {
     }
     p->last_seek_ms = (pe_now() - t0) * 1000.0;
     p->last_read_ok = pe_now();
+    PE_LOG("seek %.2f 完成 %.0fms", target, p->last_seek_ms);
 }
 
 static int pe_open_audio_codec(PePlayer *p, int id) {
@@ -622,6 +693,7 @@ static int pe_interrupt_cb(void *opaque) {
     PePlayer *p = (PePlayer *)opaque;
     if (!p) return 0;
     if (p->stop || p->run_stop) return 1;
+    if (p->seek_req || p->switch_audio_req) return 1;
     if (p->last_read_ok > 0 && pe_now() - p->last_read_ok > 20.0) return 1;
     return 0;
 }
@@ -743,7 +815,7 @@ static int SDLCALL pe_media_thread(void *ud) {
         if (p->ended) { SDL_Delay(10); continue; }
 
         if (p->has_video && pe_queue_count(p) >= PE_MAX_FRAMES) { SDL_Delay(4); continue; }
-        if (p->has_audio && p->adev) {
+        if (p->has_audio && p->adev && p->video_primed && p->fcount >= 4) {
             int al = pe_ring_len(p);
             if ((size_t)al > p->ring_cap * 3 / 4) { SDL_Delay(4); continue; }
         }
@@ -934,8 +1006,8 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
                         p->adev = 0;
                         p->ring_cap = 0;
                     } else {
-                        /* SDL 音频设备默认是暂停的，必须显式开声。 */
-                        SDL_PauseAudioDevice(p->adev, 0);
+                        /* 有视频时等首帧显示再开声；纯音频立即开声。 */
+                        SDL_PauseAudioDevice(p->adev, p->has_video ? 1 : 0);
                     }
                 }
             }
@@ -953,15 +1025,18 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
         goto fail;
     }
     p->buffering = 1;
-
+    p->video_primed = p->has_video ? 0 : 1;
+    p->clock_base = p->start_position;
+    p->clock_samples_base = p->audio_played;
+    p->clock_mono_base = p->start_position;
+    p->mono_wall_base = pe_now();
+    p->clock_paused = p->start_position;
+    p->seeking = p->start_position > 0 ? 1 : 0;
+    p->seek_target = p->start_position;
+    p->seek_request_t0 = p->start_position > 0 ? pe_now() : 0;
     if (p->start_position > 0) {
         p->seek_req = 1;
         p->seek_pos = p->start_position;
-    }
-    if (!p->has_audio) {
-        p->clock_base = p->start_position;
-        p->clock_mono_base = p->start_position;
-        p->mono_wall_base = pe_now();
     }
 
     p->th = SDL_CreateThread(pe_media_thread, "pe-media", p);
@@ -1010,7 +1085,8 @@ void pe_play(PePlayer *p) {
     p->clock_samples_base = p->audio_played;
     p->clock_mono_base = p->clock_paused;
     p->mono_wall_base = pe_now();
-    if (p->adev) SDL_PauseAudioDevice(p->adev, 0);
+    if (p->adev && (!p->has_video || p->video_primed))
+        SDL_PauseAudioDevice(p->adev, 0);
 }
 
 void pe_pause(PePlayer *p) {
@@ -1053,9 +1129,35 @@ void pe_stop(PePlayer *p) {
 
 void pe_seek(PePlayer *p, double seconds) {
     if (!p) return;
-    p->seek_pos = seconds;
+    double target = seconds;
+    if (p->duration > 0 && target > p->duration) target = p->duration;
+    if (target < 0) target = 0;
+    p->seek_pos = target;
+    p->seek_target = target;
+    p->seek_request_t0 = pe_now();
+    p->seek_first_frame_logged = 0;
     p->seek_req = 1;
+    p->seeking = 1;
+    p->video_primed = p->has_video ? 0 : 1;
     p->ended = 0;
+    p->eof = 0;
+    p->io_error = 0;
+    p->buffering = 1;
+    p->audio_started = 0;
+    p->clock_base = target;
+    p->clock_samples_base = p->audio_played;
+    p->clock_mono_base = target;
+    p->mono_wall_base = pe_now();
+    p->clock_paused = target;
+    p->video_pts = target;
+    p->discard_before = target - 0.05;
+    if (p->discard_before < 0) p->discard_before = 0;
+    p->audio_base_hint = target;
+    p->has_audio_hint = p->has_audio ? 1 : 0;
+    if (p->adev) SDL_PauseAudioDevice(p->adev, 1);
+    pe_clear_frames(p);
+    pe_clear_ring(p);
+    PE_LOG("seek 请求 %.2f", target);
 }
 
 void pe_seek_relative(PePlayer *p, double delta) {
@@ -1297,6 +1399,159 @@ int pe_screenshot(PePlayer *p, const char *path, char *errbuf, int errlen) {
 
 /* ---------- 主线程：渲染与事件 ---------- */
 
+#define PE_PI 3.14159265358979323846
+#ifndef FW_SEMIBOLD
+#define FW_SEMIBOLD 600
+#endif
+#ifndef FW_NORMAL
+#define FW_NORMAL 400
+#endif
+
+static const uint32_t kUiBg = 0x0E1014;
+static const uint32_t kUiPanel = 0x121418;
+static const uint32_t kUiPanelAlt = 0x171A1F;
+static const uint32_t kUiText = 0xE9EBEF;
+static const uint32_t kUiTextDim = 0x9AA1AC;
+static const uint32_t kUiAmber = 0xEBB15D;
+static const uint32_t kUiAccentTop = 0xF2C27C;
+static const uint32_t kUiAccentBottom = 0xD99447;
+static const uint32_t kUiRed = 0xF0655E;
+
+static SDL_Color pe_col(uint32_t rgb, Uint8 a) {
+    SDL_Color c;
+    c.r = (Uint8)((rgb >> 16) & 255);
+    c.g = (Uint8)((rgb >> 8) & 255);
+    c.b = (Uint8)(rgb & 255);
+    c.a = a;
+    return c;
+}
+
+static void pe_setc(SDL_Renderer *r, SDL_Color c) {
+    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
+}
+
+static void pe_fill(SDL_Renderer *r, SDL_Rect rc, SDL_Color c) {
+    pe_setc(r, c);
+    SDL_RenderFillRect(r, &rc);
+}
+
+static void pe_fill_circle(SDL_Renderer *r, int cx, int cy, int rad, SDL_Color c) {
+    if (rad <= 0) return;
+    pe_setc(r, c);
+    for (int y = -rad; y <= rad; y++) {
+        int w = (int)sqrt((double)(rad * rad - y * y));
+        SDL_RenderDrawLine(r, cx - w, cy + y, cx + w, cy + y);
+    }
+}
+
+static void pe_fill_round(SDL_Renderer *r, SDL_Rect rc, int rad, SDL_Color c) {
+    if (rc.w <= 0 || rc.h <= 0) return;
+    if (rad * 2 > rc.w) rad = rc.w / 2;
+    if (rad * 2 > rc.h) rad = rc.h / 2;
+    if (rad <= 0) { pe_fill(r, rc, c); return; }
+    pe_fill(r, (SDL_Rect){rc.x + rad, rc.y, rc.w - 2 * rad, rc.h}, c);
+    pe_fill(r, (SDL_Rect){rc.x, rc.y + rad, rc.w, rc.h - 2 * rad}, c);
+    pe_fill_circle(r, rc.x + rad, rc.y + rad, rad, c);
+    pe_fill_circle(r, rc.x + rc.w - rad - 1, rc.y + rad, rad, c);
+    pe_fill_circle(r, rc.x + rad, rc.y + rc.h - rad - 1, rad, c);
+    pe_fill_circle(r, rc.x + rc.w - rad - 1, rc.y + rc.h - rad - 1, rad, c);
+}
+
+static void pe_draw_arc(SDL_Renderer *r, int cx, int cy, int rad, double a0, double a1,
+                        SDL_Color c, int thick) {
+    pe_setc(r, c);
+    int steps = (int)(fabs(a1 - a0) * rad / 2.0) + 8;
+    if (thick < 1) thick = 1;
+    int lo = -(thick / 2), hi = thick / 2;
+    for (int i = 0; i <= steps; i++) {
+        double a = a0 + (a1 - a0) * (double)i / (double)steps;
+        int x = cx + (int)(cos(a) * (double)rad);
+        int y = cy + (int)(sin(a) * (double)rad);
+        for (int dx = lo; dx <= hi; dx++)
+            for (int dy = lo; dy <= hi; dy++)
+                SDL_RenderDrawPoint(r, x + dx, y + dy);
+    }
+}
+
+static void pe_stroke_round(SDL_Renderer *r, SDL_Rect rc, int rad, SDL_Color c, int thick) {
+    if (rc.w <= 0 || rc.h <= 0) return;
+    if (rad * 2 > rc.w) rad = rc.w / 2;
+    if (rad * 2 > rc.h) rad = rc.h / 2;
+    if (rad < 2) rad = 2;
+    pe_setc(r, c);
+    for (int i = 0; i < thick; i++) {
+        int y0 = rc.y + i, y1 = rc.y + rc.h - 1 - i;
+        int x0 = rc.x + i, x1 = rc.x + rc.w - 1 - i;
+        SDL_RenderDrawLine(r, rc.x + rad, y0, rc.x + rc.w - rad, y0);
+        SDL_RenderDrawLine(r, rc.x + rad, y1, rc.x + rc.w - rad, y1);
+        SDL_RenderDrawLine(r, x0, rc.y + rad, x0, rc.y + rc.h - rad);
+        SDL_RenderDrawLine(r, x1, rc.y + rad, x1, rc.y + rc.h - rad);
+    }
+    pe_draw_arc(r, rc.x + rad, rc.y + rad, rad, PE_PI, 1.5 * PE_PI, c, thick);
+    pe_draw_arc(r, rc.x + rc.w - rad - 1, rc.y + rad, rad, -0.5 * PE_PI, 0, c, thick);
+    pe_draw_arc(r, rc.x + rc.w - rad - 1, rc.y + rc.h - rad - 1, rad, 0, 0.5 * PE_PI, c, thick);
+    pe_draw_arc(r, rc.x + rad, rc.y + rc.h - rad - 1, rad, 0.5 * PE_PI, PE_PI, c, thick);
+}
+
+static void pe_fill_tri(SDL_Renderer *r, float x1, float y1, float x2, float y2,
+                        float x3, float y3, SDL_Color c) {
+    SDL_Vertex v[3];
+    v[0].position = (SDL_FPoint){x1, y1};
+    v[1].position = (SDL_FPoint){x2, y2};
+    v[2].position = (SDL_FPoint){x3, y3};
+    v[0].color = c;
+    v[1].color = c;
+    v[2].color = c;
+    v[0].tex_coord = (SDL_FPoint){0, 0};
+    v[1].tex_coord = (SDL_FPoint){0, 0};
+    v[2].tex_coord = (SDL_FPoint){0, 0};
+    SDL_RenderGeometry(r, NULL, v, 3, NULL, 0);
+}
+
+static void pe_hgrad(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c0, SDL_Color c1) {
+    if (w <= 0 || h <= 0) return;
+    for (int i = 0; i < w; i++) {
+        double t = w > 1 ? (double)i / (double)(w - 1) : 0;
+        SDL_Color c;
+        c.r = (Uint8)(c0.r + (c1.r - c0.r) * t);
+        c.g = (Uint8)(c0.g + (c1.g - c0.g) * t);
+        c.b = (Uint8)(c0.b + (c1.b - c0.b) * t);
+        c.a = (Uint8)(c0.a + (c1.a - c0.a) * t);
+        SDL_Rect px = {x + i, y, 1, h};
+        pe_fill(r, px, c);
+    }
+}
+
+static void pe_vgrad(SDL_Renderer *r, int x, int y, int w, int h, Uint8 a0, Uint8 a1) {
+    if (w <= 0 || h <= 0) return;
+    SDL_Color c = {0, 0, 0, 0};
+    for (int i = 0; i < h; i++) {
+        double t = h > 1 ? (double)i / (double)(h - 1) : 0;
+        c.a = (Uint8)(a0 + (a1 - a0) * t);
+        SDL_Rect line = {x, y + i, w, 1};
+        pe_fill(r, line, c);
+    }
+}
+
+/* ---------- 文本：Windows 用 GDI 画中文，本机自测退回 5x7 点阵 ---------- */
+
+static void pe_utf8_copy(char *dst, size_t n, const char *src) {
+    if (!dst || n == 0) return;
+    size_t o = 0;
+    const unsigned char *q = (const unsigned char *)(src ? src : "");
+    while (*q) {
+        int len = 1;
+        if ((*q & 0xE0) == 0xC0) len = 2;
+        else if ((*q & 0xF0) == 0xE0) len = 3;
+        else if ((*q & 0xF8) == 0xF0) len = 4;
+        if (o + (size_t)len >= n) break;
+        memcpy(dst + o, q, (size_t)len);
+        o += (size_t)len;
+        q += len;
+    }
+    dst[o] = 0;
+}
+
 static int pe_glyph_index(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c == ':') return 10;
@@ -1323,70 +1578,232 @@ static const uint8_t kGlyphs[14][7] = {
     {0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00},
 };
 
-static void pe_draw_text(SDL_Renderer *r, int x, int y, const char *s, int scale,
-                         Uint8 cr, Uint8 cg, Uint8 cb, Uint8 ca) {
-    SDL_SetRenderDrawColor(r, cr, cg, cb, ca);
-    for (const char *q = s; *q; q++) {
-        int gi = pe_glyph_index(*q);
-        if (gi < 0) { x += 6 * scale; continue; }
-        for (int row = 0; row < 7; row++) {
-            uint8_t bits = kGlyphs[gi][row];
-            for (int col = 0; col < 5; col++) {
-                if (bits & (1u << (4 - col))) {
-                    SDL_Rect px = {x + col * scale, y + row * scale, scale, scale};
-                    SDL_RenderFillRect(r, &px);
+#ifdef _WIN32
+static SDL_Texture *pe_text_render_gdi(PePlayer *p, const char *text, int px, int weight,
+                                       int *out_w, int *out_h) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    if (wlen <= 1) return NULL;
+    wchar_t *wt = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
+    if (!wt) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wt, wlen);
+
+    HDC screen = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(screen);
+    if (!dc) { ReleaseDC(NULL, screen); free(wt); return NULL; }
+    HFONT font = CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    if (!font) { DeleteDC(dc); ReleaseDC(NULL, screen); free(wt); return NULL; }
+    HGDIOBJ old_font = SelectObject(dc, font);
+    SIZE sz;
+    memset(&sz, 0, sizeof(sz));
+    GetTextExtentPoint32W(dc, wt, wlen - 1, &sz);
+    int w = sz.cx + 8;
+    int h = sz.cy + 8;
+    if (w < 8) w = 8;
+    if (h < 8) h = 8;
+
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HGDIOBJ old_bmp = SelectObject(dc, bmp);
+    if (!bmp || !bits) {
+        SelectObject(dc, old_bmp);
+        DeleteObject(bmp);
+        SelectObject(dc, old_font);
+        DeleteObject(font);
+        DeleteDC(dc);
+        ReleaseDC(NULL, screen);
+        free(wt);
+        return NULL;
+    }
+    memset(bits, 0, (size_t)w * (size_t)h * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    TextOutW(dc, 4, 4, wt, wlen - 1);
+
+    uint32_t *src = (uint32_t *)bits;
+    uint32_t *argb = (uint32_t *)malloc((size_t)w * (size_t)h * 4);
+    SDL_Texture *tex = NULL;
+    if (argb) {
+        for (int i = 0; i < w * h; i++) {
+            uint32_t v = src[i];
+            int b = (int)(v & 255);
+            int g = (int)((v >> 8) & 255);
+            int r = (int)((v >> 16) & 255);
+            int a = (r + g + b) / 3;
+            argb[i] = ((uint32_t)a << 24) | 0x00FFFFFFu;
+        }
+        tex = SDL_CreateTexture(p->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
+        if (tex) {
+            SDL_UpdateTexture(tex, NULL, argb, w * 4);
+            SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        }
+        free(argb);
+    }
+
+    SelectObject(dc, old_bmp);
+    DeleteObject(bmp);
+    SelectObject(dc, old_font);
+    DeleteObject(font);
+    DeleteDC(dc);
+    ReleaseDC(NULL, screen);
+    free(wt);
+    if (tex) {
+        *out_w = w;
+        *out_h = h;
+    }
+    return tex;
+}
+#endif
+
+static SDL_Texture *pe_text_render_bitmap(PePlayer *p, const char *text, int px,
+                                          int *out_w, int *out_h) {
+    int scale = px / 10;
+    if (scale < 1) scale = 1;
+    int len = (int)strlen(text);
+    if (len <= 0) return NULL;
+    int w = len * 6 * scale;
+    int h = 7 * scale;
+    uint32_t *pix = (uint32_t *)calloc((size_t)w * (size_t)h, 4);
+    if (!pix) return NULL;
+    int x = 0, drawn = 0;
+    const unsigned char *q = (const unsigned char *)text;
+    while (*q) {
+        int glen = 1;
+        if ((*q & 0xE0) == 0xC0) glen = 2;
+        else if ((*q & 0xF0) == 0xE0) glen = 3;
+        else if ((*q & 0xF8) == 0xF0) glen = 4;
+        if (glen > 1 || *q >= 0x80) {
+            q += glen;
+            x += 6 * scale;
+            continue;
+        }
+        int gi = pe_glyph_index((char)*q);
+        if (gi >= 0) {
+            for (int row = 0; row < 7; row++) {
+                uint8_t bits = kGlyphs[gi][row];
+                for (int col = 0; col < 5; col++) {
+                    if (bits & (1u << (4 - col))) {
+                        for (int yy = 0; yy < scale; yy++)
+                            for (int xx = 0; xx < scale; xx++)
+                                pix[(row * scale + yy) * w + x + col * scale + xx] = 0xFFFFFFFFu;
+                    }
                 }
             }
+            drawn = 1;
         }
         x += 6 * scale;
+        q++;
     }
-}
-
-static void pe_draw_speaker(SDL_Renderer *r, int x, int y, int size, Uint8 cr, Uint8 cg, Uint8 cb) {
-    SDL_SetRenderDrawColor(r, cr, cg, cb, 255);
-    SDL_Rect body = {x, y + size / 3, size / 4, size / 3};
-    SDL_RenderFillRect(r, &body);
-    for (int i = 0; i < size / 2; i++) {
-        int h = (size / 3) + (size / 2 - i) * 2;
-        int cy = y + size / 2;
-        SDL_RenderDrawLine(r, x + size / 4 + i, cy - h / 2, x + size / 4 + i, cy + h / 2);
+    if (!drawn) {
+        free(pix);
+        return NULL;
     }
+    SDL_Texture *tex = SDL_CreateTexture(p->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (tex) {
+        SDL_UpdateTexture(tex, NULL, pix, w * 4);
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        *out_w = w;
+        *out_h = h;
+    }
+    free(pix);
+    return tex;
 }
 
-static void pe_draw_fullscreen_icon(SDL_Renderer *r, int x, int y, int size) {
-    SDL_SetRenderDrawColor(r, 255, 255, 255, 235);
-    int L = size / 3;
-    SDL_RenderDrawLine(r, x, y, x + L, y);
-    SDL_RenderDrawLine(r, x, y, x, y + L);
-    SDL_RenderDrawLine(r, x + size, y, x + size - L, y);
-    SDL_RenderDrawLine(r, x + size, y, x + size, y + L);
-    SDL_RenderDrawLine(r, x, y + size, x + L, y + size);
-    SDL_RenderDrawLine(r, x, y + size, x, y + size - L);
-    SDL_RenderDrawLine(r, x + size, y + size, x + size - L, y + size);
-    SDL_RenderDrawLine(r, x + size, y + size, x + size, y + size - L);
-}
-
-static void pe_draw_play_icon(SDL_Renderer *r, int x, int y, int size, int paused) {
-    SDL_SetRenderDrawColor(r, 255, 255, 255, 240);
-    if (paused) {
-        for (int i = 0; i < size; i++) {
-            int h = size - abs(i * 2 - size) * 2;
-            if (h < 1) h = 1;
-            SDL_RenderDrawLine(r, x + i, y + (size - h) / 2, x + i, y + (size + h) / 2);
+static void pe_text_cache_clear(PePlayer *p) {
+    if (!p) return;
+    for (int i = 0; i < PE_TEXT_CACHE; i++) {
+        if (p->text_cache[i].tex) {
+            SDL_DestroyTexture(p->text_cache[i].tex);
+            p->text_cache[i].tex = NULL;
         }
-    } else {
-        SDL_Rect a = {x + 2, y + 2, size / 3, size - 4};
-        SDL_Rect b = {x + 2 + size / 3 + 3, y + 2, size / 3, size - 4};
-        SDL_RenderFillRect(r, &a);
-        SDL_RenderFillRect(r, &b);
+        p->text_cache[i].text[0] = 0;
+        p->text_cache[i].w = p->text_cache[i].h = 0;
+        p->text_cache[i].used = 0;
     }
 }
 
-static void pe_draw_circle(SDL_Renderer *r, int cx, int cy, int radius) {
-    for (int y = -radius; y <= radius; y++) {
-        int w = (int)sqrt((double)(radius * radius - y * y));
-        SDL_RenderDrawLine(r, cx - w, cy + y, cx + w, cy + y);
+static SDL_Texture *pe_text_texture(PePlayer *p, const char *text, int px, int weight,
+                                    int *out_w, int *out_h) {
+    if (!p || !p->ren || !text || !text[0] || px < 6) return NULL;
+    char clipped[192];
+    pe_utf8_copy(clipped, sizeof(clipped), text);
+    if (!clipped[0]) return NULL;
+    for (int i = 0; i < PE_TEXT_CACHE; i++) {
+        PeTextCache *c = &p->text_cache[i];
+        if (c->tex && c->px == px && c->weight == weight && strcmp(c->text, clipped) == 0) {
+            c->used = ++p->text_tick;
+            *out_w = c->w;
+            *out_h = c->h;
+            return c->tex;
+        }
     }
+    int slot = -1;
+    unsigned oldest = 0xFFFFFFFFu;
+    for (int i = 0; i < PE_TEXT_CACHE; i++) {
+        if (!p->text_cache[i].tex) { slot = i; break; }
+        if (p->text_cache[i].used < oldest) { oldest = p->text_cache[i].used; slot = i; }
+    }
+    if (slot < 0) return NULL;
+    PeTextCache *c = &p->text_cache[slot];
+    if (c->tex) { SDL_DestroyTexture(c->tex); c->tex = NULL; }
+    int w = 0, h = 0;
+    SDL_Texture *tex = NULL;
+#ifdef _WIN32
+    tex = pe_text_render_gdi(p, clipped, px, weight, &w, &h);
+#endif
+    if (!tex) tex = pe_text_render_bitmap(p, clipped, px, &w, &h);
+    if (!tex) return NULL;
+    c->tex = tex;
+    c->w = w;
+    c->h = h;
+    c->px = px;
+    c->weight = weight;
+    c->used = ++p->text_tick;
+    pe_utf8_copy(c->text, sizeof(c->text), clipped);
+    *out_w = w;
+    *out_h = h;
+    return tex;
+}
+
+static int pe_text_width(PePlayer *p, const char *text, int px, int weight) {
+    int w = 0, h = 0;
+    if (!pe_text_texture(p, text, px, weight, &w, &h)) return 0;
+    return w;
+}
+
+static void pe_blit_text(PePlayer *p, SDL_Texture *tex, int x, int y, SDL_Color c) {
+    SDL_SetTextureColorMod(tex, c.r, c.g, c.b);
+    SDL_SetTextureAlphaMod(tex, c.a);
+    SDL_Rect dst = {x, y, 0, 0};
+    SDL_QueryTexture(tex, NULL, NULL, &dst.w, &dst.h);
+    SDL_RenderCopy(p->ren, tex, NULL, &dst);
+    SDL_SetTextureColorMod(tex, 255, 255, 255);
+    SDL_SetTextureAlphaMod(tex, 255);
+}
+
+static void pe_draw_text(PePlayer *p, const char *text, int x, int y, int px, int weight,
+                         SDL_Color c, int align, int shadow) {
+    int w = 0, h = 0;
+    SDL_Texture *tex = pe_text_texture(p, text, px, weight, &w, &h);
+    if (!tex) return;
+    if (align == 1) x -= w;
+    else if (align == 2) x -= w / 2;
+    if (shadow) {
+        SDL_SetTextureColorMod(tex, 0, 0, 0);
+        SDL_SetTextureAlphaMod(tex, 120);
+        SDL_Rect d = {x + 1, y + 2, w, h};
+        SDL_RenderCopy(p->ren, tex, NULL, &d);
+    }
+    pe_blit_text(p, tex, x, y, c);
 }
 
 static void pe_fmt_time(char *buf, size_t n, double sec) {
@@ -1394,54 +1811,398 @@ static void pe_fmt_time(char *buf, size_t n, double sec) {
     int t = (int)(sec + 0.5);
     int h = t / 3600, m = (t % 3600) / 60, s = t % 60;
     if (h > 0) snprintf(buf, n, "%d:%02d:%02d", h, m, s);
-    else snprintf(buf, n, "%02d:%02d", m, s);
+    else snprintf(buf, n, "%d:%02d", m, s);
 }
+
+static void pe_speed_label(double v, char *buf, size_t n) {
+    if (fabs(v - 1.0) < 0.01) snprintf(buf, n, "1.0×");
+    else snprintf(buf, n, "%.3g×", v);
+}
+
+/* ---------- 图标 ---------- */
+
+static void pe_icon_play(SDL_Renderer *r, SDL_Rect rc, SDL_Color c, int paused) {
+    int pad = rc.w / 5;
+    if (rc.w <= 0 || rc.h <= 0) return;
+    if (paused) {
+        pe_fill_tri(r, (float)(rc.x + pad), (float)(rc.y + pad),
+                    (float)(rc.x + rc.w - pad), (float)(rc.y + rc.h / 2),
+                    (float)(rc.x + pad), (float)(rc.y + rc.h - pad), c);
+    } else {
+        int bw = (int)(rc.w * 0.24);
+        int gap = (int)(rc.w * 0.14);
+        pe_fill_round(r, (SDL_Rect){rc.x + pad, rc.y + pad, bw, rc.h - 2 * pad}, 2, c);
+        pe_fill_round(r, (SDL_Rect){rc.x + pad + bw + gap, rc.y + pad, bw, rc.h - 2 * pad}, 2, c);
+    }
+}
+
+static void pe_icon_seek(SDL_Renderer *r, SDL_Rect rc, int forward, SDL_Color c) {
+    int cx = rc.x + rc.w / 2, cy = rc.y + rc.h / 2;
+    int rad = rc.w / 2 - 3;
+    if (rad < 4) rad = 4;
+    double a0 = forward ? 0.6 : PE_PI - 0.6;
+    double a1 = forward ? 2.0 * PE_PI - 0.6 : PE_PI + 0.6;
+    pe_draw_arc(r, cx, cy, rad, a0, a1, c, 2);
+    double ae = forward ? a1 : a0;
+    int ax = cx + (int)(cos(ae) * (double)rad);
+    int ay = cy + (int)(sin(ae) * (double)rad);
+    int d = 5;
+    if (forward)
+        pe_fill_tri(r, (float)ax, (float)(ay - d), (float)(ax + d), (float)ay,
+                    (float)(ax - d / 2), (float)(ay + d), c);
+    else
+        pe_fill_tri(r, (float)ax, (float)(ay - d), (float)(ax - d), (float)ay,
+                    (float)(ax + d / 2), (float)(ay + d), c);
+}
+
+static void pe_icon_speaker(SDL_Renderer *r, SDL_Rect rc, int muted, SDL_Color c) {
+    int x = rc.x + rc.w / 5, y = rc.y + rc.h / 5;
+    int w = rc.w - 2 * (rc.w / 5), h = rc.h - 2 * (rc.h / 5);
+    SDL_Rect body = {x, y + h / 3, w / 4, h / 3};
+    pe_fill(r, body, c);
+    pe_fill_tri(r, (float)(x + w / 4), (float)(y + h / 3),
+                (float)(x + w * 0.58f), (float)y,
+                (float)(x + w * 0.58f), (float)(y + h), c);
+    if (muted) {
+        pe_setc(r, c);
+        for (int i = 0; i < 2; i++) {
+            SDL_RenderDrawLine(r, x + (int)(w * 0.62f), y + (int)(h * 0.25f) + i,
+                               x + w - 1, y + (int)(h * 0.75f) + i);
+            SDL_RenderDrawLine(r, x + w - 1, y + (int)(h * 0.25f) + i,
+                               x + (int)(w * 0.62f), y + (int)(h * 0.75f) + i);
+        }
+    } else {
+        pe_draw_arc(r, x + (int)(w * 0.60f), y + h / 2, (int)(w * 0.22f), -0.8, 0.8, c, 2);
+        pe_draw_arc(r, x + (int)(w * 0.60f), y + h / 2, (int)(w * 0.38f), -0.8, 0.8, c, 2);
+    }
+}
+
+static void pe_icon_fullscreen(SDL_Renderer *r, SDL_Rect rc, int on, SDL_Color c) {
+    int x = rc.x + rc.w / 4, y = rc.y + rc.h / 4;
+    int w = rc.w / 2, h = rc.h / 2, L = 5;
+    pe_setc(r, c);
+    for (int t = 0; t < 2; t++) {
+        int yy0 = y + t, yy1 = y + h - 1 - t;
+        int xx0 = x + t, xx1 = x + w - 1 - t;
+        int l = on ? L - t : L;
+        SDL_RenderDrawLine(r, xx0, yy0, xx0 + l, yy0);
+        SDL_RenderDrawLine(r, xx0, yy0, xx0, yy0 + l);
+        SDL_RenderDrawLine(r, xx1 - l, yy0, xx1, yy0);
+        SDL_RenderDrawLine(r, xx1, yy0, xx1, yy0 + l);
+        SDL_RenderDrawLine(r, xx0, yy1, xx0 + l, yy1);
+        SDL_RenderDrawLine(r, xx0, yy1 - l, xx0, yy1);
+        SDL_RenderDrawLine(r, xx1 - l, yy1, xx1, yy1);
+        SDL_RenderDrawLine(r, xx1, yy1 - l, xx1, yy1);
+    }
+}
+
+static void pe_icon_close(SDL_Renderer *r, SDL_Rect rc, SDL_Color c) {
+    int x = rc.x + rc.w / 3, y = rc.y + rc.h / 3;
+    int w = rc.w / 3, h = rc.h / 3;
+    pe_setc(r, c);
+    for (int i = 0; i < 2; i++) {
+        SDL_RenderDrawLine(r, x, y + i, x + w, y + h + i);
+        SDL_RenderDrawLine(r, x, y + h + i, x + w, y + i);
+    }
+}
+
+static void pe_icon_camera(SDL_Renderer *r, SDL_Rect rc, SDL_Color c) {
+    int w = rc.w / 2, h = rc.h / 3;
+    int x = rc.x + (rc.w - w) / 2, y = rc.y + (rc.h - h) / 2 + 1;
+    pe_stroke_round(r, (SDL_Rect){x, y, w, h}, 3, c, 1);
+    pe_fill_round(r, (SDL_Rect){x + w / 2 - 3, y - 3, 8, 4}, 1, c);
+    pe_fill_circle(r, x + w / 2, y + h / 2, h / 4, c);
+    pe_fill_circle(r, x + w / 2, y + h / 2, h / 4 - 2, pe_col(kUiBg, 255));
+}
+
+static void pe_icon_check(SDL_Renderer *r, int x, int y, int size, SDL_Color c) {
+    pe_setc(r, c);
+    SDL_RenderDrawLine(r, x, y + size / 2, x + size / 3, y + size - 1);
+    SDL_RenderDrawLine(r, x + size / 3, y + size - 1, x + size, y + 1);
+    SDL_RenderDrawLine(r, x, y + size / 2 + 1, x + size / 3, y + size);
+    SDL_RenderDrawLine(r, x + size / 3, y + size, x + size, y + 2);
+}
+
+/* ---------- 布局 ---------- */
 
 static void pe_layout(PePlayer *p, PeLayout *L, int outW, int outH) {
     memset(L, 0, sizeof(*L));
     L->W = outW;
     L->H = outH;
-    L->hb = outH < 420 ? 52 : 68;
-    L->py = outH - L->hb;
-    int scale = outH < 420 ? 1 : 2;
-    L->time_scale = scale;
-    L->play.x = 20;
-    L->play.y = L->py + (L->hb - 28) / 2;
-    L->play.w = 28;
-    L->play.h = 28;
-    L->time_x = 64;
-    L->time_y = L->py + (L->hb - 7 * scale) / 2;
-    L->bar_x = 64 + 19 * 6 * scale + 16;
-    if (L->bar_x > outW - 260) L->bar_x = outW / 2;
-    L->bar_w = outW - 130 - L->bar_x;
-    if (L->bar_w < 60) L->bar_w = 60;
-    L->bar_h = 6;
-    L->bar_y = L->py + (L->hb - L->bar_h) / 2;
-    L->barhit.x = L->bar_x - 8;
-    L->barhit.y = L->py + 12;
-    L->barhit.w = L->bar_w + 16;
-    L->barhit.h = L->hb - 24;
-    L->volhit.x = outW - 112;
-    L->volhit.y = L->py + 12;
-    L->volhit.w = 72;
-    L->volhit.h = L->hb - 24;
-    L->fullhit.x = outW - 44;
-    L->fullhit.y = L->py + 12;
-    L->fullhit.w = 36;
-    L->fullhit.h = L->hb - 24;
+    double ui = (double)outH / 720.0;
+    if (ui < 0.85) ui = 0.85;
+    if (ui > 1.6) ui = 1.6;
+    L->ui = ui;
+    int pad = (int)(24 * ui);
+    int row = (int)(40 * ui);
+    int row_y = outH - (int)(52 * ui);
+    int compact = outW < (int)(1020 * ui);
+
+    L->row_y = row_y;
+    L->play = (SDL_Rect){pad, row_y, row, row};
+    L->back = (SDL_Rect){pad + (int)(52 * ui), row_y + 2, (int)(36 * ui), (int)(36 * ui)};
+    L->fwd = (SDL_Rect){L->back.x + (int)(40 * ui), row_y + 2, (int)(36 * ui), (int)(36 * ui)};
+    L->mute = (SDL_Rect){L->fwd.x + (int)(44 * ui), row_y + 2, (int)(36 * ui), (int)(36 * ui)};
+    if (!compact) {
+        L->volume = (SDL_Rect){L->mute.x + (int)(42 * ui), row_y + (int)(11 * ui),
+                               (int)(96 * ui), (int)(18 * ui)};
+        L->volume_hit = (SDL_Rect){L->volume.x - 6, L->volume.y - 11,
+                                   L->volume.w + 12, L->volume.h + 22};
+    }
+
+    L->bar_x = pad;
+    L->bar_y = outH - (int)(88 * ui);
+    L->bar_h = (int)(4 * ui);
+    if (L->bar_h < 3) L->bar_h = 3;
+    L->bar_w = outW - 2 * pad;
+    L->progress_hit = (SDL_Rect){L->bar_x - 6, L->bar_y - (int)(12 * ui),
+                                 L->bar_w + 12, (int)(30 * ui)};
+    L->time_x = pad;
+    L->time_y = outH - (int)(72 * ui);
+    L->dur_x = outW - pad;
+    L->dur_y = L->time_y;
+
+    int close_w = (int)(36 * ui);
+    L->close = (SDL_Rect){outW - pad - close_w, row_y, close_w, row};
+    int x = L->close.x - (int)(42 * ui);
+    L->full = (SDL_Rect){x, row_y, (int)(36 * ui), row};
+    if (!compact) {
+        x -= (int)(42 * ui);
+        L->shot = (SDL_Rect){x, row_y, (int)(36 * ui), row};
+    }
+    int pill_w = compact ? (int)(58 * ui) : (int)(70 * ui);
+    x = (compact ? L->full.x : L->shot.x) - (int)(6 * ui) - pill_w;
+    L->aspect = (SDL_Rect){x, row_y + (int)(3 * ui), pill_w, (int)(34 * ui)};
+    x -= (int)(6 * ui) + pill_w;
+    L->sub = (SDL_Rect){x, L->aspect.y, pill_w, L->aspect.h};
+    x -= (int)(6 * ui) + pill_w;
+    L->audio = (SDL_Rect){x, L->aspect.y, pill_w, L->aspect.h};
+    int speed_w = compact ? (int)(54 * ui) : (int)(62 * ui);
+    x -= (int)(6 * ui) + speed_w;
+    L->speed = (SDL_Rect){x, L->aspect.y, speed_w, L->aspect.h};
+
+    L->top_h = (int)(120 * ui);
+    L->bottom_y = outH - (int)(180 * ui);
+    L->title_x = pad;
+    L->device_x = pad + (int)(12 * ui);
+    L->title_y = (int)(26 * ui);
+    L->device_y = (int)(50 * ui);
+    L->meta_y = (int)(20 * ui);
     (void)p;
 }
 
 static int pe_in_rect(const SDL_Rect *r, int x, int y) {
-    return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
+    return r && r->w > 0 && r->h > 0 &&
+           x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
 }
+
+static int pe_control_at(PePlayer *p, PeLayout *L, int x, int y) {
+    if (!p->show_controls) return PE_CTL_NONE;
+    if (pe_in_rect(&L->play, x, y)) return PE_CTL_PLAY;
+    if (pe_in_rect(&L->back, x, y)) return PE_CTL_BACK;
+    if (pe_in_rect(&L->fwd, x, y)) return PE_CTL_FWD;
+    if (pe_in_rect(&L->mute, x, y)) return PE_CTL_MUTE;
+    if (pe_in_rect(&L->speed, x, y)) return PE_CTL_SPEED;
+    if (pe_in_rect(&L->audio, x, y)) return PE_CTL_AUDIO;
+    if (pe_in_rect(&L->sub, x, y)) return PE_CTL_SUB;
+    if (pe_in_rect(&L->aspect, x, y)) return PE_CTL_ASPECT;
+    if (pe_in_rect(&L->shot, x, y)) return PE_CTL_SHOT;
+    if (pe_in_rect(&L->full, x, y)) return PE_CTL_FULL;
+    if (pe_in_rect(&L->close, x, y)) return PE_CTL_CLOSE;
+    if (pe_in_rect(&L->volume_hit, x, y)) return PE_CTL_VOLUME;
+    if (pe_in_rect(&L->progress_hit, x, y)) return PE_CTL_PROGRESS;
+    return PE_CTL_NONE;
+}
+
+/* ---------- 菜单 ---------- */
+
+static const double kSpeeds[6] = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0};
+static const char *kAspects[4] = {"auto", "16:9", "4:3", "fill"};
+
+static int pe_menu_count(PePlayer *p) {
+    switch (p->menu) {
+    case PE_MENU_SPEED: return 6;
+    case PE_MENU_AUDIO: return p->natracks;
+    case PE_MENU_SUB: return p->nstracks;
+    case PE_MENU_ASPECT: return 4;
+    default: return 0;
+    }
+}
+
+static int pe_menu_selected(PePlayer *p, int i) {
+    if (p->menu == PE_MENU_SPEED) return fabs((double)p->speed_milli / 1000.0 - kSpeeds[i]) < 0.01;
+    if (p->menu == PE_MENU_AUDIO) return p->cur_audio_id == i + 1;
+    if (p->menu == PE_MENU_SUB) return p->cur_sub_id == i + 1;
+    if (p->menu == PE_MENU_ASPECT) return strcmp(p->aspect, kAspects[i]) == 0;
+    return 0;
+}
+
+static void pe_menu_item_text(PePlayer *p, int i, char *buf, size_t n) {
+    buf[0] = 0;
+    if (p->menu == PE_MENU_SPEED) {
+        pe_speed_label(kSpeeds[i], buf, n);
+    } else if (p->menu == PE_MENU_ASPECT) {
+        snprintf(buf, n, "%s", kAspects[i]);
+    } else {
+        PeTrackInfo t;
+        memset(&t, 0, sizeof(t));
+        int rc = p->menu == PE_MENU_AUDIO
+                     ? pe_audio_track_info(p, i, &t)
+                     : pe_subtitle_track_info(p, i, &t);
+        if (rc != 0) return;
+        if (p->menu == PE_MENU_AUDIO) {
+            if (t.title[0])
+                snprintf(buf, n, "%s  %s · %dch", t.title, t.codec, t.channels);
+            else
+                snprintf(buf, n, "音轨 %d  %s · %dch", i + 1, t.codec, t.channels);
+        } else {
+            if (t.title[0])
+                snprintf(buf, n, "%s  %s", t.title, t.codec);
+            else
+                snprintf(buf, n, "字幕 %d  %s", i + 1, t.codec);
+        }
+    }
+}
+
+static void pe_menu_geometry(PePlayer *p, PeLayout *L, SDL_Rect *panel,
+                             int *title_h, int *item_h, int *count) {
+    *count = pe_menu_count(p);
+    double ui = L->ui;
+    int w = (p->menu == PE_MENU_AUDIO || p->menu == PE_MENU_SUB)
+                ? (int)(330 * ui)
+                : (int)(200 * ui);
+    int th = (int)(34 * ui);
+    int ih = (int)(40 * ui);
+    if (w > L->W - 24) w = L->W - 24;
+    int h = th + (*count > 0 ? *count : 1) * ih + (int)(10 * ui);
+    SDL_Rect a = p->menu == PE_MENU_SPEED ? L->speed
+                 : p->menu == PE_MENU_AUDIO ? L->audio
+                 : p->menu == PE_MENU_SUB ? L->sub : L->aspect;
+    int x = a.x + a.w / 2 - w / 2;
+    int minx = (int)(12 * ui);
+    if (x < minx) x = minx;
+    if (x + w > L->W - minx) x = L->W - minx - w;
+    int y = a.y - h - (int)(10 * ui);
+    if (y < minx) y = a.y + a.h + (int)(10 * ui);
+    panel->x = x;
+    panel->y = y;
+    panel->w = w;
+    panel->h = h;
+    *title_h = th;
+    *item_h = ih;
+}
+
+static void pe_open_menu(PePlayer *p, int menu) {
+    p->menu = menu;
+    p->menu_sel = 0;
+    int n = pe_menu_count(p);
+    for (int i = 0; i < n; i++) {
+        if (pe_menu_selected(p, i)) { p->menu_sel = i; break; }
+    }
+    p->show_controls = 1;
+    p->hide_at = pe_now() + 3600;
+}
+
+static void pe_menu_apply(PePlayer *p, int idx) {
+    if (idx < 0 || idx >= pe_menu_count(p)) return;
+    if (p->menu == PE_MENU_SPEED) {
+        pe_set_speed(p, kSpeeds[idx]);
+        char b[32], t[64];
+        pe_speed_label(kSpeeds[idx], b, sizeof(b));
+        snprintf(t, sizeof(t), "倍速 %s", b);
+        p->toast_error = 0;
+        snprintf(p->toast, sizeof(p->toast), "%s", t);
+        p->toast_until = pe_now() + 1.6;
+    } else if (p->menu == PE_MENU_AUDIO) {
+        pe_set_audio_track(p, idx + 1);
+    } else if (p->menu == PE_MENU_SUB) {
+        pe_set_subtitle_track(p, idx + 1);
+        p->toast_error = 0;
+        snprintf(p->toast, sizeof(p->toast), "字幕轨已选择（Windows 版暂不渲染）");
+        p->toast_until = pe_now() + 2.5;
+    } else if (p->menu == PE_MENU_ASPECT) {
+        pe_set_aspect(p, kAspects[idx]);
+    }
+    p->menu = PE_MENU_NONE;
+    p->show_controls = 1;
+    p->hide_at = pe_now() + 2.5;
+}
+
+/* ---------- 提示 / 截图 ---------- */
+
+static void pe_show_controls(PePlayer *p) {
+    p->show_controls = 1;
+    p->hide_at = pe_now() + 2.5;
+}
+
+static void pe_show_toast(PePlayer *p, const char *text, int error) {
+    snprintf(p->toast, sizeof(p->toast), "%s", text ? text : "");
+    p->toast_error = error;
+    p->toast_until = pe_now() + 3.0;
+}
+
+static void pe_take_screenshot(PePlayer *p) {
+    if (!p || p->shot_busy) return;
+    p->shot_busy = 1;
+    time_t t = time(NULL);
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    struct tm *lt = localtime(&t);
+    if (lt) tmv = *lt;
+    char path[1200];
+    char err[256];
+    err[0] = 0;
+    int rc = -1;
+    int used_temp = 0;
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+    const char *tmp = getenv("TEMP");
+    for (int i = 0; i < 2 && rc != 0; i++) {
+        const char *dir = i == 0 ? home : tmp;
+        if (!dir || !dir[0]) continue;
+        if (i == 0)
+            snprintf(path, sizeof(path),
+                     "%s\\Desktop\\DLNA 截图 %04d-%02d-%02d %02d-%02d-%02d.png",
+                     dir, tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        else
+            snprintf(path, sizeof(path),
+                     "%s\\DLNA 截图 %04d-%02d-%02d %02d-%02d-%02d.png",
+                     dir, tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        err[0] = 0;
+        rc = pe_screenshot(p, path, err, sizeof(err));
+        used_temp = i == 1;
+    }
+#else
+    snprintf(path, sizeof(path), "/tmp/DLNA 截图 %04d-%02d-%02d %02d-%02d-%02d.png",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    rc = pe_screenshot(p, path, err, sizeof(err));
+#endif
+    p->shot_busy = 0;
+    if (rc == 0) {
+        pe_show_toast(p, used_temp ? "截图已保存到临时目录" : "截图已保存到桌面", 0);
+    } else {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "截图失败：%s", err[0] ? err : "未知错误");
+        pe_show_toast(p, msg, 1);
+    }
+    p->show_controls = 1;
+    p->hide_at = pe_now() + 2.5;
+}
+
+/* ---------- 绘制 ---------- */
 
 static void pe_video_rect(PePlayer *p, PeLayout *L, int tex_w, int tex_h, SDL_Rect *dst) {
     double dar = (double)tex_w / (double)tex_h * (p->sar > 0 ? p->sar : 1.0);
     if (strcmp(p->aspect, "16:9") == 0) dar = 16.0 / 9.0;
     else if (strcmp(p->aspect, "4:3") == 0) dar = 4.0 / 3.0;
     if (strcmp(p->aspect, "fill") == 0) {
-        dst->x = 0; dst->y = 0; dst->w = L->W; dst->h = L->H;
+        dst->x = 0;
+        dst->y = 0;
+        dst->w = L->W;
+        dst->h = L->H;
         return;
     }
     double sw = (double)L->W / (double)tex_w;
@@ -1449,16 +2210,104 @@ static void pe_video_rect(PePlayer *p, PeLayout *L, int tex_w, int tex_h, SDL_Re
     double s = sw < sh ? sw : sh;
     int w = (int)(tex_w * s + 0.5);
     int h = (int)(tex_h * s + 0.5);
-    if (strcmp(p->aspect, "auto") == 0 && fabs(dar - (double)tex_w / tex_h) < 0.02) {
-        /* 方形像素，按纹理比例 */
-    } else {
+    if (!(strcmp(p->aspect, "auto") == 0 && fabs(dar - (double)tex_w / tex_h) < 0.02)) {
         h = (int)(w / dar + 0.5);
-        if (h > L->H) { h = L->H; w = (int)(h * dar + 0.5); }
+        if (h > L->H) {
+            h = L->H;
+            w = (int)(h * dar + 0.5);
+        }
     }
     dst->w = w;
     dst->h = h;
     dst->x = (L->W - w) / 2;
     dst->y = (L->H - h) / 2;
+}
+
+static void pe_draw_pill(PePlayer *p, SDL_Rect r, const char *text, int hover, int active) {
+    if (r.w <= 0 || r.h <= 0) return;
+    double ui = ((double)r.h / 34.0);
+    SDL_Color bg = pe_col(0xFFFFFF, (Uint8)((0.08 + 0.06 * hover) * 255));
+    pe_fill_round(p->ren, r, r.h / 2, bg);
+    pe_stroke_round(p->ren, r, r.h / 2, pe_col(0xFFFFFF, 30), 1);
+    SDL_Color fg = active ? pe_col(kUiAmber, 255) : pe_col(kUiText, 235);
+    int px = (int)(13 * ui);
+    if (px < 10) px = 10;
+    int w = 0, h = 0;
+    SDL_Texture *tex = pe_text_texture(p, text, px, FW_SEMIBOLD, &w, &h);
+    if (tex) pe_blit_text(p, tex, r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, fg);
+}
+
+static void pe_draw_icon_button(PePlayer *p, SDL_Rect r, int hover, int kind,
+                                int fullscreen, int paused) {
+    if (r.w <= 0) return;
+    if (hover) pe_fill_round(p->ren, r, r.h / 2, pe_col(0xFFFFFF, 26));
+    SDL_Color fg = pe_col(kUiText, 235);
+    switch (kind) {
+    case PE_CTL_PLAY: pe_icon_play(p->ren, r, fg, paused); break;
+    case PE_CTL_BACK: pe_icon_seek(p->ren, r, 0, fg); break;
+    case PE_CTL_FWD: pe_icon_seek(p->ren, r, 1, fg); break;
+    case PE_CTL_MUTE: pe_icon_speaker(p->ren, r, p->muted, fg); break;
+    case PE_CTL_SHOT: pe_icon_camera(p->ren, r, fg); break;
+    case PE_CTL_FULL: pe_icon_fullscreen(p->ren, r, fullscreen, fg); break;
+    case PE_CTL_CLOSE: pe_icon_close(p->ren, r, fg); break;
+    default: break;
+    }
+    if (kind == PE_CTL_BACK || kind == PE_CTL_FWD) {
+        double ui = (double)r.h / 36.0;
+        pe_draw_text(p, "10", r.x + r.w / 2, r.y + r.h / 2 - (int)(5 * ui),
+                     (int)(9 * ui), FW_SEMIBOLD, fg, 2, 0);
+    }
+}
+
+static void pe_render_menu(PePlayer *p, PeLayout *L) {
+    if (!p->menu) return;
+    SDL_Rect panel;
+    int th = 0, ih = 0, count = 0;
+    pe_menu_geometry(p, L, &panel, &th, &ih, &count);
+    double ui = L->ui;
+    pe_fill_round(p->ren, (SDL_Rect){panel.x, panel.y + (int)(4 * ui), panel.w, panel.h},
+                  (int)(12 * ui), pe_col(0x000000, 110));
+    pe_fill_round(p->ren, panel, (int)(12 * ui), pe_col(kUiPanelAlt, 248));
+    pe_stroke_round(p->ren, panel, (int)(12 * ui), pe_col(0xFFFFFF, 30), 1);
+
+    const char *title = p->menu == PE_MENU_SPEED ? "倍速"
+                        : p->menu == PE_MENU_AUDIO ? "音轨"
+                        : p->menu == PE_MENU_SUB ? "字幕" : "画面比例";
+    pe_draw_text(p, title, panel.x + (int)(16 * ui), panel.y + (int)(10 * ui),
+                 (int)(11 * ui), FW_NORMAL, pe_col(kUiTextDim, 230), 0, 0);
+
+    if (count == 0) {
+        pe_draw_text(p, p->menu == PE_MENU_SUB ? "没有字幕轨" : "没有可切换的音轨",
+                     panel.x + (int)(16 * ui), panel.y + th + (int)(10 * ui),
+                     (int)(13 * ui), FW_NORMAL, pe_col(kUiTextDim, 220), 0, 0);
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        SDL_Rect item = {panel.x + (int)(8 * ui), panel.y + th + i * ih,
+                         panel.w - (int)(16 * ui), ih - 2};
+        int sel = pe_menu_selected(p, i);
+        int hot = (i == p->menu_sel);
+        if (hot) pe_fill_round(p->ren, item, (int)(8 * ui), pe_col(0xFFFFFF, 20));
+        char label[320];
+        pe_menu_item_text(p, i, label, sizeof(label));
+        SDL_Color fg = sel ? pe_col(kUiAmber, 255) : pe_col(kUiText, 235);
+        SDL_Rect old_clip;
+        int had_clip = SDL_RenderIsClipEnabled(p->ren);
+        if (had_clip) SDL_RenderGetClipRect(p->ren, &old_clip);
+        SDL_Rect clip = {item.x + (int)(10 * ui), item.y, item.w - (int)(40 * ui), item.h};
+        SDL_RenderSetClipRect(p->ren, &clip);
+        pe_draw_text(p, label, item.x + (int)(10 * ui),
+                     item.y + (item.h - (int)(17 * ui)) / 2,
+                     (int)(13 * ui), FW_NORMAL, fg, 0, 0);
+        if (had_clip) SDL_RenderSetClipRect(p->ren, &old_clip);
+        else SDL_RenderSetClipRect(p->ren, NULL);
+        if (sel) {
+            pe_icon_check(p->ren, item.x + item.w - (int)(24 * ui),
+                          item.y + (item.h - (int)(12 * ui)) / 2,
+                          (int)(12 * ui), pe_col(kUiAmber, 255));
+        }
+    }
 }
 
 static void pe_render(PePlayer *p, PeLayout *L) {
@@ -1471,99 +2320,259 @@ static void pe_render(PePlayer *p, PeLayout *L) {
         SDL_RenderCopy(p->ren, p->tex, NULL, &dst);
     }
 
-    if (!p->show_controls) {
-        SDL_RenderPresent(p->ren);
-        return;
+    double ui = L->ui;
+    if (p->show_controls) {
+        pe_vgrad(p->ren, 0, 0, L->W, L->top_h, 150, 0);
+        pe_vgrad(p->ren, 0, L->bottom_y, L->W, L->H - L->bottom_y, 0, 200);
+
+        char title[160];
+        pe_utf8_copy(title, sizeof(title), p->title[0] ? p->title : p->url);
+        SDL_Rect title_clip = {L->title_x, L->title_y - (int)(4 * ui),
+                               L->W - L->title_x - (int)(300 * ui), (int)(32 * ui)};
+        SDL_RenderSetClipRect(p->ren, &title_clip);
+        pe_draw_text(p, title, L->title_x, L->title_y, (int)(17 * ui), FW_SEMIBOLD,
+                     pe_col(kUiText, 238), 0, 1);
+        SDL_RenderSetClipRect(p->ren, NULL);
+
+        pe_fill_circle(p->ren, L->title_x + (int)(3 * ui), L->device_y + (int)(7 * ui),
+                       (int)(3 * ui), pe_col(kUiAccentTop, 242));
+        char dev[320];
+        snprintf(dev, sizeof(dev), "%s · 投屏中", p->device[0] ? p->device : "DLNA 电视");
+        pe_draw_text(p, dev, L->device_x, L->device_y, (int)(12 * ui), FW_NORMAL,
+                     pe_col(0xFFFFFF, 145), 0, 0);
+
+        if (p->has_video && L->W > (int)(760 * ui)) {
+            char codec[64];
+            int ci = 0;
+            for (; p->vcodec[ci] && ci < 63; ci++) {
+                char c = p->vcodec[ci];
+                codec[ci] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+            }
+            codec[ci] = 0;
+            char meta[160];
+            snprintf(meta, sizeof(meta), "%s · %dx%d · %dfps · 软解", codec,
+                     p->width, p->height, p->fps);
+            int tw = pe_text_width(p, meta, (int)(12 * ui), FW_NORMAL);
+            int cw = tw + (int)(22 * ui);
+            int ch = (int)(24 * ui);
+            SDL_Rect pill = {L->W - (int)(24 * ui) - cw, L->meta_y, cw, ch};
+            pe_fill_round(p->ren, pill, (int)(8 * ui), pe_col(0x000000, 97));
+            pe_stroke_round(p->ren, pill, (int)(8 * ui), pe_col(0xFFFFFF, 26), 1);
+            int w = 0, h = 0;
+            SDL_Texture *tex = pe_text_texture(p, meta, (int)(12 * ui), FW_NORMAL, &w, &h);
+            if (tex) pe_blit_text(p, tex, pill.x + (pill.w - w) / 2,
+                                  pill.y + (pill.h - h) / 2, pe_col(0xFFFFFF, 145));
+        }
+
+        double dur = p->duration > 0 ? p->duration : 0;
+        double pos = p->dragging ? p->drag_frac * dur : pe_clock(p);
+        if (p->ended && dur > 0) pos = dur;
+        double frac = dur > 0 ? pos / dur : 0;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+
+        SDL_Rect track = {L->bar_x, L->bar_y, L->bar_w, L->bar_h};
+        pe_fill_round(p->ren, track, L->bar_h / 2, pe_col(0xFFFFFF, 46));
+        if (dur > 0) {
+            double buffered_ms = p->audio_out_rate > 0
+                ? (double)pe_ring_len(p) / (double)(p->audio_out_rate * 4) * 1000.0 : 0;
+            double buf = pos + buffered_ms / 1000.0;
+            double bf = buf / dur;
+            if (bf < 0) bf = 0;
+            if (bf > 1) bf = 1;
+            if (bf > frac) {
+                SDL_Rect br = {L->bar_x, L->bar_y, (int)(L->bar_w * bf), L->bar_h};
+                pe_fill_round(p->ren, br, L->bar_h / 2, pe_col(0xFFFFFF, 68));
+            }
+        }
+        int pw = (int)(L->bar_w * frac);
+        if (pw > 0) {
+            SDL_Rect played = {L->bar_x, L->bar_y, pw, L->bar_h};
+            pe_hgrad(p->ren, played.x, played.y, played.w, played.h,
+                     pe_col(kUiAccentTop, 255), pe_col(kUiAccentBottom, 255));
+        }
+        int knobx = L->bar_x + pw;
+        int show_preview = p->dragging || p->hover_ctl == PE_CTL_PROGRESS ||
+                           pe_in_rect(&L->progress_hit, p->mouse_x, p->mouse_y);
+        if (show_preview) {
+            double pf = p->dragging ? p->drag_frac : p->hover_frac;
+            knobx = L->bar_x + (int)(L->bar_w * pf);
+            SDL_SetRenderDrawColor(p->ren, 255, 255, 255, 210);
+            SDL_RenderDrawLine(p->ren, knobx, L->bar_y - (int)(4 * ui),
+                               knobx, L->bar_y + L->bar_h + (int)(4 * ui));
+            pe_fill_circle(p->ren, knobx, L->bar_y + L->bar_h / 2, (int)(6 * ui),
+                           pe_col(0xFFFFFF, 240));
+            char tip[32];
+            pe_fmt_time(tip, sizeof(tip), pf * dur);
+            int tw = pe_text_width(p, tip, (int)(11 * ui), FW_SEMIBOLD);
+            int bw = tw + (int)(18 * ui), bh = (int)(24 * ui);
+            int bx = knobx - bw / 2;
+            if (bx < (int)(12 * ui)) bx = (int)(12 * ui);
+            if (bx + bw > L->W - (int)(12 * ui)) bx = L->W - (int)(12 * ui) - bw;
+            SDL_Rect bubble = {bx, L->bar_y - (int)(38 * ui), bw, bh};
+            pe_fill_round(p->ren, bubble, (int)(8 * ui), pe_col(kUiPanelAlt, 245));
+            pe_stroke_round(p->ren, bubble, (int)(8 * ui), pe_col(0xFFFFFF, 26), 1);
+            pe_draw_text(p, tip, bubble.x + bubble.w / 2,
+                         bubble.y + (bubble.h - (int)(17 * ui)) / 2,
+                         (int)(11 * ui), FW_SEMIBOLD, pe_col(0xFFFFFF, 235), 2, 0);
+        }
+
+        char cur[32], total[32];
+        pe_fmt_time(cur, sizeof(cur), pos);
+        pe_fmt_time(total, sizeof(total), dur);
+        pe_draw_text(p, cur, L->time_x, L->time_y, (int)(12 * ui), FW_NORMAL,
+                     pe_col(0xFFFFFF, 235), 0, 0);
+        if (dur > 0)
+            pe_draw_text(p, total, L->dur_x, L->dur_y, (int)(12 * ui), FW_NORMAL,
+                         pe_col(0xFFFFFF, 140), 1, 0);
+
+        int hp = p->hover_ctl == PE_CTL_PLAY;
+        pe_fill_round(p->ren, L->play, L->play.h / 2,
+                      pe_col(0xFFFFFF, (Uint8)((0.10 + 0.08 * hp) * 255)));
+        pe_draw_icon_button(p, L->play, hp, PE_CTL_PLAY, p->fullscreen, p->paused);
+        pe_draw_icon_button(p, L->back, p->hover_ctl == PE_CTL_BACK, PE_CTL_BACK, 0, 0);
+        pe_draw_icon_button(p, L->fwd, p->hover_ctl == PE_CTL_FWD, PE_CTL_FWD, 0, 0);
+        pe_draw_icon_button(p, L->mute, p->hover_ctl == PE_CTL_MUTE, PE_CTL_MUTE, 0, 0);
+
+        if (L->volume.w > 0) {
+            SDL_Rect vt = {L->volume.x, L->volume.y + L->volume.h / 2 - 2,
+                           L->volume.w, 4};
+            pe_fill_round(p->ren, vt, 2, pe_col(0xFFFFFF, 46));
+            double vf = (double)p->volume / 100.0;
+            if (p->muted) vf = 0;
+            if (vf > 0.01) {
+                SDL_Rect vfill = {vt.x, vt.y, (int)(vt.w * vf), vt.h};
+                pe_fill_round(p->ren, vfill, 2, pe_col(kUiAmber, 255));
+            }
+            pe_fill_circle(p->ren, vt.x + (int)(vt.w * vf), vt.y + vt.h / 2,
+                           (int)(5 * ui), pe_col(0xFFFFFF, 245));
+        }
+
+        char sp[32];
+        pe_speed_label((double)p->speed_milli / 1000.0, sp, sizeof(sp));
+        pe_draw_pill(p, L->speed,
+                     p->speed_milli != 1000 ? sp : "1.0×",
+                     p->hover_ctl == PE_CTL_SPEED, p->speed_milli != 1000);
+        char audio[64];
+        if (p->natracks > 1 && p->cur_audio_id > 0)
+            snprintf(audio, sizeof(audio), "音轨 %d", p->cur_audio_id);
+        else
+            snprintf(audio, sizeof(audio), "音轨");
+        pe_draw_pill(p, L->audio, audio, p->hover_ctl == PE_CTL_AUDIO,
+                     p->natracks > 1 || p->menu == PE_MENU_AUDIO);
+        char sub[64];
+        if (p->cur_sub_id > 0) snprintf(sub, sizeof(sub), "字幕 %d", p->cur_sub_id);
+        else snprintf(sub, sizeof(sub), "字幕");
+        pe_draw_pill(p, L->sub, sub, p->hover_ctl == PE_CTL_SUB,
+                     p->cur_sub_id > 0 || p->menu == PE_MENU_SUB);
+        pe_draw_pill(p, L->aspect, p->aspect, p->hover_ctl == PE_CTL_ASPECT,
+                     strcmp(p->aspect, "auto") != 0);
+        if (L->shot.w > 0)
+            pe_draw_icon_button(p, L->shot, p->hover_ctl == PE_CTL_SHOT, PE_CTL_SHOT, 0, 0);
+        pe_draw_icon_button(p, L->full, p->hover_ctl == PE_CTL_FULL, PE_CTL_FULL,
+                            p->fullscreen, 0);
+        pe_draw_icon_button(p, L->close, p->hover_ctl == PE_CTL_CLOSE, PE_CTL_CLOSE, 0, 0);
     }
 
-    SDL_SetRenderDrawColor(p->ren, 0, 0, 0, 165);
-    SDL_Rect bar = {0, L->py, L->W, L->hb};
-    SDL_RenderFillRect(p->ren, &bar);
-    SDL_SetRenderDrawColor(p->ren, 255, 255, 255, 22);
-    SDL_Rect line = {0, L->py, L->W, 1};
-    SDL_RenderFillRect(p->ren, &line);
+    if (p->menu) pe_render_menu(p, L);
 
-    pe_draw_play_icon(p->ren, L->play.x, L->play.y, L->play.w, p->paused);
+    if (p->buffering) {
+        double a = pe_now() * 3.2;
+        int cx = L->W / 2, cy = L->H / 2;
+        int rad = (int)(28 * ui);
+        for (int i = 0; i < 40; i++) {
+            double t = a + (double)i * 0.045;
+            int x = cx + (int)(cos(t) * (double)rad);
+            int y = cy + (int)(sin(t) * (double)rad);
+            Uint8 al = (Uint8)(40 + 215 * (double)i / 40.0);
+            pe_fill_circle(p->ren, x, y, 2, pe_col(kUiAccentTop, al));
+        }
+        pe_draw_text(p, p->seeking ? "跳转中…" : "准备中…",
+                     L->W / 2, L->H / 2 + (int)(42 * ui),
+                     (int)(14 * ui), FW_NORMAL, pe_col(kUiText, 220), 2, 1);
+    }
 
-    double pos = p->dragging ? p->drag_frac * p->duration : pe_clock(p);
-    if (p->ended && p->duration > 0) pos = p->duration;
-    char cur[32], total[32], label[96];
-    pe_fmt_time(cur, sizeof(cur), pos);
-    pe_fmt_time(total, sizeof(total), p->duration);
-    snprintf(label, sizeof(label), "%s / %s", cur, total);
-    pe_draw_text(p->ren, L->time_x, L->time_y, label, L->time_scale, 255, 255, 255, 235);
+    if (p->toast[0] && pe_now() < p->toast_until) {
+        int tw = pe_text_width(p, p->toast, (int)(13 * ui), FW_NORMAL);
+        int bw = tw + (int)(44 * ui);
+        int bh = (int)(36 * ui);
+        int bx = (L->W - bw) / 2;
+        int by = L->H - (int)(140 * ui);
+        pe_fill_round(p->ren, (SDL_Rect){bx, by + (int)(3 * ui), bw, bh},
+                      (int)(10 * ui), pe_col(0x000000, 100));
+        pe_fill_round(p->ren, (SDL_Rect){bx, by, bw, bh}, (int)(10 * ui),
+                      pe_col(kUiPanel, 242));
+        pe_stroke_round(p->ren, (SDL_Rect){bx, by, bw, bh}, (int)(10 * ui),
+                        pe_col(0xFFFFFF, 28), 1);
+        pe_fill_circle(p->ren, bx + (int)(18 * ui), by + bh / 2, (int)(4 * ui),
+                       pe_col(p->toast_error ? kUiRed : kUiAmber, 255));
+        pe_draw_text(p, p->toast, bx + (int)(30 * ui),
+                     by + (bh - (int)(17 * ui)) / 2,
+                     (int)(13 * ui), FW_NORMAL, pe_col(kUiText, 235), 0, 0);
+    }
 
-    double frac = p->duration > 0 ? pos / p->duration : 0;
-    if (frac < 0) frac = 0;
-    if (frac > 1) frac = 1;
-    SDL_SetRenderDrawColor(p->ren, 255, 255, 255, 70);
-    SDL_Rect track = {L->bar_x, L->bar_y, L->bar_w, L->bar_h};
-    SDL_RenderFillRect(p->ren, &track);
-    SDL_SetRenderDrawColor(p->ren, 30, 144, 255, 255);
-    SDL_Rect played = {L->bar_x, L->bar_y, (int)(L->bar_w * frac), L->bar_h};
-    SDL_RenderFillRect(p->ren, &played);
-    int knobx = L->bar_x + (int)(L->bar_w * frac);
-    pe_draw_circle(p->ren, knobx, L->bar_y + L->bar_h / 2, 7);
-
-    pe_draw_speaker(p->ren, L->W - 108, L->py + 20, 24, 255, 255, 255);
-    char vol[8];
-    snprintf(vol, sizeof(vol), "%d", p->volume);
-    pe_draw_text(p->ren, L->W - 74, L->py + (L->hb - 14) / 2, vol, 2, 255, 255, 255, 200);
-
-    pe_draw_fullscreen_icon(p->ren, L->W - 40, L->py + 20, 24);
+    if (p->debug_capture_req) {
+        p->debug_capture_req = 0;
+        SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, L->W, L->H, 32,
+                                                           SDL_PIXELFORMAT_ARGB8888);
+        if (surf) {
+            if (SDL_RenderReadPixels(p->ren, NULL, SDL_PIXELFORMAT_ARGB8888,
+                                     surf->pixels, surf->pitch) == 0)
+                SDL_SaveBMP(surf, p->debug_capture_path);
+            SDL_FreeSurface(surf);
+        }
+    }
 
     SDL_RenderPresent(p->ren);
 }
 
-static void pe_show_controls(PePlayer *p) {
-    p->show_controls = 1;
-    p->hide_at = pe_now() + 2.5;
+void pe_debug_capture(PePlayer *p, const char *path) {
+    if (!p || !path) return;
+    pe_utf8_copy(p->debug_capture_path, sizeof(p->debug_capture_path), path);
+    p->debug_capture_req = 1;
 }
 
+/* ---------- 事件 ---------- */
+
 static void pe_handle_key(PePlayer *p, SDL_Keycode key) {
+    if (p->menu) {
+        int n = pe_menu_count(p);
+        if (key == SDLK_ESCAPE) {
+            p->menu = PE_MENU_NONE;
+            pe_show_controls(p);
+            return;
+        }
+        if (key == SDLK_UP && n > 0) {
+            p->menu_sel = (p->menu_sel + n - 1) % n;
+            return;
+        }
+        if (key == SDLK_DOWN && n > 0) {
+            p->menu_sel = (p->menu_sel + 1) % n;
+            return;
+        }
+        if (n == 0 && (key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE))
+            return;
+        if ((key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE) && n > 0) {
+            pe_menu_apply(p, p->menu_sel);
+            return;
+        }
+    }
     switch (key) {
     case SDLK_ESCAPE:
         if (p->fullscreen) pe_set_fullscreen(p, 0);
         else { p->closed = 1; p->run_stop = 1; }
         break;
-    case SDLK_SPACE:
-        pe_toggle_pause(p);
-        pe_show_controls(p);
-        break;
-    case SDLK_LEFT:
-        pe_seek_relative(p, -10);
-        pe_show_controls(p);
-        break;
-    case SDLK_RIGHT:
-        pe_seek_relative(p, 10);
-        pe_show_controls(p);
-        break;
-    case SDLK_UP:
-        pe_set_volume(p, p->volume + 5);
-        pe_show_controls(p);
-        break;
-    case SDLK_DOWN:
-        pe_set_volume(p, p->volume - 5);
-        pe_show_controls(p);
-        break;
-    case SDLK_m:
-        p->muted = !p->muted;
-        pe_show_controls(p);
-        break;
-    case SDLK_f:
-        pe_toggle_fullscreen(p);
-        pe_show_controls(p);
-        break;
-    case SDLK_HOME:
-        pe_seek(p, 0);
-        pe_show_controls(p);
-        break;
-    case SDLK_END:
-        pe_seek(p, p->duration);
-        pe_show_controls(p);
-        break;
-    default:
-        break;
+    case SDLK_SPACE: pe_toggle_pause(p); pe_show_controls(p); break;
+    case SDLK_LEFT: pe_seek_relative(p, -10); pe_show_controls(p); break;
+    case SDLK_RIGHT: pe_seek_relative(p, 10); pe_show_controls(p); break;
+    case SDLK_UP: pe_set_volume(p, p->volume + 5); pe_show_controls(p); break;
+    case SDLK_DOWN: pe_set_volume(p, p->volume - 5); pe_show_controls(p); break;
+    case SDLK_m: p->muted = !p->muted; pe_show_controls(p); break;
+    case SDLK_f: pe_toggle_fullscreen(p); pe_show_controls(p); break;
+    case SDLK_s: pe_take_screenshot(p); break;
+    case SDLK_HOME: pe_seek(p, 0); pe_show_controls(p); break;
+    case SDLK_END: pe_seek(p, p->duration); pe_show_controls(p); break;
+    default: break;
     }
 }
 
@@ -1587,12 +2596,35 @@ static void pe_handle_event(PePlayer *p, SDL_Event *ev, PeLayout *L, double sx, 
         int my = (int)(ev->motion.y * sy);
         p->mouse_x = mx;
         p->mouse_y = my;
-        pe_show_controls(p);
+        if (!p->menu) pe_show_controls(p);
+        p->hover_ctl = p->menu ? PE_CTL_NONE : pe_control_at(p, L, mx, my);
         if (p->dragging && L->bar_w > 0) {
             double f = (double)(mx - L->bar_x) / (double)L->bar_w;
             if (f < 0) f = 0;
             if (f > 1) f = 1;
             p->drag_frac = f;
+        } else if (L->bar_w > 0) {
+            double f = (double)(mx - L->bar_x) / (double)L->bar_w;
+            if (f < 0) f = 0;
+            if (f > 1) f = 1;
+            p->hover_frac = f;
+        }
+        if (p->vol_drag && L->volume.w > 0) {
+            double f = (double)(mx - L->volume.x) / (double)L->volume.w;
+            if (f < 0) f = 0;
+            if (f > 1) f = 1;
+            pe_set_volume(p, (int)(f * 100 + 0.5));
+        }
+        if (p->menu) {
+            SDL_Rect panel;
+            int th = 0, ih = 0, count = 0;
+            pe_menu_geometry(p, L, &panel, &th, &ih, &count);
+            p->menu_sel = -1;
+            for (int i = 0; i < count; i++) {
+                SDL_Rect item = {panel.x + (int)(8 * L->ui), panel.y + th + i * ih,
+                                 panel.w - (int)(16 * L->ui), ih - 2};
+                if (pe_in_rect(&item, mx, my)) { p->menu_sel = i; break; }
+            }
         }
         break;
     }
@@ -1600,7 +2632,31 @@ static void pe_handle_event(PePlayer *p, SDL_Event *ev, PeLayout *L, double sx, 
         int mx = (int)(ev->button.x * sx);
         int my = (int)(ev->button.y * sy);
         if (ev->button.button != SDL_BUTTON_LEFT) break;
-        if (p->show_controls && pe_in_rect(&L->barhit, mx, my)) {
+        if (p->menu) {
+            SDL_Rect panel;
+            int th = 0, ih = 0, count = 0;
+            pe_menu_geometry(p, L, &panel, &th, &ih, &count);
+            int handled = 0;
+            for (int i = 0; i < count; i++) {
+                SDL_Rect item = {panel.x + (int)(8 * L->ui), panel.y + th + i * ih,
+                                 panel.w - (int)(16 * L->ui), ih - 2};
+                if (pe_in_rect(&item, mx, my)) {
+                    pe_menu_apply(p, i);
+                    handled = 1;
+                    break;
+                }
+            }
+            if (!handled) p->menu = PE_MENU_NONE;
+            pe_show_controls(p);
+            break;
+        }
+        int ctl = pe_control_at(p, L, mx, my);
+        switch (ctl) {
+        case PE_CTL_PLAY: pe_toggle_pause(p); pe_show_controls(p); break;
+        case PE_CTL_BACK: pe_seek_relative(p, -10); pe_show_controls(p); break;
+        case PE_CTL_FWD: pe_seek_relative(p, 10); pe_show_controls(p); break;
+        case PE_CTL_MUTE: p->muted = !p->muted; pe_show_controls(p); break;
+        case PE_CTL_PROGRESS:
             if (p->duration > 0) {
                 double f = (double)(mx - L->bar_x) / (double)L->bar_w;
                 if (f < 0) f = 0;
@@ -1608,28 +2664,43 @@ static void pe_handle_event(PePlayer *p, SDL_Event *ev, PeLayout *L, double sx, 
                 p->drag_frac = f;
                 p->dragging = 1;
             }
-        } else if (p->show_controls && pe_in_rect(&L->play, mx, my)) {
-            pe_toggle_pause(p);
-            pe_show_controls(p);
-        } else if (p->show_controls && pe_in_rect(&L->volhit, mx, my)) {
-            p->muted = !p->muted;
-            pe_show_controls(p);
-        } else if (p->show_controls && pe_in_rect(&L->fullhit, mx, my)) {
-            pe_toggle_fullscreen(p);
-            pe_show_controls(p);
-        } else if (ev->button.clicks >= 2) {
-            pe_toggle_fullscreen(p);
-            pe_show_controls(p);
-        } else {
-            p->show_controls = !p->show_controls;
-            p->hide_at = pe_now() + 2.5;
+            break;
+        case PE_CTL_VOLUME:
+            if (L->volume.w > 0) {
+                double f = (double)(mx - L->volume.x) / (double)L->volume.w;
+                if (f < 0) f = 0;
+                if (f > 1) f = 1;
+                pe_set_volume(p, (int)(f * 100 + 0.5));
+                p->vol_drag = 1;
+            }
+            break;
+        case PE_CTL_SPEED: pe_open_menu(p, PE_MENU_SPEED); break;
+        case PE_CTL_AUDIO: pe_open_menu(p, PE_MENU_AUDIO); break;
+        case PE_CTL_SUB: pe_open_menu(p, PE_MENU_SUB); break;
+        case PE_CTL_ASPECT: pe_open_menu(p, PE_MENU_ASPECT); break;
+        case PE_CTL_SHOT: pe_take_screenshot(p); break;
+        case PE_CTL_FULL: pe_toggle_fullscreen(p); pe_show_controls(p); break;
+        case PE_CTL_CLOSE: p->closed = 1; p->run_stop = 1; break;
+        default:
+            if (ev->button.clicks >= 2) {
+                pe_toggle_fullscreen(p);
+                pe_show_controls(p);
+            } else if (!p->show_controls) {
+                pe_show_controls(p);
+            } else {
+                pe_toggle_pause(p);
+            }
+            break;
         }
         break;
     }
     case SDL_MOUSEBUTTONUP:
-        if (ev->button.button == SDL_BUTTON_LEFT && p->dragging) {
-            p->dragging = 0;
-            if (p->duration > 0) pe_seek(p, p->drag_frac * p->duration);
+        if (ev->button.button == SDL_BUTTON_LEFT) {
+            if (p->dragging) {
+                p->dragging = 0;
+                if (p->duration > 0) pe_seek(p, p->drag_frac * p->duration);
+            }
+            p->vol_drag = 0;
         }
         break;
     case SDL_MOUSEWHEEL:
@@ -1643,51 +2714,93 @@ static void pe_handle_event(PePlayer *p, SDL_Event *ev, PeLayout *L, double sx, 
 
 static void pe_update_frame(PePlayer *p) {
     double clock = pe_clock(p);
+    int prime = p->has_video && !p->video_primed;
     AVFrame *show = NULL;
     double show_pts = 0;
     SDL_LockMutex(p->mu);
-    while (p->fcount > 0) {
+    if (p->fcount > 0) {
         PeFrameNode *n = &p->frames[p->fhead];
-        if (n->pts <= clock + 0.008) {
-            if (show) { av_frame_free(&show); p->frames_dropped++; }
+        if (prime || n->pts <= clock + 0.008) {
             show = n->frame;
             show_pts = n->pts;
             n->frame = NULL;
             p->fhead = (p->fhead + 1) % PE_MAX_FRAMES;
             p->fcount--;
-        } else {
-            break;
+            if (!prime) {
+                while (p->fcount > 0) {
+                    PeFrameNode *m = &p->frames[p->fhead];
+                    if (m->pts <= clock + 0.008) {
+                        if (show) { av_frame_free(&show); p->frames_dropped++; }
+                        show = m->frame;
+                        show_pts = m->pts;
+                        m->frame = NULL;
+                        p->fhead = (p->fhead + 1) % PE_MAX_FRAMES;
+                        p->fcount--;
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
     }
     SDL_UnlockMutex(p->mu);
+    if (!show) return;
 
-    if (show) {
-        int w = show->width, h = show->height;
-        if (!p->tex || p->tex_w != w || p->tex_h != h) {
-            if (p->tex) SDL_DestroyTexture(p->tex);
-            p->tex = SDL_CreateTexture(p->ren, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, w, h);
-            p->tex_w = w;
-            p->tex_h = h;
-            if (!p->tex) PE_LOG("创建视频纹理失败：%s", SDL_GetError());
-        }
-        if (p->tex) {
-            SDL_UpdateYUVTexture(p->tex, NULL,
-                                 show->data[0], show->linesize[0],
-                                 show->data[1], show->linesize[1],
-                                 show->data[2], show->linesize[2]);
-        }
-        SDL_LockMutex(p->mu);
-        if (p->current) av_frame_free(&p->current);
-        p->current = show;
-        p->current_pts = show_pts;
-        p->video_pts = show_pts;
-        p->drift_ms = (show_pts - clock) * 1000.0;
-        pe_drift_add(p, p->drift_ms);
-        p->frames_shown++;
-        if (p->first_frame_ms <= 0) p->first_frame_ms = (pe_now() - p->open_t0) * 1000.0;
-        p->buffering = 0;
-        SDL_UnlockMutex(p->mu);
+    int ring = (p->has_audio && p->adev) ? pe_ring_len(p) : 0;
+    int w = show->width, h = show->height;
+    if (!p->tex || p->tex_w != w || p->tex_h != h) {
+        if (p->tex) SDL_DestroyTexture(p->tex);
+        p->tex = SDL_CreateTexture(p->ren, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, w, h);
+        p->tex_w = w;
+        p->tex_h = h;
+        if (!p->tex) PE_LOG("创建视频纹理失败：%s", SDL_GetError());
     }
+    if (p->tex) {
+        SDL_UpdateYUVTexture(p->tex, NULL,
+                             show->data[0], show->linesize[0],
+                             show->data[1], show->linesize[1],
+                             show->data[2], show->linesize[2]);
+    }
+
+    int unpause_audio = 0;
+    SDL_LockMutex(p->mu);
+    if (p->current) av_frame_free(&p->current);
+    p->current = show;
+    p->current_pts = show_pts;
+    p->video_pts = show_pts;
+    p->drift_ms = (show_pts - clock) * 1000.0;
+    pe_drift_add(p, p->drift_ms);
+    p->frames_shown++;
+    if (prime) {
+        double base = p->clock_base;
+        p->video_primed = 1;
+        p->seeking = 0;
+        p->clock_base = base;
+        p->clock_samples_base = p->audio_played;
+        p->clock_mono_base = base;
+        p->mono_wall_base = pe_now();
+        p->clock_paused = base;
+        p->audio_base_hint = base;
+        p->has_audio_hint = p->has_audio ? 1 : 0;
+        if (p->has_audio && p->adev) {
+            p->audio_started = ring > 0 ? 1 : 0;
+            unpause_audio = !p->paused;
+        } else {
+            p->audio_started = 0;
+        }
+        if (p->seek_request_t0 > 0 && !p->seek_first_frame_logged) {
+            p->seek_first_frame_logged = 1;
+            PE_LOG("seek 首帧 %.0fms target=%.2f pts=%.2f",
+                   (pe_now() - p->seek_request_t0) * 1000.0, p->seek_target, show_pts);
+        }
+    }
+    if (p->first_frame_ms <= 0) {
+        p->first_frame_ms = (pe_now() - p->open_t0) * 1000.0;
+        PE_LOG("首视频 %.0fms（首音频 %.0fms）", p->first_frame_ms, p->first_audio_ms);
+    }
+    p->buffering = 0;
+    SDL_UnlockMutex(p->mu);
+    if (unpause_audio) SDL_PauseAudioDevice(p->adev, 0);
 }
 
 void pe_run(PePlayer *p) {
@@ -1720,7 +2833,13 @@ void pe_run(PePlayer *p) {
             SDL_SetWindowFullscreen(p->win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
         }
 
-        if (!p->paused && !p->dragging && pe_now() > p->hide_at) p->show_controls = 0;
+        if (p->paused || p->dragging || p->vol_drag || p->menu) {
+            p->show_controls = 1;
+            p->hide_at = pe_now() + 2.5;
+        } else if (pe_now() > p->hide_at) {
+            p->show_controls = 0;
+            p->hover_ctl = PE_CTL_NONE;
+        }
 
         pe_update_frame(p);
         pe_render(p, &L);
@@ -1730,6 +2849,7 @@ void pe_run(PePlayer *p) {
     p->stop = 1;
     if (p->adev) SDL_PauseAudioDevice(p->adev, 1);
     p->run_returned = 1;
+    pe_text_cache_clear(p);
     if (p->tex) { SDL_DestroyTexture(p->tex); p->tex = NULL; }
     if (p->ren) { SDL_DestroyRenderer(p->ren); p->ren = NULL; }
     if (p->win) { SDL_DestroyWindow(p->win); p->win = NULL; }
@@ -1758,6 +2878,7 @@ void pe_close(PePlayer *p) {
     }
     if (p->adev) { SDL_CloseAudioDevice(p->adev); p->adev = 0; }
     if (!p->run_started && !p->gfx_done) {
+        pe_text_cache_clear(p);
         if (p->tex) { SDL_DestroyTexture(p->tex); p->tex = NULL; }
         if (p->ren) { SDL_DestroyRenderer(p->ren); p->ren = NULL; }
         if (p->win) { SDL_DestroyWindow(p->win); p->win = NULL; }
@@ -1791,45 +2912,91 @@ void pe_ui_set_visible(PePlayer *p, int visible) {
     if (!p) return;
     p->show_controls = visible ? 1 : 0;
     if (visible) p->hide_at = pe_now() + 3600;
+    else { p->hover_ctl = PE_CTL_NONE; p->menu = PE_MENU_NONE; }
 }
 
 void pe_ui_hover(PePlayer *p, const char *control) {
     if (!p || !control) return;
     pe_show_controls(p);
-    if (strcmp(control, "progress") == 0) return;
     if (strncmp(control, "progress:", 9) == 0 && p->duration > 0) {
         double f = atof(control + 9);
-        p->drag_frac = f;
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        p->hover_frac = f;
+        p->hover_ctl = PE_CTL_PROGRESS;
+        return;
     }
+    p->hover_ctl = PE_CTL_NONE;
+    if (strcmp(control, "play") == 0) p->hover_ctl = PE_CTL_PLAY;
+    else if (strcmp(control, "back") == 0) p->hover_ctl = PE_CTL_BACK;
+    else if (strcmp(control, "forward") == 0) p->hover_ctl = PE_CTL_FWD;
+    else if (strcmp(control, "mute") == 0) p->hover_ctl = PE_CTL_MUTE;
+    else if (strcmp(control, "volume") == 0) p->hover_ctl = PE_CTL_VOLUME;
+    else if (strcmp(control, "speed") == 0) p->hover_ctl = PE_CTL_SPEED;
+    else if (strcmp(control, "audio") == 0) p->hover_ctl = PE_CTL_AUDIO;
+    else if (strcmp(control, "subtitle") == 0) p->hover_ctl = PE_CTL_SUB;
+    else if (strcmp(control, "aspect") == 0) p->hover_ctl = PE_CTL_ASPECT;
+    else if (strcmp(control, "screenshot") == 0) p->hover_ctl = PE_CTL_SHOT;
+    else if (strcmp(control, "fullscreen") == 0) p->hover_ctl = PE_CTL_FULL;
+    else if (strcmp(control, "close") == 0) p->hover_ctl = PE_CTL_CLOSE;
 }
 
 void pe_ui_click(PePlayer *p, const char *control) {
     if (!p || !control) return;
-    if (strcmp(control, "play") == 0) pe_toggle_pause(p);
+    pe_show_controls(p);
+    if (strcmp(control, "play") == 0 || strcmp(control, "toggle") == 0) pe_toggle_pause(p);
     else if (strcmp(control, "pause") == 0) pe_pause(p);
+    else if (strcmp(control, "back") == 0) pe_seek_relative(p, -10);
+    else if (strcmp(control, "forward") == 0) pe_seek_relative(p, 10);
     else if (strcmp(control, "fullscreen") == 0) pe_toggle_fullscreen(p);
     else if (strcmp(control, "mute") == 0) p->muted = !p->muted;
-    else if (strncmp(control, "progress:", 9) == 0 && p->duration > 0) {
+    else if (strcmp(control, "screenshot") == 0) pe_take_screenshot(p);
+    else if (strcmp(control, "close") == 0) { p->closed = 1; p->run_stop = 1; }
+    else if (strncmp(control, "progress:", 9) == 0 && p->duration > 0)
         pe_seek(p, atof(control + 9) * p->duration);
+    else if (strncmp(control, "volume:", 7) == 0) pe_set_volume(p, atoi(control + 7));
+    else if (strncmp(control, "speed:", 6) == 0) pe_set_speed(p, atof(control + 6));
+    else if (strncmp(control, "audio:", 6) == 0) pe_set_audio_track(p, atoi(control + 6));
+    else if (strncmp(control, "subtitle:", 9) == 0) pe_set_subtitle_track(p, atoi(control + 9));
+    else if (strncmp(control, "aspect:", 7) == 0) pe_set_aspect(p, control + 7);
+    else if (strcmp(control, "menu:speed") == 0) pe_open_menu(p, PE_MENU_SPEED);
+    else if (strcmp(control, "menu:audio") == 0) pe_open_menu(p, PE_MENU_AUDIO);
+    else if (strcmp(control, "menu:subtitle") == 0) pe_open_menu(p, PE_MENU_SUB);
+    else if (strcmp(control, "menu:aspect") == 0) pe_open_menu(p, PE_MENU_ASPECT);
+    else if (strcmp(control, "menu:close") == 0 || strcmp(control, "menu:none") == 0) {
+        p->menu = PE_MENU_NONE;
+        pe_show_controls(p);
     }
-    pe_show_controls(p);
 }
 
 void pe_ui_menu(PePlayer *p, const char *menu) {
-    (void)p;
-    (void)menu;
+    if (!p || !menu) return;
+    if (strcmp(menu, "speed") == 0) pe_open_menu(p, PE_MENU_SPEED);
+    else if (strcmp(menu, "audio") == 0) pe_open_menu(p, PE_MENU_AUDIO);
+    else if (strcmp(menu, "subtitle") == 0 || strcmp(menu, "sub") == 0) pe_open_menu(p, PE_MENU_SUB);
+    else if (strcmp(menu, "aspect") == 0) pe_open_menu(p, PE_MENU_ASPECT);
+    else if (strcmp(menu, "close") == 0 || strcmp(menu, "none") == 0) {
+        p->menu = PE_MENU_NONE;
+        pe_show_controls(p);
+    }
 }
 
 void pe_ui_key(PePlayer *p, const char *key) {
     if (!p || !key) return;
-    if (strcmp(key, "space") == 0) pe_toggle_pause(p);
-    else if (strcmp(key, "left") == 0) pe_seek_relative(p, -10);
-    else if (strcmp(key, "right") == 0) pe_seek_relative(p, 10);
-    else if (strcmp(key, "up") == 0) pe_set_volume(p, p->volume + 5);
-    else if (strcmp(key, "down") == 0) pe_set_volume(p, p->volume - 5);
-    else if (strcmp(key, "m") == 0) p->muted = !p->muted;
-    else if (strcmp(key, "f") == 0) pe_toggle_fullscreen(p);
-    else if (strcmp(key, "esc") == 0) pe_set_fullscreen(p, 0);
+    SDL_Keycode k = 0;
+    if (strcmp(key, "space") == 0) k = SDLK_SPACE;
+    else if (strcmp(key, "left") == 0) k = SDLK_LEFT;
+    else if (strcmp(key, "right") == 0) k = SDLK_RIGHT;
+    else if (strcmp(key, "up") == 0) k = SDLK_UP;
+    else if (strcmp(key, "down") == 0) k = SDLK_DOWN;
+    else if (strcmp(key, "m") == 0) k = SDLK_m;
+    else if (strcmp(key, "f") == 0) k = SDLK_f;
+    else if (strcmp(key, "s") == 0 || strcmp(key, "screenshot") == 0) k = SDLK_s;
+    else if (strcmp(key, "esc") == 0 || strcmp(key, "escape") == 0) k = SDLK_ESCAPE;
+    else if (strcmp(key, "enter") == 0 || strcmp(key, "return") == 0) k = SDLK_RETURN;
+    else if (strcmp(key, "home") == 0) k = SDLK_HOME;
+    else if (strcmp(key, "end") == 0) k = SDLK_END;
+    if (k) pe_handle_key(p, k);
     pe_show_controls(p);
 }
 
