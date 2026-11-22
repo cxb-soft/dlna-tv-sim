@@ -95,6 +95,17 @@ else
   mkdir -p "$WIN_ROOT/ffmpeg"
   cp -R "$FF_DIR/." "$WIN_ROOT/ffmpeg/"
 
+  # BtbN 的 shared 包给的是 MSVC 的 .lib 和 .def；MinGW/cgo 要 .dll.a。
+  # 这里从 .def 生成 import library，否则 CI 新解压后会缺 libavcodec.dll.a。
+  if command -v x86_64-w64-mingw32-dlltool >/dev/null 2>&1; then
+    for def in "$WIN_ROOT/ffmpeg/lib"/*.def; do
+      [ -f "$def" ] || continue
+      base="$(basename "$def" .def)"
+      stem="${base%-*}"
+      x86_64-w64-mingw32-dlltool -d "$def" -l "$WIN_ROOT/ffmpeg/lib/lib${stem}.dll.a" -D "${base}.dll"
+    done
+  fi
+
   if ! have_deps; then
     echo "错误：解压后仍然缺少开发库，检查下载包是否完整" >&2
     exit 1
