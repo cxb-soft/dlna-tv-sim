@@ -56,13 +56,22 @@ extract_zip() {
   fi
 }
 
-have_deps() {
+have_base_deps() {
   [ -f "$WIN_ROOT/sdl2/lib/libSDL2.dll.a" ] &&
     [ -f "$WIN_ROOT/sdl2/include/SDL2/SDL.h" ] &&
     [ -f "$WIN_ROOT/ffmpeg/lib/libavcodec.dll.a" ] &&
-    [ -f "$WIN_ROOT/ffmpeg/include/libavcodec/avcodec.h" ] &&
-    [ -f "$WIN_ROOT/subs/lib/libass.dll.a" ] &&
+    [ -f "$WIN_ROOT/ffmpeg/include/libavcodec/avcodec.h" ]
+}
+
+have_subs_deps() {
+  [ -f "$WIN_ROOT/subs/lib/libass.dll.a" ] &&
     [ -f "$WIN_ROOT/subs/include/ass/ass.h" ]
+}
+
+# subs 不在这里检查：它是下面的源码交叉编译步骤产出的，放进来会让首次运行
+# （CI 无缓存）在构建字幕依赖之前就报“缺少开发库”。
+have_deps() {
+  have_base_deps && have_subs_deps
 }
 
 if have_deps && [ -z "${FORCE:-}" ]; then
@@ -127,7 +136,7 @@ else
     done
   fi
 
-  if ! have_deps; then
+  if ! have_base_deps; then
     echo "诊断：dlltool=$(command -v x86_64-w64-mingw32-dlltool || echo none) gendef=$(command -v gendef || echo none)" >&2
     echo "诊断：sdl2/lib" >&2; ls -1 "$WIN_ROOT/sdl2/lib" 2>&1 | head -5 >&2
     echo "诊断：ffmpeg/lib" >&2; ls -1 "$WIN_ROOT/ffmpeg/lib" 2>&1 | head -15 >&2
@@ -146,7 +155,7 @@ fi
 # 这里用源码交叉编译，字体走系统 DirectWrite。
 echo
 echo "→ 字幕渲染依赖（libass）"
-if [ -f "$WIN_ROOT/subs/lib/libass.dll.a" ] && [ -z "${FORCE:-}" ]; then
+if have_subs_deps && [ -z "${FORCE:-}" ]; then
   echo "  已有 $WIN_ROOT/subs"
 else
   DLNA_DEPS_ROOT="$DEPS_ROOT" DLNA_WIN_SUBS_PREFIX="$WIN_ROOT/subs" "$PWD/scripts/build-win-subs-deps.sh"
