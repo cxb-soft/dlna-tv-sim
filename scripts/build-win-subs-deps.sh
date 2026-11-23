@@ -50,7 +50,7 @@ for t in "$CC_BIN" "$CXX_BIN" x86_64-w64-mingw32-ar meson ninja pkg-config curl 
     echo "错误：找不到 $t" >&2
     case "$t" in
       meson|ninja) echo "  安装：pip3 install meson ninja  或  apt-get install -y meson ninja-build" >&2 ;;
-      x86_64-w64-mingw32-gcc|x86_64-w64-mingw32-g++) echo "  macOS: brew install mingw-w64；Debian/Ubuntu: apt-get install gcc-mingw-w64-x86-64" >&2 ;;
+      x86_64-w64-mingw32-gcc|x86_64-w64-mingw32-g++) echo "  macOS: brew install mingw-w64；Debian/Ubuntu: apt-get install g++-mingw-w64-x86-64" >&2 ;;
     esac
     exit 1
   fi
