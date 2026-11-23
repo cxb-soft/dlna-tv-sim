@@ -76,6 +76,23 @@
 
 未验证：ASS 高级排版（未引 libass）、HLS HEVC/加密 fMP4/master playlist、本地 fMP4 起播慢、Windows/Linux native。
 
+## Windows mpv IPC 不再卡指令（2026-11-23，0.5.3）
+
+现象：iPad 投到 Windows（mpv 引擎）时，暂停后按播放没反应、遥控按钮一直转；一集播完点下一集停在「电视正在缓冲」。日志里 SOAP Play 20 秒超时（设备其实已报 PLAYING）、Stop 12 秒超时、TRANSITIONING 持续 30 秒、下一集卡在旧画面。
+
+原因：`ipc_windows.go` 用 `os.OpenFile` 打开 mpv 的命名管道，拿到的是同步句柄（FILE_SYNCHRONOUS_IO_NONALERT）。Windows 会把同一同步句柄上的 I/O 串行化，`readLoop` 一直挂着 ReadFile，于是每次写指令都要等 mpv 发出下一条事件。播放中 `time-pos` 不停地推，看不出来；mpv 暂停、空闲或卡在取流时什么都不发，Play/Stop/`loadfile` 就卡十几秒甚至更久。
+
+改法：
+- `dialIPC` 改用 `O_FILE_FLAG_OVERLAPPED` 打开管道（Go 1.26 的 `os.OpenFile` 支持），句柄进 Go 运行时的 IOCP，读写互不等待；`Close` 用 CancelIoEx 打断挂着的读。unix 套接字路径不变。
+- 写 IPC 统一走 `writeIPC`：一次一整行（`writeMu` 串行化），普通指令 3 秒写超时，退出时的 `quit` 1 秒，mpv 整个卡死时不会把 SOAP 请求或退出流程挂住。
+
+已验证（Wine 10 跑 windows/amd64 测试，模拟 mpv 的重叠 I/O 服务端管道）：
+- `TestIPCHandleIsOverlapped`：旧代码得到 mode=0x20（同步句柄）判失败，新代码通过。Wine 不模拟同步句柄的串行化，所以这条直接检查句柄模式。
+- 读挂着时写 `pause`/`stop`/`loadfile` 立即送达；挂着读时写 `quit` + `Close` 不卡、读返回；服务端不读时写入 300ms 超时返回（旧的同步句柄这里会一直卡住）。
+- Windows 全量测试在 Wine 下通过；macOS `go test ./...`、`-race` 通过；windows/amd64、windows/arm64 交叉编译通过。
+
+未验证：Windows 实机 + 真实 mpv.exe 上的暂停后播放、播完下一集（需在 Windows 机器上投屏确认）。
+
 ## 未验证
 
 - Windows 实机运行（只做了交叉编译）。

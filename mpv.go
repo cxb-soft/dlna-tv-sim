@@ -24,6 +24,7 @@ type mpvScreen struct {
 	sock string
 
 	mu           sync.Mutex
+	writeMu      sync.Mutex // 串行化 IPC 写：一次一整行，写超时只管当前这条
 	cmd          *exec.Cmd
 	conn         io.ReadWriteCloser
 	started      bool
@@ -202,9 +203,29 @@ func (m *mpvScreen) send(payload map[string]any) {
 		return
 	}
 	data = append(data, '\n')
-	if _, err := conn.Write(data); err != nil {
+	m.writeMu.Lock()
+	err = writeIPC(conn, data, mpvWriteTimeout)
+	m.writeMu.Unlock()
+	if err != nil {
 		m.dev.logf("screen", "mpv 指令失败: %v", err)
 	}
+}
+
+// mpvWriteTimeout 是一条 IPC 指令最多等多久。正常情况下写入立刻完成；
+// 只有 mpv 整个卡死、不再读管道（缓冲写满）时才会超时，免得把 SOAP 请求一起挂住。
+const mpvWriteTimeout = 3 * time.Second
+
+type writeDeadliner interface {
+	SetWriteDeadline(time.Time) error
+}
+
+// writeIPC 带写超时写一条 IPC 指令；连接不支持写超时时直接写。
+func writeIPC(conn io.Writer, data []byte, timeout time.Duration) error {
+	if d, ok := conn.(writeDeadliner); ok && d.SetWriteDeadline(time.Now().Add(timeout)) == nil {
+		defer d.SetWriteDeadline(time.Time{})
+	}
+	_, err := conn.Write(data)
+	return err
 }
 
 func (m *mpvScreen) start() error {
@@ -519,8 +540,11 @@ func (m *mpvScreen) Close() {
 	m.mu.Unlock()
 
 	if conn != nil {
+		// quit 最多等 1 秒；随后的 Close 会打断 readLoop 挂着的读。
 		payload, _ := json.Marshal(map[string]any{"command": []any{"quit"}})
-		_, _ = conn.Write(append(payload, '\n'))
+		m.writeMu.Lock()
+		_ = writeIPC(conn, append(payload, '\n'), time.Second)
+		m.writeMu.Unlock()
 		conn.Close()
 	}
 	if cmd != nil && cmd.Process != nil {
