@@ -34,6 +34,7 @@ static int g_speed_changed;
 static int g_full_mode;
 static int g_ui_mode;
 static int g_seek_mode;
+static int g_sub_mode;
 
 static int SDLCALL control_thread(void *arg) {
     (void)arg;
@@ -98,6 +99,44 @@ static int SDLCALL control_thread(void *arg) {
                        st.position, st.buffering, (long long)st.frames_shown, st.last_seek_ms);
             }
             if (tick >= 55) { pe_close_window(g_player); return 0; }
+            continue;
+        }
+        if (g_sub_mode) {
+            /* 字幕自测：分别在字幕显示窗口内抓帧，切轨后再抓一次。 */
+            if (tick == 15) pe_debug_capture(g_player, "/tmp/winui_sub_01_srt.bmp");
+            if (tick == 20) {
+                char txt[512] = {0};
+                int n = pe_get_subtitle_text(g_player, txt, sizeof(txt));
+                printf("SUB_TEXT n=%d sub_track=%d tracks=%d text=%s\n", n,
+                       st.subtitle_track, st.subtitle_tracks, txt);
+                fflush(stdout);
+            }
+            if (tick == 24) pe_debug_capture(g_player, "/tmp/winui_sub_02_second.bmp");
+            if (tick == 28) {
+                printf("SUB_SWITCH off\n");
+                pe_set_subtitle_track(g_player, 0);
+            }
+            if (tick == 34) pe_debug_capture(g_player, "/tmp/winui_sub_03_off.bmp");
+            if (tick == 36) {
+                printf("SUB_SWITCH on 1\n");
+                pe_set_subtitle_track(g_player, 1);
+            }
+            if (tick == 38) pe_ui_click(g_player, "menu:subtitle");
+            if (tick == 40) pe_debug_capture(g_player, "/tmp/winui_sub_07_menu.bmp");
+            if (tick == 42) pe_ui_click(g_player, "menu:close");
+            if (tick == 44) pe_debug_capture(g_player, "/tmp/winui_sub_04_back.bmp");
+            if (tick == 46) {
+                printf("SUB_SEEK 15\n");
+                pe_seek(g_player, 15.0);
+            }
+            if (tick == 52) pe_debug_capture(g_player, "/tmp/winui_sub_05_seek.bmp");
+            /* 往回 seek 到第一句中间：验证 seek 后旧句不会丢 */
+            if (tick == 54) {
+                printf("SUB_SEEK_BACK 6\n");
+                pe_seek(g_player, 6.0);
+            }
+            if (tick == 62) pe_debug_capture(g_player, "/tmp/winui_sub_06_seekback.bmp");
+            if (tick >= 66) { pe_close_window(g_player); return 0; }
             continue;
         }
         if (g_full_mode) {
@@ -183,6 +222,7 @@ int main(int argc, char **argv) {
     g_full_mode = getenv("PE_SELFTEST_FULL") != NULL;
     g_ui_mode = getenv("PE_SELFTEST_UI") != NULL;
     g_seek_mode = getenv("PE_SELFTEST_SEEK") != NULL;
+    g_sub_mode = getenv("PE_SELFTEST_SUB") != NULL;
     printf("FFmpeg %s%s\n", pe_ffmpeg_version(), g_full_mode ? "（连续播放模式）" : "");
     SDL_CreateThread(control_thread, "selftest", NULL);
     pe_run(p);

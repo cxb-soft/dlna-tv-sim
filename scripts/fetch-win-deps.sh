@@ -2,10 +2,12 @@
 # 下载 Windows x64 自研播放核心需要的开发库和运行库：
 #   SDL2 2.32.0（官方 mingw 开发包，x86_64-w64-mingw32）
 #   FFmpeg 9.0 LGPL shared（BtbN 构建，含 avcodec/avformat/avutil/swscale/swresample）
+#   libass 0.17.5 及其依赖（本仓 scripts/build-win-subs-deps.sh 交叉编译）
 #
 # 产物：
 #   $DLNA_DEPS_ROOT/win64/sdl2/{include,lib,bin}
 #   $DLNA_DEPS_ROOT/win64/ffmpeg/{include,lib,bin,LICENSE.txt}
+#   $DLNA_DEPS_ROOT/win64/subs/{include,lib,bin,share/licenses}
 #
 # 用法：
 #   ./scripts/fetch-win-deps.sh
@@ -58,7 +60,9 @@ have_deps() {
   [ -f "$WIN_ROOT/sdl2/lib/libSDL2.dll.a" ] &&
     [ -f "$WIN_ROOT/sdl2/include/SDL2/SDL.h" ] &&
     [ -f "$WIN_ROOT/ffmpeg/lib/libavcodec.dll.a" ] &&
-    [ -f "$WIN_ROOT/ffmpeg/include/libavcodec/avcodec.h" ]
+    [ -f "$WIN_ROOT/ffmpeg/include/libavcodec/avcodec.h" ] &&
+    [ -f "$WIN_ROOT/subs/lib/libass.dll.a" ] &&
+    [ -f "$WIN_ROOT/subs/include/ass/ass.h" ]
 }
 
 if have_deps && [ -z "${FORCE:-}" ]; then
@@ -137,17 +141,30 @@ if ! grep -q "lgpl" <<<"$FFMPEG_ASSET"; then
   echo "警告：$FFMPEG_ASSET 看起来不是 LGPL 构建，发布前请核对许可证" >&2
 fi
 
+# 字幕渲染依赖（libass + freetype/fribidi/harfbuzz/unibreak）。
+# 没有 msys2 现成包可用：那个 libass 链接 fontconfig，还要多带一套配置与字体;
+# 这里用源码交叉编译，字体走系统 DirectWrite。
+echo
+echo "→ 字幕渲染依赖（libass）"
+if [ -f "$WIN_ROOT/subs/lib/libass.dll.a" ] && [ -z "${FORCE:-}" ]; then
+  echo "  已有 $WIN_ROOT/subs"
+else
+  DLNA_DEPS_ROOT="$DEPS_ROOT" DLNA_WIN_SUBS_PREFIX="$WIN_ROOT/subs" "$PWD/scripts/build-win-subs-deps.sh"
+fi
+
 echo
 echo "Windows 依赖已就绪：$WIN_ROOT"
 echo "  SDL2   $SDL2_VERSION"
 echo "  FFmpeg $FFMPEG_ASSET"
+echo "  libass 0.17.5（依存：freetype / fribidi / harfbuzz / libunibreak）"
 echo "  运行库："
 ls "$WIN_ROOT"/ffmpeg/bin/avcodec-*.dll \
    "$WIN_ROOT"/ffmpeg/bin/avformat-*.dll \
    "$WIN_ROOT"/ffmpeg/bin/avutil-*.dll \
    "$WIN_ROOT"/ffmpeg/bin/swresample-*.dll \
    "$WIN_ROOT"/ffmpeg/bin/swscale-*.dll \
-   "$WIN_ROOT/sdl2/bin/SDL2.dll" 2>/dev/null | sed 's/^/    /'
+   "$WIN_ROOT/sdl2/bin/SDL2.dll" \
+   "$WIN_ROOT"/subs/bin/*.dll 2>/dev/null | sed 's/^/    /'
 echo
 echo "构建 Windows 原生版："
 echo "  ./scripts/build-windows-native.sh"

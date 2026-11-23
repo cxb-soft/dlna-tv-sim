@@ -12,7 +12,7 @@ package player
 
 /*
 #cgo CFLAGS: -D_CRT_SECURE_NO_WARNINGS
-#cgo LDFLAGS: -lavformat -lavcodec -lswresample -lswscale -lavutil -lSDL2 -limm32 -lole32 -loleaut32 -luuid -lversion -lwinmm -lsetupapi -lgdi32 -luser32 -ladvapi32 -lshell32 -lbcrypt
+#cgo LDFLAGS: -lavformat -lavcodec -lswresample -lswscale -lavutil -lSDL2 -lass -limm32 -lole32 -loleaut32 -luuid -lversion -lwinmm -lsetupapi -lgdi32 -luser32 -ladvapi32 -lshell32 -lbcrypt
 #include <stdlib.h>
 #include "engine.h"
 */

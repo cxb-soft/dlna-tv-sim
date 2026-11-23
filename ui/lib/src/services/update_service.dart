@@ -25,6 +25,7 @@ class UpdateService {
     required this.currentVersion,
     this.repo = 'cxb-soft/dlna-tv-sim',
     this.assetNameOverride,
+    this.appBundlePathOverride,
   });
 
   static const String _apiRoot = 'https://api.github.com/repos';
@@ -39,6 +40,9 @@ class UpdateService {
   final String currentVersion;
   final String repo;
   final String? assetNameOverride;
+
+  /// 测试用：指定要替换的 .app 路径，避免 e2e 动到真正安装的 App。
+  final String? appBundlePathOverride;
 
   /// 当前平台对应的安装包名，用于在 release 资产里挑下载地址。
   /// macOS 是可替换安装的 .app 压缩包；Windows 是带引擎和 mpv 的绿色包。
@@ -271,6 +275,9 @@ class UpdateService {
 
   /// 当前 App 的 .app 路径，例如 /Applications/DLNA 电视.app
   String? _currentAppBundlePath() {
+    if (appBundlePathOverride != null && appBundlePathOverride!.isNotEmpty) {
+      return appBundlePathOverride;
+    }
     final exe = Platform.resolvedExecutable;
     final index = exe.indexOf('/Contents/MacOS/');
     if (index < 0) return null;
@@ -309,52 +316,217 @@ class UpdateService {
     }
     final newApp = apps.first.path;
 
-    final script = File('${tmp.path}/install.sh');
-    await script.writeAsString('''#!/bin/sh
-PID="\$1"; TARGET="\$2"; NEW="\$3"
-while kill -0 "\$PID" 2>/dev/null; do sleep 0.4; done
+    final home = Platform.environment['HOME'];
+    if (home == null || home.isEmpty) {
+      return const InstallOutcome(ok: false, message: '找不到用户目录，请手动下载安装。');
+    }
+    final workDir = Directory(
+      '$home/Library/Application Support/DLNA 电视/update',
+    );
+    await workDir.create(recursive: true);
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final script = File('${workDir.path}/install-$stamp.sh');
+    final log = File('${workDir.path}/install-$stamp.log');
+    final plist = File(
+      '$home/Library/LaunchAgents/com.cxbsoft.dlna-tv-sim.update.plist',
+    );
+
+    final uidResult = await Process.run('/usr/bin/id', ['-u']);
+    final uid = uidResult.stdout.toString().trim();
+    if (uidResult.exitCode != 0 || uid.isEmpty) {
+      return const InstallOutcome(ok: false, message: '找不到当前用户，请手动下载安装。');
+    }
+
+    // 安装器必须交给 launchd，不能作为 App 的子进程：App 退出后子进程会被
+    // 一起收掉，表现就是“下载完 App 退出、没有后续”。
+    await script.writeAsString(r'''#!/bin/sh
+set -u
+PID="$1"; TARGET="$2"; NEW="$3"; PLIST="$4"; LOG="$5"
+exec >>"$LOG" 2>&1
+echo "=== $(date) update start pid=$PID target=$TARGET"
+
+i=0
+while kill -0 "$PID" 2>/dev/null; do
+  i=$((i+1))
+  if [ "$i" -gt 900 ]; then
+    echo "timeout waiting for app to exit"
+    exit 1
+  fi
+  sleep 0.2
+done
+
+# 旧引擎/播放器可能还占着 App 包里的可执行文件/端口，先结束它们。
+/usr/bin/pkill -f "$TARGET/Contents/MacOS" 2>/dev/null || true
+/usr/bin/pkill -f "$TARGET/Contents/Resources/engine/dlna-tv-sim" 2>/dev/null || true
+/usr/bin/pkill -f "$TARGET/Contents/Resources/engine/mpv" 2>/dev/null || true
 sleep 0.5
-rm -rf "\$TARGET"
-cp -R "\$NEW" "\$TARGET"
-xattr -dr com.apple.quarantine "\$TARGET" 2>/dev/null
-open "\$TARGET"
+
+PARENT=$(dirname "$TARGET")
+if [ ! -w "$PARENT" ]; then
+  echo "no write permission: $PARENT"
+  exit 1
+fi
+
+BACKUP="$TARGET.bak-$(date +%s)"
+if [ -e "$TARGET" ]; then
+  mv "$TARGET" "$BACKUP" || { echo "backup failed"; exit 1; }
+fi
+
+if ! /usr/bin/ditto "$NEW" "$TARGET"; then
+  echo "ditto failed; restoring old app"
+  rm -rf "$TARGET"
+  if [ -e "$BACKUP" ]; then mv "$BACKUP" "$TARGET"; fi
+  /usr/bin/open "$TARGET" 2>/dev/null || true
+  exit 1
+fi
+
+/usr/bin/xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+if ! /usr/bin/open "$TARGET"; then
+  echo "open new app failed; restoring old app"
+  rm -rf "$TARGET"
+  if [ -e "$BACKUP" ]; then mv "$BACKUP" "$TARGET"; fi
+  /usr/bin/open "$TARGET" 2>/dev/null || true
+  exit 1
+fi
+
+rm -rf "$BACKUP"
+rm -f "$PLIST"
+echo "=== update done"
+exit 0
 ''');
-    await Process.start('/bin/sh', [
-      script.path,
-      pid.toString(),
-      target,
-      newApp,
-    ], mode: ProcessStartMode.detached);
-    return const InstallOutcome(ok: true, message: '更新已下载，App 会重启完成安装。');
+
+    final plistXml = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.cxbsoft.dlna-tv-sim.update</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>${_xmlEscape(script.path)}</string>
+    <string>$pid</string>
+    <string>${_xmlEscape(target)}</string>
+    <string>${_xmlEscape(newApp)}</string>
+    <string>${_xmlEscape(plist.path)}</string>
+    <string>${_xmlEscape(log.path)}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${_xmlEscape(log.path)}</string>
+  <key>StandardErrorPath</key><string>${_xmlEscape(log.path)}</string>
+</dict>
+</plist>
+''';
+
+    await Process.run('/bin/launchctl', ['bootout', 'gui/$uid', plist.path]);
+    await plist.parent.create(recursive: true);
+    await plist.writeAsString(plistXml);
+    final bootstrap = await Process.run('/bin/launchctl', [
+      'bootstrap',
+      'gui/$uid',
+      plist.path,
+    ]);
+    if (bootstrap.exitCode != 0) {
+      final err = bootstrap.stderr.toString().trim();
+      return InstallOutcome(
+        ok: false,
+        message: '无法启动系统安装器${err.isEmpty ? '' : '：$err'}（日志：${log.path}）',
+      );
+    }
+
+    return const InstallOutcome(
+      ok: true,
+      message: '更新已下载，App 会退出，由系统安装器替换并重启。',
+    );
   }
+
+  static String _xmlEscape(String s) => s
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&apos;');
 
   Future<InstallOutcome> _installWindows(String zipPath, Directory tmp) async {
     final targetDir = File(Platform.resolvedExecutable).parent.path;
-    final script = File('${tmp.path}/install.ps1');
+    final base = Platform.environment['LOCALAPPDATA'] ?? tmp.path;
+    final workDir = Directory('$base/DLNA 电视/update');
+    await workDir.create(recursive: true);
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final script = File('${workDir.path}/install-$stamp.ps1');
+    final log = File('${workDir.path}/install-$stamp.log');
+
     await script.writeAsString(r'''
-param([int]$Pid, [string]$Target, [string]$Zip)
-Wait-Process -Id $Pid -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
+param([int]$TargetPid, [string]$Target, [string]$Zip, [string]$Log)
+Start-Transcript -Path $Log -Append
+Write-Host "=== update start $(Get-Date) pid=$TargetPid target=$Target"
+Wait-Process -Id $TargetPid -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 800
+
+# 旧 engine、App 实例和它拉起的 mpv 都可能锁着目标目录里的 exe/DLL，按 target 路径结束它们。
+Write-Host "stopping app/engine/mpv under $Target"
+Get-CimInstance Win32_Process -Filter "Name = 'dlna_tv_sim.exe'" |
+  Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Target, [System.StringComparison]::OrdinalIgnoreCase) } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "Name = 'dlna-tv-sim.exe'" |
+  Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Target, [System.StringComparison]::OrdinalIgnoreCase) } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "Name = 'mpv.exe'" |
+  Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Target, [System.StringComparison]::OrdinalIgnoreCase) } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 800
+
 $dir = Join-Path $env:TEMP ("dlna-tv-update-" + [guid]::NewGuid().ToString("N"))
 Expand-Archive -Path $Zip -DestinationPath $dir -Force
-Copy-Item -Path (Join-Path $dir "*") -Destination $Target -Recurse -Force
-$exe = Get-ChildItem -Path $Target -Filter "*.exe" | Select-Object -First 1
-if ($exe) { Start-Process $exe.FullName }
+$copied = $false
+for ($i = 0; $i -lt 20; $i++) {
+  try {
+    Copy-Item -Path (Join-Path $dir "*") -Destination $Target -Recurse -Force -ErrorAction Stop
+    $copied = $true
+    break
+  } catch {
+    Write-Host "copy attempt $i failed: $_"
+    Start-Sleep -Milliseconds 500
+  }
+}
+if (-not $copied) {
+  Write-Host "copy failed"
+  Stop-Transcript
+  exit 1
+}
+$exe = Get-ChildItem -Path $Target -Filter "dlna_tv_sim.exe" | Select-Object -First 1
+if (-not $exe) { $exe = Get-ChildItem -Path $Target -Filter "*.exe" | Select-Object -First 1 }
+if ($exe) { Start-Process -FilePath $exe.FullName }
+Stop-Transcript
 ''');
-    await Process.start('powershell', [
-      '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-File',
-      script.path,
-      '-Pid',
-      pid.toString(),
-      '-Target',
-      targetDir,
-      '-Zip',
-      zipPath,
-    ], mode: ProcessStartMode.detached);
-    return const InstallOutcome(ok: true, message: '更新已下载，App 会重启完成安装。');
+
+    try {
+      await Process.start('powershell', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        script.path,
+        '-TargetPid',
+        pid.toString(),
+        '-Target',
+        targetDir,
+        '-Zip',
+        zipPath,
+        '-Log',
+        log.path,
+      ], mode: ProcessStartMode.detached);
+    } catch (e) {
+      return InstallOutcome(
+        ok: false,
+        message: '无法启动 Windows 安装器：$e（日志：${log.path}）',
+      );
+    }
+    return const InstallOutcome(
+      ok: true,
+      message: '更新已下载，App 会退出，由系统安装器替换并重启。',
+    );
   }
 
   /// 语义化版本比较：忽略 v 前缀和预发布后缀，按数字段比较。

@@ -150,3 +150,32 @@ Windows 包里的 `SDL2.dll`（SDL2 2.32.0，zlib 许可证）和
 `swscale-10.dll`（FFmpeg 9.0 LGPL shared，BtbN 构建）由
 `scripts/fetch-win-deps.sh` 下载到 `$DLNA_DEPS_ROOT/win64`。发布包会带上
 `LICENSE-SDL2.txt` 和 `LICENSE-FFmpeg.txt`；不要换成 GPL 构建。
+
+字幕渲染使用 **libass 0.17.5 及依赖库**，全部由
+`scripts/build-win-subs-deps.sh` 用 `x86_64-w64-mingw32-gcc` 从源码交叉编译到
+`$DLNA_DEPS_ROOT/win64/subs`（`fetch-win-deps.sh` 会自动调用它），产物不在仓库里：
+
+| 组件 | 版本 | 许可 | 源码 |
+| --- | --- | --- | --- |
+| libass | 0.17.5 | ISC | https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.gz |
+| freetype | 2.15.0 | FTL 或 GPLv2 | https://download.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz |
+| fribidi | 1.0.16 | LGPL-2.1+ | https://github.com/fribidi/fribidi/releases/download/v1.0.16/fribidi-1.0.16.tar.xz |
+| harfbuzz | 15.0.0 | MIT | https://github.com/harfbuzz/harfbuzz/releases/download/15.0.0/harfbuzz-15.0.0.tar.xz |
+| libunibreak | 7.0 | Zlib | https://github.com/adah1972/libunibreak/releases/download/libunibreak_7_0/libunibreak-7.0.tar.gz |
+
+- 字体来源是 **DirectWrite**（`-Dfontconfig=disabled -Ddirectwrite=enabled`），不需要
+  fontconfig.dll，也不需要字体配置和字体文件；凡是 Windows 系统里装了的中文字体
+  （微软雅黑、宋体等）都能被 libass 按脚本里的字体名找到，找不到时回退系统默认字体。
+- harfbuzz 关掉了 glib/icu/graphite2/cairo/subset/raster/vector(/gpu），并且用
+  `-Dc_link_args=-static-libgcc -Dcpp_link_args=-static-libgcc` 静态链 libgcc，
+  所以最终只需要 `libass-9.dll`、`libfreetype-6.dll`、`libfribidi-0.dll`、
+  `libharfbuzz-0.dll`、`libunibreak-7.dll` 五个文件（约 4.8MB），无额外运行库。
+- 脚本自带依赖闭包自检：每个 DLL 的导入表里出现的非系统库必须能在同目录找到，
+  否则直接报错退出（macOS 上也能跑，本地验证的就是这个逻辑）。
+- 许可文本由 `build-windows-native.sh` 从 `win64/subs/share/licenses` 收集到 stage：
+  `LICENSE-libass.txt`（ISC）、`LICENSE-freetype-FTL.txt`、
+  `LICENSE-freetype-GPLv2.txt`、`LICENSE-fribidi.txt`（LGPL-2.1）、
+  `LICENSE-harfbuzz.txt`（MIT）、`LICENSE-libunibreak.txt`（Zlib）。
+  仓库内副本在 `third_party/licenses/`。
+- LGPL 动态链接义务（fribidi）：保持未修改的独立 DLL、允许用户替换，随包附许可文本与
+  源码地址即可，与 FFmpeg 的做法一致。

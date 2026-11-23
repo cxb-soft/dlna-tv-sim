@@ -57,7 +57,8 @@ jobs:
         if: matrix.native
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-tools
+          sudo apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-tools \
+            meson ninja-build pkg-config autoconf automake libtool
       - name: Fetch Windows native deps
         if: matrix.native
         run: ./scripts/fetch-win-deps.sh
@@ -144,6 +145,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stage\engine" | Out-Null
           Copy-Item -Recurse "dist\engine\*" "$stage\engine\"
           if (-not (Test-Path "$stage\engine\SDL2.dll")) { throw "SDL2.dll missing from engine bundle" }
+          if (-not (Test-Path "$stage\engine\libass-9.dll")) { throw "libass-9.dll missing from engine bundle" }
           Copy-Item -Recurse "uosc" "$stage\engine\uosc"
           New-Item -ItemType Directory -Force -Path "$stage\engine\mpv" | Out-Null
           Copy-Item "mpv\mpv.exe" "$stage\engine\mpv\"
@@ -210,7 +212,7 @@ jobs:
             if [ "$arch" = "x64" ]; then
               # 自研播放核心的运行库（由 build 作业的 win64-native-runtime 提供）
               if compgen -G "*.dll" >/dev/null; then cp *.dll "stage-$arch/"; fi
-              for f in LICENSE-FFmpeg.txt LICENSE-SDL2.txt COPYING.LGPLv2.1; do
+              for f in LICENSE-*.txt COPYING.*; do
                 if [ -f "$f" ]; then cp "$f" "stage-$arch/"; fi
               done
             fi
@@ -226,6 +228,13 @@ jobs:
             if [ "$arch" = "x64" ]; then
               unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "SDL2.dll"
               unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "avcodec-.*\.dll"
+              # 字幕渲染：libass 与 4 个依赖 DLL
+              for dll in libass- libfreetype- libfribidi- libharfbuzz- libunibreak-; do
+                unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "$dll" || {
+                  echo "缺少字幕 DLL：$dll" >&2; return 1
+                }
+              done
+              unzip -l "dlna-tv-sim-windows-$arch.zip" | grep -q "LICENSE-libass.txt"
             fi
             rm -rf "stage-$arch"
           }

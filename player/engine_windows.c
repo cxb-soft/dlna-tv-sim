@@ -53,6 +53,10 @@
 
 #include "engine.h"
 
+/* 字幕渲染：FFmpeg 把 SRT/ASS 都解成 ASS 事件，libass 负责排版和栅格化，
+   输出的是一张 ARGB 位图，叠到视频画面上。和 macOS 版同一套做法。 */
+#include <ass/ass.h>
+
 #ifdef _WIN32
 #define PE_LOG(...) do { \
     fprintf(stderr, "[player-win] " __VA_ARGS__); fprintf(stderr, "\n"); fflush(stderr); \
@@ -67,6 +71,7 @@
 #define PE_AUDIO_RATE 48000
 #define PE_AUDIO_CHANNELS 2
 #define PE_AUDIO_SECONDS 4
+#define PE_SUB_SEEN 512
 
 typedef struct PeFrameNode {
     AVFrame *frame;
@@ -143,6 +148,9 @@ struct PePlayer {
     double seek_request_t0, seek_target;
     int seek_first_frame_logged;
     int64_t audio_dropped_bytes;
+    /* 音频缓冲快满时把这一包先存着，让视频继续解码，稍后再补上；
+       直接丢会把音频时间线剪短，听感上就是缺口。 */
+    AVPacket *pending_audio;
     double discard_before;
 
     char url[2048];
@@ -199,11 +207,48 @@ struct PePlayer {
     int want_audio_id;
     int cur_audio_id, cur_sub_id;
 
+    /* 字幕：FFmpeg 解包拿 ASS 事件，libass 渲染成位图叠加到视频上。
+       sctx/sstream 归媒体线程用；ass_* 和 sub_px 由 smu 保护。 */
+    AVCodecContext *sctx;
+    int sstream;              /* 当前字幕流索引，-1 = 无 */
+    int want_sub_id;          /* 待切换的字幕轨 id，0 = 关 */
+    volatile int switch_sub_req;
+    ASS_Library *ass_lib;
+    ASS_Renderer *ass_render;
+    ASS_Track *ass_track;
+    SDL_mutex *smu;
+    int ass_w, ass_h;         /* ass_set_frame_size 当前值 */
+    SDL_Texture *sub_tex;
+    unsigned char *sub_px;    /* ARGB8888 字幕位图，尺寸同视频帧 */
+    size_t sub_px_cap;
+    int sub_tex_w, sub_tex_h;
+    int sub_dirty_full;       /* 纹理刚建好，需要整帧上传 */
+    int sub_active;           /* 当前帧有字幕要画 */
+    int sub_bx, sub_by, sub_bw, sub_bh;  /* 上一帧字幕覆盖区域 */
+    int sub_bbox_valid;
+
+    /* 最近几条字幕文本，供 pe_get_subtitle_text 兼容接口取当前一句 */
+    struct {
+        double start, end;
+        char text[512];
+    } scues[24];
+    int nscues, scue_head;
+
+    /* seek 前会先回退 10 秒只解字幕包（跟 macOS 一样），随后正常播放又会读到
+       同一批包。这里用一张环形去重表把重复投递的同一句挡掉，
+       seek 时清空，否则 seek 回原位置后字幕会出不来。 */
+    unsigned long long sub_seen[PE_SUB_SEEN];
+    int sub_seen_n, sub_seen_head;
+
     int gfx_done;
     int run_started, run_returned;
 };
 
 /* ---------- 小工具 ---------- */
+
+static void pe_decode_subtitle(PePlayer *p, AVPacket *pkt);
+static void pe_ass_reset_track(PePlayer *p);
+static void pe_sub_seen_clear(PePlayer *p);
 
 double pe_now(void) { return (double)av_gettime_relative() / 1000000.0; }
 
@@ -251,6 +296,17 @@ static double pe_frame_time(PePlayer *p, AVFrame *f, int stream_index) {
     if (p->start_offset > 0) t -= (double)p->start_offset / AV_TIME_BASE;
     if (t < 0) t = 0;
     return t;
+}
+
+/* 在二进制缓冲区里找子串（memmem 是 GNU 扩展，mingw 上没有）。 */
+static const char *pe_mem_find(const void *hay, size_t haylen, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0 || haylen < n) return NULL;
+    const char *h = (const char *)hay;
+    for (size_t i = 0; i + n <= haylen; i++) {
+        if (h[i] == needle[0] && memcmp(h + i, needle, n) == 0) return h + i;
+    }
+    return NULL;
 }
 
 static int pe_ring_len(PePlayer *p) {
@@ -536,9 +592,11 @@ static int pe_append_audio(PePlayer *p, const uint8_t *data, int bytes, double p
         }
         SDL_UnlockAudioDevice(p->adev);
         if (p->seek_req || p->switch_audio_req) return 0;
-        /* 视频队列见底时优先让解复用继续走；宁可丢这包音频，避免黑屏/seek 卡住。 */
-        if (p->has_video && (!p->video_primed || p->fcount < 4)) {
+        /* 走到这里说明缓冲真的没空间了。只有在视频队列已经彻底见底（没有帧可显示）
+           且不能靠暂存解决时才丢，避免正常播放时频繁剪掉音频。 */
+        if (p->has_video && p->video_primed && p->fcount == 0) {
             p->audio_dropped_bytes += bytes;
+            PE_LOG("音频丢包 %d 字节（视频队列见底且缓冲已满）", bytes);
             return 0;
         }
         SDL_Delay(5);
@@ -608,11 +666,43 @@ static void pe_do_seek(PePlayer *p, double target) {
     p->seek_first_frame_logged = 0;
 
     int64_t ts = (int64_t)((target + (double)p->start_offset / AV_TIME_BASE) * AV_TIME_BASE);
+
+    /* 跨目标点的字幕事件（比如 9..13s 的字幕，目标是 10s）直接 seek 到 10s 读不到，
+       先回到目标前 10 秒只解字幕包，seek 后当前这句才能立刻显示。
+       libass 按时间索引事件，事件永久保留、不 flush：往回 seek 到某句中间时
+       这句还在；重复投递的由 pe_ass_feed_locked 的去重表挡掉。 */
+    if (p->sctx && p->sstream >= 0 && p->cur_sub_id > 0) {
+        double pre = target > 10.0 ? target - 10.0 : 0.0;
+        int64_t pre_ts = (int64_t)((pre + (double)p->start_offset / AV_TIME_BASE) * AV_TIME_BASE);
+        if (av_seek_frame(p->fmt, -1, pre_ts, AVSEEK_FLAG_BACKWARD) >= 0) {
+            avcodec_flush_buffers(p->sctx);
+            AVPacket *spkt = av_packet_alloc();
+            if (spkt) {
+                for (int guard = 0; guard < 20000; guard++) {
+                    int rr = av_read_frame(p->fmt, spkt);
+                    if (rr < 0) break;
+                    double pts = 0;
+                    if (spkt->pts != AV_NOPTS_VALUE) {
+                        pts = (double)spkt->pts *
+                              av_q2d(p->fmt->streams[spkt->stream_index]->time_base);
+                        if (p->start_offset > 0) pts -= (double)p->start_offset / AV_TIME_BASE;
+                    }
+                    if (spkt->stream_index == p->sstream) pe_decode_subtitle(p, spkt);
+                    int done = pts > target + 2.0;
+                    av_packet_unref(spkt);
+                    if (done) break;
+                }
+                av_packet_free(&spkt);
+            }
+        }
+    }
+
     if (av_seek_frame(p->fmt, -1, ts, AVSEEK_FLAG_BACKWARD) < 0) {
         PE_LOG("seek %.2f 失败", target);
     }
     if (p->vctx) avcodec_flush_buffers(p->vctx);
     if (p->actx) avcodec_flush_buffers(p->actx);
+    if (p->sctx) avcodec_flush_buffers(p->sctx);
     pe_clear_frames(p);
     pe_clear_ring(p);
     if (p->swr) {
@@ -693,7 +783,7 @@ static int pe_interrupt_cb(void *opaque) {
     PePlayer *p = (PePlayer *)opaque;
     if (!p) return 0;
     if (p->stop || p->run_stop) return 1;
-    if (p->seek_req || p->switch_audio_req) return 1;
+    if (p->seek_req || p->switch_audio_req || p->switch_sub_req) return 1;
     if (p->last_read_ok > 0 && pe_now() - p->last_read_ok > 20.0) return 1;
     return 0;
 }
@@ -764,6 +854,515 @@ static void pe_fill_video_info(PePlayer *p) {
     }
 }
 
+/* ---------- 字幕（libass） ---------- */
+
+#ifdef _WIN32
+#define PE_SUB_FONT "Microsoft YaHei"
+#else
+#define PE_SUB_FONT "PingFang SC"
+#endif
+
+static void pe_ass_fmt_time(double sec, char *out, size_t len) {
+    if (sec < 0) sec = 0;
+    int total = (int)llround(sec * 100.0);
+    int h = total / 360000;
+    int m = (total / 6000) % 60;
+    int s = (total / 100) % 60;
+    int cs = total % 100;
+    snprintf(out, len, "%d:%02d:%02d.%02d", h, m, s, cs);
+}
+
+static const char *pe_skip_commas(const char *s, int n) {
+    for (int i = 0; i < n && s; i++) {
+        const char *c = strchr(s, ',');
+        if (!c) return s;
+        s = c + 1;
+    }
+    return s;
+}
+
+/* 取出 AVSubtitleRect 里的 ASS 事件文本。FFmpeg 的 SRT/ASS 解码器都把结果表示成
+   ASS 事件：带 "Dialogue:" 前缀时字段在 9 个逗号之后；Matroska 的 ASS 包没有
+   前缀，字段是 ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text。 */
+static const char *pe_sub_rect_field(AVSubtitleRect *r) {
+    if (!r) return NULL;
+    if (r->type == SUBTITLE_ASS && r->ass) {
+        const char *d = strstr(r->ass, "Dialogue:");
+        if (d) return pe_skip_commas(d + 9, 9);
+        int alt = 0;
+        const char *p = r->ass;
+        for (int i = 0; i < 3 && p; i++) {
+            const char *comma = strchr(p, ',');
+            size_t field = comma ? (size_t)(comma - p) : strlen(p);
+            if (memchr(p, ':', field)) alt = 1;
+            p = comma ? comma + 1 : NULL;
+        }
+        return pe_skip_commas(r->ass, alt ? 9 : 8);
+    }
+    if (r->text) return r->text;
+    return NULL;
+}
+
+/* 剥掉 {\pos(...)} 这类样式覆盖标签，只留纯文本（兼容接口用）。 */
+static void pe_sub_plain(const char *src, char *out, size_t len) {
+    out[0] = 0;
+    if (!src) return;
+    size_t o = 0;
+    for (const char *s = src; *s && o + 1 < len; s++) {
+        if (*s == '{') {
+            while (*s && *s != '}') s++;
+            continue;
+        }
+        if (*s == '\\' && s[1]) {
+            char c = s[1];
+            if (c == 'N' || c == 'n') { out[o++] = '\n'; s++; continue; }
+            if (c == 'h') { out[o++] = ' '; s++; continue; }
+        }
+        if (*s == '\r') continue;
+        out[o++] = *s;
+    }
+    out[o] = 0;
+    size_t b = 0;
+    while (out[b] == ' ' || out[b] == '\n' || out[b] == '\t') b++;
+    if (b > 0) memmove(out, out + b, strlen(out + b) + 1);
+    size_t n = strlen(out);
+    while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\n' || out[n - 1] == '\t')) out[--n] = 0;
+}
+
+/* 新建一条 libass 轨道。ASS 从 extradata 读样式头（字体/颜色/位置），
+   SRT 没有 extradata 就用一份默认样式。调用时已持 smu。 */
+static void pe_ass_reset_track_locked(PePlayer *p) {
+    if (!p->ass_lib) return;
+    if (p->ass_track) { ass_free_track(p->ass_track); p->ass_track = NULL; }
+    p->sub_active = 0;
+    int vw = p->width > 0 ? p->width : 1920;
+    int vh = p->height > 0 ? p->height : 1080;
+    if (p->ass_render) {
+        ass_set_frame_size(p->ass_render, vw, vh);
+        ass_set_storage_size(p->ass_render, vw, vh);
+    }
+    p->ass_w = vw;
+    p->ass_h = vh;
+    p->ass_track = ass_new_track(p->ass_lib);
+    if (!p->ass_track) return;
+    ass_set_check_readorder(p->ass_track, 0);
+    int have_private = 0;
+    if (p->sstream >= 0 && p->sstream < (int)p->fmt->nb_streams) {
+        AVCodecParameters *par = p->fmt->streams[p->sstream]->codecpar;
+        /* 只有 ASS/SSA 的 extradata 才是脚本文本（[Script Info]/[V4+ Styles]）。
+           mov_text（mp4）的 extradata 是二进制 f4v 头（ftab/btrt），
+           传给 libass 会被当成没有 PlayRes 的脚本，字号按 384x288 放大得很离谱。 */
+        if (par->extradata && par->extradata_size > 0 &&
+            pe_mem_find(par->extradata, (size_t)par->extradata_size, "[Script Info]")) {
+            const char *ext = (const char *)par->extradata;
+            int has_res = pe_mem_find(ext, (size_t)par->extradata_size, "PlayResX") != NULL;
+            if (has_res) {
+                ass_process_codec_private(p->ass_track, ext, par->extradata_size);
+            } else {
+                /* 样式头没写分辨率：补一段 Script Info，否则 libass 用 384x288 缩放字号。 */
+                char *buf = (char *)malloc((size_t)par->extradata_size + 256);
+                if (buf) {
+                    int n = snprintf(buf, (size_t)par->extradata_size + 256,
+                                     "[Script Info]\nScriptType: v4.00+\n"
+                                     "PlayResX: %d\nPlayResY: %d\n"
+                                     "WrapStyle: 0\nScaledBorderAndShadow: yes\n\n%.*s",
+                                     vw, vh, par->extradata_size, ext);
+                    if (n > 0) ass_process_codec_private(p->ass_track, buf, n);
+                    free(buf);
+                }
+            }
+            have_private = 1;
+            PE_LOG("libass 读取 ASS 样式头 %d 字节（%d 种样式，PlayRes %s）",
+                   par->extradata_size, p->ass_track->n_styles, has_res ? "自带" : "已补");
+        }
+    }
+    if (!have_private) {
+        /* 默认样式用 1920x1080 作 PlayRes：libass 会按住 frame size 等比缩放字号，
+           直接用视频尺寸会把同一字号在小画面上放大得很大。 */
+        char header[1024];
+        snprintf(header, sizeof(header),
+                 "[Script Info]\n"
+                 "ScriptType: v4.00+\n"
+                 "PlayResX: 1920\n"
+                 "PlayResY: 1080\n"
+                 "WrapStyle: 0\n"
+                 "ScaledBorderAndShadow: yes\n\n"
+                 "[V4+ Styles]\n"
+                 "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+                 "Style: Default,%s,66,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3.2,0,2,60,60,58,1\n\n"
+                 "[Events]\n"
+                 "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+                 PE_SUB_FONT);
+        ass_process_data(p->ass_track, header, (int)strlen(header));
+    }
+}
+
+static void pe_ass_reset_track(PePlayer *p) {
+    if (!p || !p->smu) return;
+    SDL_LockMutex(p->smu);
+    pe_ass_reset_track_locked(p);
+    SDL_UnlockMutex(p->smu);
+}
+
+/* 把一条字幕投给 libass。style 是 ASS 里的样式名，空则用 Default。
+   调用时已持 smu。
+   seek 前预取和随后的正常播放会读到同一批字幕包，用一张环形表把重复的挡掉，
+   否则同一句会被 libass 叠成两层。 */
+static void pe_ass_feed_locked(PePlayer *p, const char *raw, const char *style,
+                               double start, double end) {
+    if (!p->ass_track || !raw || !raw[0]) return;
+    unsigned long long h = 1469598103934665603ULL;
+    for (const char *s = raw; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211ULL;
+    }
+    long long ss = (long long)llround(start * 1000.0);
+    long long ee = (long long)llround(end * 1000.0);
+    h ^= (unsigned long long)(ss * 1000003LL + ee);
+    h *= 1099511628211ULL;
+    for (int i = 0; i < p->sub_seen_n; i++) {
+        if (p->sub_seen[i] == h) return;
+    }
+    int slot = p->sub_seen_head;
+    p->sub_seen[slot] = h;
+    p->sub_seen_head = (slot + 1) % PE_SUB_SEEN;
+    if (p->sub_seen_n < PE_SUB_SEEN) p->sub_seen_n++;
+
+    char st[32], et[32], line[8192];
+    const char *sty = (style && style[0]) ? style : "Default";
+    pe_ass_fmt_time(start, st, sizeof(st));
+    pe_ass_fmt_time(end, et, sizeof(et));
+    snprintf(line, sizeof(line), "Dialogue: 0,%s,%s,%s,,0,0,0,,%s\n", st, et, sty, raw);
+    ass_process_data(p->ass_track, line, (int)strlen(line));
+}
+
+static void pe_sub_seen_clear(PePlayer *p) {
+    p->sub_seen_n = 0;
+    p->sub_seen_head = 0;
+}
+
+static void pe_sub_cue_add_locked(PePlayer *p, double start, double end, const char *text) {
+    if (!text || !text[0]) return;
+    int i = p->scue_head;
+    p->scues[i].start = start;
+    p->scues[i].end = end;
+    pe_strdup(p->scues[i].text, sizeof(p->scues[i].text), text);
+    p->scue_head = (i + 1) % (int)(sizeof(p->scues) / sizeof(p->scues[0]));
+    if (p->nscues < (int)(sizeof(p->scues) / sizeof(p->scues[0]))) p->nscues++;
+}
+
+/* 解一个字幕包：一边交给 libass 渲染，一边留下纯文本给兼容接口。 */
+static void pe_decode_subtitle(PePlayer *p, AVPacket *pkt) {
+    if (!p->sctx) return;
+    AVSubtitle sub;
+    memset(&sub, 0, sizeof(sub));
+    int got = 0;
+    if (avcodec_decode_subtitle2(p->sctx, &sub, &got, pkt) < 0) return;
+    if (!got) return;
+
+    double base = 0;
+    if (sub.pts != AV_NOPTS_VALUE) {
+        base = (double)sub.pts / AV_TIME_BASE;
+    } else if (pkt->pts != AV_NOPTS_VALUE && p->sstream >= 0) {
+        base = (double)pkt->pts * av_q2d(p->fmt->streams[p->sstream]->time_base);
+    }
+    if (p->start_offset > 0) base -= (double)p->start_offset / AV_TIME_BASE;
+    if (base < 0) base = 0;
+    double start = base + (double)sub.start_display_time / 1000.0;
+    double end = base + (double)sub.end_display_time / 1000.0;
+    if (end <= start + 0.01) end = start + 4.0;
+
+    static int sub_logs = 0;
+    char all[1024];
+    all[0] = 0;
+    if (p->smu) SDL_LockMutex(p->smu);
+    for (unsigned i = 0; i < sub.num_rects; i++) {
+        AVSubtitleRect *r = sub.rects[i];
+        const char *raw = pe_sub_rect_field(r);
+        if (!raw || !raw[0]) continue;
+        char style[64];
+        style[0] = 0;
+        if (r->type == SUBTITLE_ASS && r->ass) {
+            const char *d = strstr(r->ass, "Dialogue:");
+            const char *f = d ? pe_skip_commas(d + 9, 3) : pe_skip_commas(r->ass, 2);
+            const char *comma = f ? strchr(f, ',') : NULL;
+            size_t n = comma ? (size_t)(comma - f) : (f ? strlen(f) : 0);
+            if (n >= sizeof(style)) n = sizeof(style) - 1;
+            if (f && n > 0) memcpy(style, f, n);
+            style[n] = 0;
+        }
+        pe_ass_feed_locked(p, raw, style, start, end);
+
+        char plain[512];
+        pe_sub_plain(raw, plain, sizeof(plain));
+        if (!plain[0]) continue;
+        size_t o = strlen(all);
+        if (o + 1 < sizeof(all)) {
+            if (o > 0) snprintf(all + o, sizeof(all) - o, "\n");
+            o = strlen(all);
+            snprintf(all + o, sizeof(all) - o, "%s", plain);
+        }
+    }
+    if (all[0]) pe_sub_cue_add_locked(p, start, end, all);
+    if (p->smu) SDL_UnlockMutex(p->smu);
+
+    if (sub_logs < 5) {
+        sub_logs++;
+        PE_LOG("字幕 %.3f..%.3f %s", start, end, all[0] ? all : "(空)");
+    }
+    avsubtitle_free(&sub);
+}
+
+static int pe_open_sub_codec(PePlayer *p) {
+    if (p->sctx) { avcodec_free_context(&p->sctx); }
+    if (p->sstream < 0 || p->sstream >= (int)p->fmt->nb_streams) return -1;
+    AVStream *st = p->fmt->streams[p->sstream];
+    const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) {
+        PE_LOG("字幕流 %d 没有解码器（%s）", p->sstream,
+               avcodec_get_name(st->codecpar->codec_id));
+        return -1;
+    }
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    if (!ctx) return -1;
+    if (avcodec_parameters_to_context(ctx, st->codecpar) < 0 ||
+        avcodec_open2(ctx, codec, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        return -1;
+    }
+    ctx->pkt_timebase = st->time_base;
+    p->sctx = ctx;
+    PE_LOG("字幕解码器：%s（流 %d）", codec->name, p->sstream);
+    return 0;
+}
+
+/* 切字幕轨：重建解码器和 libass 轨道，再 seek 回当前位置，让新轨从当前这句开始。 */
+static void pe_switch_subtitles(PePlayer *p) {
+    double pos = pe_clock(p);
+    if (p->sctx) { avcodec_free_context(&p->sctx); }
+    p->sstream = -1;
+    p->cur_sub_id = 0;
+    if (p->want_sub_id > 0 && p->want_sub_id <= p->nstracks) {
+        int idx = p->stracks[p->want_sub_id - 1].stream_index;
+        p->sstream = idx;
+        if (pe_open_sub_codec(p) == 0) {
+            p->cur_sub_id = p->want_sub_id;
+        } else {
+            p->sstream = -1;
+        }
+    }
+    if (p->smu) SDL_LockMutex(p->smu);
+    p->nscues = 0;
+    p->scue_head = 0;
+    pe_ass_reset_track_locked(p);
+    pe_sub_seen_clear(p);
+    SDL_UnlockMutex(p->smu);
+    p->switch_sub_req = 0;
+    p->seek_req = 1;
+    p->seek_pos = pos;
+    PE_LOG("切字幕 → %d（流 %d，位置 %.2fs）", p->cur_sub_id, p->sstream, pos);
+}
+
+static void pe_ass_init(PePlayer *p) {
+    p->ass_lib = ass_library_init();
+    if (!p->ass_lib) {
+        PE_LOG("libass 初始化失败，字幕不渲染");
+        return;
+    }
+    /* 默认不要字幕阴影：ASS 里常见的深色投影在电视上显得糊，和 macOS 版一致。 */
+    const char *ov[] = {"Shadow=0", NULL};
+    ass_set_style_overrides(p->ass_lib, (char **)ov);
+    p->ass_render = ass_renderer_init(p->ass_lib);
+    if (!p->ass_render) {
+        PE_LOG("libass renderer 初始化失败，字幕不渲染");
+        return;
+    }
+    ass_set_fonts(p->ass_render, NULL, PE_SUB_FONT, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
+    int vw = p->width > 0 ? p->width : 1280;
+    int vh = p->height > 0 ? p->height : 720;
+    ass_set_frame_size(p->ass_render, vw, vh);
+    ass_set_storage_size(p->ass_render, vw, vh);
+    /* 非方形像素的视频（SAR≠1）字幕会被拉伸，先告诉 libass 真实宽高比。 */
+    ass_set_pixel_aspect(p->ass_render, p->sar > 0 ? p->sar : 1.0);
+    p->ass_w = vw;
+    p->ass_h = vh;
+    PE_LOG("libass %d 初始化完成（字体 %s）", ass_library_version(), PE_SUB_FONT);
+}
+
+/* 按当前时间从 libass 取字幕图，合成为一张 ARGB 位图贴到视频画面上。
+   只重绘、上传字幕覆盖的那一块，避免每帧刷整帧 8MB。 */
+static void pe_render_subtitles(PePlayer *p, const SDL_Rect *dst) {
+    if (!p || !p->ren || !dst || dst->w <= 0 || dst->h <= 0) return;
+    if (!p->ass_render || !p->ass_track || !p->smu) return;
+    if (p->cur_sub_id <= 0) return;
+    /* 按显示尺寸渲染字幕，而不是视频原始尺寸：像 640x360 的小画面拉到 1280x720 时，
+       如果先按 640x360 出字再被放大，笔画经双线性插值会发虚发灰（实测最亮只有 229）。
+       与画布 1:1 叠加后字形才锐利。storage size 仍用视频尺寸，供 libass 算像素宽高比。 */
+    int vw = dst->w, vh = dst->h;
+    const int sw = p->tex_w, sh = p->tex_h;
+    if (vw <= 0 || vh <= 0 || sw <= 0 || sh <= 0) return;
+
+    double pos = pe_clock(p);
+    if (pos < 0) pos = 0;
+
+    SDL_LockMutex(p->smu);
+    if (p->ass_w != vw || p->ass_h != vh) {
+        ass_set_frame_size(p->ass_render, vw, vh);
+        ass_set_storage_size(p->ass_render, sw, sh);
+        ass_set_pixel_aspect(p->ass_render, p->sar > 0 ? p->sar : 1.0);
+        p->ass_w = vw;
+        p->ass_h = vh;
+    }
+    int changed = 0;
+    ASS_Image *imgs = ass_render_frame(p->ass_render, p->ass_track,
+                                       (long long)llround(pos * 1000.0), &changed);
+
+    int have_new = 0;
+    int x0 = vw, y0 = vh, x1 = 0, y1 = 0;
+    for (ASS_Image *im = imgs; im; im = im->next) {
+        if (im->w <= 0 || im->h <= 0) continue;
+        int ix0 = im->dst_x, iy0 = im->dst_y;
+        int ix1 = im->dst_x + im->w, iy1 = im->dst_y + im->h;
+        if (ix0 < 0) ix0 = 0;
+        if (iy0 < 0) iy0 = 0;
+        if (ix1 > vw) ix1 = vw;
+        if (iy1 > vh) iy1 = vh;
+        if (ix0 >= ix1 || iy0 >= iy1) continue;
+        have_new = 1;
+        if (ix0 < x0) x0 = ix0;
+        if (iy0 < y0) y0 = iy0;
+        if (ix1 > x1) x1 = ix1;
+        if (iy1 > y1) y1 = iy1;
+    }
+
+    if (!have_new) {
+        /* 这一帧没有字幕：必须把上一帧字幕区域的像素从纹理里抹掉。
+           否则下一句只更新自己的区域时，旧文字会被重新画出来。 */
+        if (p->sub_bbox_valid && p->sub_px && p->sub_tex &&
+            p->sub_bx >= 0 && p->sub_by >= 0 &&
+            p->sub_bx + p->sub_bw <= vw && p->sub_by + p->sub_bh <= vh) {
+            for (int y = p->sub_by; y < p->sub_by + p->sub_bh; y++) {
+                memset(p->sub_px + ((size_t)y * (size_t)vw + (size_t)p->sub_bx) * 4, 0,
+                       (size_t)p->sub_bw * 4);
+            }
+            SDL_Rect upd = {p->sub_bx, p->sub_by, p->sub_bw, p->sub_bh};
+            const void *px = p->sub_px + ((size_t)upd.y * (size_t)vw + (size_t)upd.x) * 4;
+            SDL_UpdateTexture(p->sub_tex, &upd, px, vw * 4);
+        }
+        p->sub_active = 0;
+        p->sub_bbox_valid = 0;
+        SDL_UnlockMutex(p->smu);
+        return;
+    }
+
+    if (!changed && p->sub_tex && p->sub_active && !p->sub_dirty_full) {
+        SDL_UnlockMutex(p->smu);
+        SDL_RenderCopy(p->ren, p->sub_tex, NULL, dst);
+        return;
+    }
+
+    size_t need = (size_t)vw * (size_t)vh * 4;
+    if (p->sub_px_cap < need) {
+        unsigned char *nb = (unsigned char *)realloc(p->sub_px, need);
+        if (!nb) {
+            SDL_UnlockMutex(p->smu);
+            return;
+        }
+        p->sub_px = nb;
+        p->sub_px_cap = need;
+        p->sub_dirty_full = 1;
+    }
+    if (p->sub_dirty_full) {
+        memset(p->sub_px, 0, need);
+        p->sub_bbox_valid = 0;
+    }
+    if (!p->sub_tex || p->sub_tex_w != vw || p->sub_tex_h != vh) {
+        if (p->sub_tex) SDL_DestroyTexture(p->sub_tex);
+        p->sub_tex = SDL_CreateTexture(p->ren, SDL_PIXELFORMAT_ABGR8888,
+                                       SDL_TEXTUREACCESS_STREAMING, vw, vh);
+        p->sub_tex_w = vw;
+        p->sub_tex_h = vh;
+        p->sub_dirty_full = 1;
+        memset(p->sub_px, 0, need);
+        p->sub_bbox_valid = 0;
+        if (p->sub_tex) SDL_SetTextureBlendMode(p->sub_tex, SDL_BLENDMODE_BLEND);
+    }
+    if (!p->sub_tex) {
+        SDL_UnlockMutex(p->smu);
+        return;
+    }
+
+    /* 上传范围 = 上一帧字幕区域 ∪ 这一帧字幕区域 */
+    int ux0 = x0, uy0 = y0, ux1 = x1, uy1 = y1;
+    if (p->sub_bbox_valid) {
+        if (p->sub_bx < ux0) ux0 = p->sub_bx;
+        if (p->sub_by < uy0) uy0 = p->sub_by;
+        if (p->sub_bx + p->sub_bw > ux1) ux1 = p->sub_bx + p->sub_bw;
+        if (p->sub_by + p->sub_bh > uy1) uy1 = p->sub_by + p->sub_bh;
+    }
+    if (p->sub_dirty_full) {
+        ux0 = 0; uy0 = 0; ux1 = vw; uy1 = vh;
+    }
+    for (int y = uy0; y < uy1; y++) {
+        memset(p->sub_px + ((size_t)y * (size_t)vw + (size_t)ux0) * 4, 0,
+               (size_t)(ux1 - ux0) * 4);
+    }
+
+    /* 逐层 over 合成，先按预乘存，最后再反预乘成直通 alpha。 */
+    for (ASS_Image *im = imgs; im; im = im->next) {
+        uint32_t c = im->color;
+        int cr = (int)((c >> 24) & 0xff);
+        int cg = (int)((c >> 16) & 0xff);
+        int cb = (int)((c >> 8) & 0xff);
+        int ca = 255 - (int)(c & 0xff);
+        if (ca <= 0) continue;
+        for (int y = 0; y < im->h; y++) {
+            int dy = im->dst_y + y;
+            if (dy < 0 || dy >= vh) continue;
+            const unsigned char *src = im->bitmap + (size_t)y * (size_t)im->stride;
+            unsigned char *row = p->sub_px + ((size_t)dy * (size_t)vw) * 4;
+            for (int x = 0; x < im->w; x++) {
+                int dx = im->dst_x + x;
+                if (dx < 0 || dx >= vw) continue;
+                int a = (ca * (int)src[x]) / 255;
+                if (a <= 0) continue;
+                unsigned char *d = row + (size_t)dx * 4;
+                int inv = 255 - a;
+                d[0] = (unsigned char)((cr * a + d[0] * inv) / 255);
+                d[1] = (unsigned char)((cg * a + d[1] * inv) / 255);
+                d[2] = (unsigned char)((cb * a + d[2] * inv) / 255);
+                d[3] = (unsigned char)(a + (d[3] * inv) / 255);
+            }
+        }
+    }
+    for (int y = y0; y < y1; y++) {
+        unsigned char *row = p->sub_px + ((size_t)y * (size_t)vw + (size_t)x0) * 4;
+        for (int x = x0; x < x1; x++, row += 4) {
+            unsigned a = row[3];
+            if (a == 0 || a == 255) continue;
+            row[0] = (unsigned char)((row[0] * 255u + a / 2) / a);
+            row[1] = (unsigned char)((row[1] * 255u + a / 2) / a);
+            row[2] = (unsigned char)((row[2] * 255u + a / 2) / a);
+        }
+    }
+
+    SDL_Rect upd = {ux0, uy0, ux1 - ux0, uy1 - uy0};
+    if (upd.w > 0 && upd.h > 0) {
+        const void *px = p->sub_px + ((size_t)upd.y * (size_t)vw + (size_t)upd.x) * 4;
+        SDL_UpdateTexture(p->sub_tex, &upd, px, vw * 4);
+    }
+    p->sub_bx = x0;
+    p->sub_by = y0;
+    p->sub_bw = x1 - x0;
+    p->sub_bh = y1 - y0;
+    p->sub_bbox_valid = 1;
+    p->sub_dirty_full = 0;
+    p->sub_active = 1;
+    SDL_UnlockMutex(p->smu);
+
+    SDL_RenderCopy(p->ren, p->sub_tex, NULL, dst);
+}
+
 /* ---------- 媒体线程 ---------- */
 
 static void pe_flush_decoders(PePlayer *p) {
@@ -775,6 +1374,7 @@ static void pe_flush_decoders(PePlayer *p) {
         avcodec_send_packet(p->actx, NULL);
         pe_receive_audio(p);
     }
+    if (p->sctx) avcodec_flush_buffers(p->sctx);
 }
 
 static void pe_handle_eof(PePlayer *p) {
@@ -807,12 +1407,24 @@ static int SDLCALL pe_media_thread(void *ud) {
     if (!pkt) return -1;
     while (!p->stop) {
         if (p->switch_audio_req) pe_switch_audio(p);
+        if (p->switch_sub_req) pe_switch_subtitles(p);
         if (p->seek_req) {
             double t = p->seek_pos;
             p->seek_req = 0;
             pe_do_seek(p, t);
         }
         if (p->ended) { SDL_Delay(10); continue; }
+
+        /* 之前存下的音频包：缓冲腾出余量就补解码，不剪掉这段时间。 */
+        if (p->pending_audio) {
+            int al = pe_ring_len(p);
+            if (p->ring_cap == 0 || (size_t)al <= p->ring_cap / 2) {
+                int dr = pe_decode_audio(p, p->pending_audio);
+                av_packet_free(&p->pending_audio);
+                if (dr == AVERROR_EXIT) break;
+                continue;
+            }
+        }
 
         if (p->has_video && pe_queue_count(p) >= PE_MAX_FRAMES) { SDL_Delay(4); continue; }
         if (p->has_audio && p->adev && p->video_primed && p->fcount >= 4) {
@@ -841,14 +1453,32 @@ static int SDLCALL pe_media_thread(void *ud) {
             int dr = pe_decode_video(p, pkt);
             if (dr == AVERROR_EXIT) { av_packet_unref(pkt); break; }
         } else if (p->astream >= 0 && pkt->stream_index == p->astream) {
-            int dr = pe_decode_audio(p, pkt);
-            if (dr == AVERROR_EXIT) { av_packet_unref(pkt); break; }
+            int al = pe_ring_len(p);
+            if (p->pending_audio ||
+                (p->adev && p->ring_cap > 0 && (size_t)al > p->ring_cap * 3 / 4)) {
+                /* 缓冲快满：先存着，让视频解复用继续跑，稍后再补。 */
+                if (!p->pending_audio) p->pending_audio = av_packet_alloc();
+                if (p->pending_audio && av_packet_ref(p->pending_audio, pkt) < 0) {
+                    av_packet_free(&p->pending_audio);
+                    int dr = pe_decode_audio(p, pkt);
+                    if (dr == AVERROR_EXIT) { av_packet_unref(pkt); break; }
+                }
+            } else {
+                int dr = pe_decode_audio(p, pkt);
+                if (dr == AVERROR_EXIT) { av_packet_unref(pkt); break; }
+            }
         } else if (p->astream < 0 && p->has_audio) {
             /* 正在切音轨的空档：丢弃旧音轨的包 */
+        } else if (p->sctx && p->sstream >= 0 && pkt->stream_index == p->sstream) {
+            pe_decode_subtitle(p, pkt);
         }
         av_packet_unref(pkt);
     }
     av_packet_free(&pkt);
+    av_packet_free(&p->pending_audio);
+    if (p->audio_dropped_bytes > 0) {
+        PE_LOG("媒体线程退出，音频累计丢包 %lld 字节", (long long)p->audio_dropped_bytes);
+    }
     PE_LOG("媒体线程退出");
     return 0;
 }
@@ -1024,6 +1654,27 @@ PePlayer *pe_open(const PeConfig *cfg, char *errbuf, int errlen) {
         pe_seterr(errbuf, errlen, "这个媒体没有可解码的音视频流");
         goto fail;
     }
+
+    /* 字幕：libass 渲染器 + 默认选第一条字幕轨（和 macOS 版一致）。 */
+    p->sstream = -1;
+    p->smu = SDL_CreateMutex();
+    p->ass_w = -1;
+    p->ass_h = -1;
+    pe_ass_init(p);
+    if (p->nstracks > 0) {
+        int want = cfg->subtitle_track;
+        if (want <= 0 || want > p->nstracks) want = 1;
+        p->want_sub_id = want;
+        p->sstream = p->stracks[want - 1].stream_index;
+        if (pe_open_sub_codec(p) == 0) {
+            p->cur_sub_id = want;
+            pe_ass_reset_track(p);
+            PE_LOG("默认字幕：第 %d 条（流 %d）", want, p->sstream);
+        } else {
+            p->sstream = -1;
+            p->cur_sub_id = 0;
+        }
+    }
     p->buffering = 1;
     p->video_primed = p->has_video ? 0 : 1;
     p->clock_base = p->start_position;
@@ -1053,6 +1704,13 @@ fail:
     if (p->adev) { SDL_CloseAudioDevice(p->adev); p->adev = 0; }
     if (p->vctx) avcodec_free_context(&p->vctx);
     if (p->actx) avcodec_free_context(&p->actx);
+    if (p->sctx) avcodec_free_context(&p->sctx);
+    if (p->ass_track) ass_free_track(p->ass_track);
+    if (p->ass_render) ass_renderer_done(p->ass_render);
+    if (p->ass_lib) ass_library_done(p->ass_lib);
+    if (p->sub_tex) SDL_DestroyTexture(p->sub_tex);
+    free(p->sub_px);
+    if (p->smu) SDL_DestroyMutex(p->smu);
     if (p->fmt) avformat_close_input(&p->fmt);
     if (p->vsws) sws_freeContext(p->vsws);
     if (p->shotsws) sws_freeContext(p->shotsws);
@@ -1313,16 +1971,34 @@ void pe_set_audio_track(PePlayer *p, int id) {
 
 void pe_set_subtitle_track(PePlayer *p, int id) {
     if (!p || id < 0 || id > p->nstracks) return;
-    p->cur_sub_id = id;
+    if (id == p->cur_sub_id && !p->switch_sub_req) return;
+    /* 真正的切换（重建解码器 + libass track + seek 回原位）交给媒体线程，
+       免得在 UI 线程里动解复用上下文。 */
+    p->want_sub_id = id;
+    p->switch_sub_req = 1;
 }
 
 int pe_get_audio_track(PePlayer *p) { return p ? p->cur_audio_id : 0; }
 int pe_get_subtitle_track(PePlayer *p) { return p ? p->cur_sub_id : 0; }
 
 int pe_get_subtitle_text(PePlayer *p, char *buf, int len) {
-    (void)p;
-    if (buf && len > 0) buf[0] = 0;
-    return 0;
+    if (!buf || len <= 0) return 0;
+    buf[0] = 0;
+    if (!p || !p->smu || p->nscues <= 0) return 0;
+    double pos = pe_clock(p);
+    int cap = (int)(sizeof(p->scues) / sizeof(p->scues[0]));
+    int n = 0;
+    SDL_LockMutex(p->smu);
+    for (int i = 0; i < p->nscues; i++) {
+        int idx = (p->scue_head - 1 - i + cap * 2) % cap;
+        if (pos + 0.001 < p->scues[idx].start) continue;
+        if (pos > p->scues[idx].end + 0.001) continue;
+        if (n > 0 && n + 1 < len) buf[n++] = '\n';
+        for (const char *s = p->scues[idx].text; *s && n + 1 < len; s++) buf[n++] = *s;
+    }
+    SDL_UnlockMutex(p->smu);
+    buf[n] = 0;
+    return n;
 }
 
 void *pe_copy_subtitle_image(PePlayer *p) { (void)p; return NULL; }
@@ -2118,7 +2794,7 @@ static void pe_menu_apply(PePlayer *p, int idx) {
     } else if (p->menu == PE_MENU_SUB) {
         pe_set_subtitle_track(p, idx + 1);
         p->toast_error = 0;
-        snprintf(p->toast, sizeof(p->toast), "字幕轨已选择（Windows 版暂不渲染）");
+        snprintf(p->toast, sizeof(p->toast), "已切换到字幕 %d", idx + 1);
         p->toast_until = pe_now() + 2.5;
     } else if (p->menu == PE_MENU_ASPECT) {
         pe_set_aspect(p, kAspects[idx]);
@@ -2318,6 +2994,7 @@ static void pe_render(PePlayer *p, PeLayout *L) {
         SDL_Rect dst;
         pe_video_rect(p, L, p->tex_w, p->tex_h, &dst);
         SDL_RenderCopy(p->ren, p->tex, NULL, &dst);
+        pe_render_subtitles(p, &dst);
     }
 
     double ui = L->ui;
@@ -2850,6 +3527,7 @@ void pe_run(PePlayer *p) {
     if (p->adev) SDL_PauseAudioDevice(p->adev, 1);
     p->run_returned = 1;
     pe_text_cache_clear(p);
+    if (p->sub_tex) { SDL_DestroyTexture(p->sub_tex); p->sub_tex = NULL; }
     if (p->tex) { SDL_DestroyTexture(p->tex); p->tex = NULL; }
     if (p->ren) { SDL_DestroyRenderer(p->ren); p->ren = NULL; }
     if (p->win) { SDL_DestroyWindow(p->win); p->win = NULL; }
@@ -2879,6 +3557,7 @@ void pe_close(PePlayer *p) {
     if (p->adev) { SDL_CloseAudioDevice(p->adev); p->adev = 0; }
     if (!p->run_started && !p->gfx_done) {
         pe_text_cache_clear(p);
+        if (p->sub_tex) { SDL_DestroyTexture(p->sub_tex); p->sub_tex = NULL; }
         if (p->tex) { SDL_DestroyTexture(p->tex); p->tex = NULL; }
         if (p->ren) { SDL_DestroyRenderer(p->ren); p->ren = NULL; }
         if (p->win) { SDL_DestroyWindow(p->win); p->win = NULL; }
@@ -2893,6 +3572,13 @@ void pe_destroy(PePlayer *p) {
     if (p->current) { av_frame_free(&p->current); p->current = NULL; }
     if (p->vctx) avcodec_free_context(&p->vctx);
     if (p->actx) avcodec_free_context(&p->actx);
+    if (p->sctx) avcodec_free_context(&p->sctx);
+    if (p->ass_track) ass_free_track(p->ass_track);
+    if (p->ass_render) ass_renderer_done(p->ass_render);
+    if (p->ass_lib) ass_library_done(p->ass_lib);
+    if (p->sub_tex) SDL_DestroyTexture(p->sub_tex);
+    free(p->sub_px);
+    if (p->smu) SDL_DestroyMutex(p->smu);
     if (p->fmt) avformat_close_input(&p->fmt);
     if (p->vsws) sws_freeContext(p->vsws);
     if (p->shotsws) sws_freeContext(p->shotsws);
