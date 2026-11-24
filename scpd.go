@@ -192,7 +192,17 @@ const scpdAVTransport = `<?xml version="1.0" encoding="utf-8"?>
       <defaultValue>NORMAL</defaultValue>
     </stateVariable>
     <stateVariable sendEvents="no"><name>TransportPlaySpeed</name><dataType>string</dataType>
-      <allowedValueList><allowedValue>1</allowedValue></allowedValueList>
+      <allowedValueList>
+        <allowedValue>0.25</allowedValue>
+        <allowedValue>0.5</allowedValue>
+        <allowedValue>0.75</allowedValue>
+        <allowedValue>1</allowedValue>
+        <allowedValue>1.25</allowedValue>
+        <allowedValue>1.5</allowedValue>
+        <allowedValue>2</allowedValue>
+        <allowedValue>3</allowedValue>
+        <allowedValue>4</allowedValue>
+      </allowedValueList>
     </stateVariable>
     <stateVariable sendEvents="no"><name>RecordMediumWriteStatus</name><dataType>string</dataType>
       <allowedValueList><allowedValue>NOT_IMPLEMENTED</allowedValue></allowedValueList>

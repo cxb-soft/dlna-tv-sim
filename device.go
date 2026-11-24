@@ -66,7 +66,6 @@ type Device struct {
 	// 控制点常在 Play 之后立刻发 Seek，此时播放器可能还没开好；先记下来，开屏后应用。
 	pendingSeek    time.Duration
 	hasPendingSeek bool
-	playSpeed      string
 	playMode       string
 
 	// RenderingControl
@@ -108,7 +107,6 @@ func NewDevice(cfg Config, cfgPath string, verbose bool) *Device {
 		log:       NewEventLog(2000),
 		state:     stateNoMedia,
 		status:    "OK",
-		playSpeed: "1",
 		playMode:  "NORMAL",
 		volume:    30,
 		speed:     1,
@@ -258,7 +256,7 @@ func (d *Device) eventedVars(service string) map[string]string {
 		vars := map[string]string{
 			"TransportState":             d.state,
 			"TransportStatus":            d.status,
-			"TransportPlaySpeed":         d.playSpeed,
+			"TransportPlaySpeed":         formatPlaySpeed(d.speed),
 			"CurrentPlayMode":            d.playMode,
 			"PlaybackStorageMedium":      "NETWORK",
 			"NumberOfTracks":             strconv.Itoa(d.trackCountLocked()),
@@ -310,6 +308,16 @@ func (d *Device) transportActionsLocked() string {
 		return "Stop"
 	}
 	return "Play,Stop,Seek"
+}
+
+// formatPlaySpeed 把倍速数值转成 DLNA 要的 TransportPlaySpeed 字符串。
+// 以前这里读的是一个独立字段，而 SetSpeed / noteSpeed 只写 d.speed，
+// 两者从来没同步过，结果控制点查到的倍速永远是 "1"。
+func formatPlaySpeed(v float64) string {
+	if v <= 0 {
+		return "1"
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 func boolStr(b bool) string {
@@ -714,12 +722,16 @@ func (d *Device) SetSpeed(v float64) *upnpError {
 		return &upnpError{402, "Invalid Args"}
 	}
 	d.mu.Lock()
+	changed := d.speed != v
 	d.speed = v
 	d.mu.Unlock()
 	if e, ok := d.scr.(playerEngine); ok {
 		e.SetSpeed(v)
 	}
-	d.logf("player", "播放倍速 → %gx", v)
+	if changed {
+		d.logf("player", "播放倍速 → %gx", v)
+		d.emit(serviceAVTransport)
+	}
 	return nil
 }
 
@@ -811,8 +823,16 @@ func (d *Device) lastScreenshot() string {
 
 func (d *Device) noteSpeed(v float64) {
 	d.mu.Lock()
-	d.speed = v
+	changed := d.speed != v
+	if changed {
+		d.speed = v
+	}
 	d.mu.Unlock()
+	if changed {
+		// 在播放器窗口里改倍速不会走 SOAP，得自己推事件给控制点。
+		d.logf("player", "播放器调倍速，同步为 %gx", v)
+		d.emit(serviceAVTransport)
+	}
 }
 
 func (d *Device) noteLoop(on bool) {

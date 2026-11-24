@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,6 +41,20 @@ type mpvScreen struct {
 	paused       bool
 	reloading    bool
 	stallReloads int
+
+	// 进程异常退出（segfault/abort）后自动重拉用。crashRetries 在同一个崩溃事件里累计，
+	// 隔得久了（lastCrashAt 早于 10 分钟）算新事件重新给额度，避免同一份流反复崩时无限重启。
+	crashRetries int
+	lastCrashAt  time.Time
+	// procDone 表示 Wait 已经收到进程退出。读循环断连时要靠它区分
+	// “进程死了”（交给 Wait 里的崩溃恢复）和“只是连接断了”。
+	procDone bool
+
+	// suppressProps 在播放器刚起来、还没真正加载好文件时抑制 speed/loop/volume/mute
+	// 的属性回报。mpv 的 observe_property 一注册就立刻把当前值（默认值）报回来，
+	// 不压住它会把控制点刚设进去的倍速/音量改回默认值：
+	// 实测 Play(Speed=2) 第一次不生效、第二次才生效，就是这个原因。
+	suppressProps bool
 }
 
 func (m *mpvScreen) Kind() string { return "mpv" }
@@ -48,6 +64,8 @@ func (m *mpvScreen) Show(uri, title string, volume int, mute bool) {
 	m.volume, m.mute = volume, mute
 	m.uri = uri
 	m.retries = 0
+	m.crashRetries = 0
+	m.procDone = false
 	m.mu.Unlock()
 
 	if err := m.start(); err != nil {
@@ -300,6 +318,10 @@ func (m *mpvScreen) start() error {
 	m.cmd = cmd
 	m.conn = conn
 	m.started = true
+	m.procDone = false
+	// 刚连上：observe_property 会立刻把默认值报回来，先压住，
+	// 否则会把控制点刚设进去的倍速/音量改回默认值。
+	m.suppressProps = true
 	m.mu.Unlock()
 
 	go m.readLoop(conn)
@@ -311,14 +333,21 @@ func (m *mpvScreen) start() error {
 		err := cmd.Wait()
 		m.mu.Lock()
 		wasExiting := m.exiting
+		m.procDone = true
 		m.started = false
 		m.cmd = nil
 		m.conn = nil
 		m.mu.Unlock()
-		if !wasExiting {
-			m.dev.logf("screen", "mpv 已退出（%v）", err)
-			m.dev.onScreenExit()
+		if wasExiting {
+			return
 		}
+		m.dev.logf("screen", "mpv 已退出（%v）", err)
+		// mpv 自身崩掉（segfault/abort）不是用户关窗，也不是播完；
+		// 直接当关窗会把画面停在冻结帧上，得自己重新拉起来。
+		if crashedBySignal(err) && m.recoverFromCrash(err) {
+			return
+		}
+		m.dev.onScreenExit()
 	}()
 
 	// 让 mpv 把播放进度、时长、暂停状态推回来
@@ -331,6 +360,9 @@ func (m *mpvScreen) start() error {
 	m.send(map[string]any{"command": []any{"observe_property", 6, "container-fps"}})
 	m.send(map[string]any{"command": []any{"observe_property", 7, "speed"}})
 	m.send(map[string]any{"command": []any{"observe_property", 8, "loop-file"}})
+	// volume/mute 也要盯：窗口内用鼠标或快捷键调音量不会走 SOAP。
+	m.send(map[string]any{"command": []any{"observe_property", 9, "volume"}})
+	m.send(map[string]any{"command": []any{"observe_property", 10, "mute"}})
 	m.dev.logf("screen", "mpv 已启动（%s）", m.path)
 	return nil
 }
@@ -358,8 +390,7 @@ func (m *mpvScreen) retryAfterError() bool {
 		if exiting {
 			return
 		}
-		m.send(map[string]any{"command": []any{"set_property", "start", pos.Seconds()}})
-		m.send(map[string]any{"command": []any{"loadfile", uri, "replace"}})
+		m.loadAt(uri, pos)
 		m.send(map[string]any{"command": []any{"set_property", "pause", false}})
 	}(uri, pos)
 	return true
@@ -407,14 +438,47 @@ func (m *mpvScreen) reloadAt(pos time.Duration) {
 	if uri == "" {
 		return
 	}
-	m.send(map[string]any{"command": []any{"set_property", "start", pos.Seconds()}})
-	m.send(map[string]any{"command": []any{"loadfile", uri, "replace"}})
+	m.loadAt(uri, pos)
 	m.send(map[string]any{"command": []any{"set_property", "pause", false}})
 	time.AfterFunc(8*time.Second, func() {
 		m.mu.Lock()
 		m.reloading = false
 		m.mu.Unlock()
 	})
+}
+
+// propsSuppressed 报告当前是否处于“刚连上、还没加载好文件”的属性抑制期。
+func (m *mpvScreen) propsSuppressed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.suppressProps
+}
+
+// clearPropsSuppressed 结束抑制期，返回之前是否真的处于抑制期。
+// 只应该在 file-loaded 里调：那时 mpv 的属性才是真实生效值。
+func (m *mpvScreen) clearPropsSuppressed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	was := m.suppressProps
+	m.suppressProps = false
+	return was
+}
+
+// loadAt 让 mpv 从指定位置开始播同一个地址。
+// 必须用 loadfile 的 options 参数传 start：在 mpv 0.41 上 set_property start
+// 会直接报 "error accessing property"，静默失效，续播就变从头播。
+func (m *mpvScreen) loadAt(uri string, pos time.Duration) {
+	m.send(map[string]any{"command": loadFileAtCommand(uri, pos)})
+}
+
+// loadFileAtCommand 拼出“从 pos 开始播 uri”的 mpv 命令。
+// 单独抽出来是为了能测：start 参数位置和写法写错时 mpv 只会报一个
+// 看不出所以然的 error accessing property / invalid parameter，续播就静默失效。
+func loadFileAtCommand(uri string, pos time.Duration) []any {
+	if pos < 0 {
+		pos = 0
+	}
+	return []any{"loadfile", uri, "replace", -1, fmt.Sprintf("start=%.3f", pos.Seconds())}
 }
 
 type mpvEvent struct {
@@ -463,6 +527,9 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 					m.paused = b
 					m.lastTick = time.Now()
 					m.mu.Unlock()
+					// 用户直接在 mpv 窗口里按空格暂停时，没有 SOAP 请求进来，
+					// 只能靠这个属性变化把状态回写给 DLNA，否则控制点一直以为在播。
+					m.dev.syncPaused(b)
 				}
 			case "track-list":
 				m.dev.setTracks(parseMPVTracks(ev.Data))
@@ -479,16 +546,52 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 			case "speed":
 				var v float64
 				if json.Unmarshal(ev.Data, &v) == nil && v > 0 {
+					if m.propsSuppressed() {
+						break
+					}
 					m.dev.noteSpeed(v)
 				}
 			case "loop-file":
 				var v string
 				if json.Unmarshal(ev.Data, &v) == nil {
+					if m.propsSuppressed() {
+						break
+					}
 					m.dev.noteLoop(v != "no")
+				}
+			case "volume":
+				var v float64
+				if json.Unmarshal(ev.Data, &v) == nil {
+					if m.propsSuppressed() {
+						break
+					}
+					m.mu.Lock()
+					m.volume = int(v + 0.5)
+					mute := m.mute
+					vol := m.volume
+					m.mu.Unlock()
+					m.dev.syncRendering(vol, mute)
+				}
+			case "mute":
+				var b bool
+				if json.Unmarshal(ev.Data, &b) == nil {
+					if m.propsSuppressed() {
+						break
+					}
+					m.mu.Lock()
+					m.mute = b
+					vol := m.volume
+					m.mu.Unlock()
+					m.dev.syncRendering(vol, b)
 				}
 			}
 		case "file-loaded":
 			m.dev.logf("screen", "mpv file-loaded")
+			// 文件真加载完了：抑制期结束，把设备上的倍速/循环重新下发一次，
+			// 再放开属性回报。这样控制点刚设的 Play(Speed) 不会被默认值覆盖。
+			if m.clearPropsSuppressed() {
+				m.applySettings()
+			}
 			m.dev.startPlayback()
 			m.dev.applyPendingSeek()
 			m.mu.Lock()
@@ -519,13 +622,103 @@ func (m *mpvScreen) readLoop(conn io.ReadWriteCloser) {
 			m.dev.logf("mpv", "%s", line)
 		}
 	}
-	// 连接断了但进程还在（极少见）：当成窗口被关
+	// 连接断了。这里不能直接当“用户关窗”：进程被信号打死时 socket 会先断，
+	// Wait 随后才返回，抢先把状态打成 STOPPED 会把位置归零，崩溃恢复拉起来也推不回 PLAYING。
+	if m.waitProcDone(2 * time.Second) {
+		return
+	}
 	m.mu.Lock()
 	wasExiting := m.exiting
 	m.mu.Unlock()
 	if !wasExiting {
+		// 进程还在、只是 IPC 断了（极少见）：当成窗口被关
 		m.dev.onScreenExit()
 	}
+}
+
+// waitProcDone 等进程退出（Wait 返回）最多 d，返回 true 表示进程确实结束了。
+func (m *mpvScreen) waitProcDone(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		m.mu.Lock()
+		done, exiting := m.procDone, m.exiting
+		m.mu.Unlock()
+		if done || exiting {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// crashedBySignal 判断 Wait 返回的错误是不是“进程被信号打死”（segfault/abort 等）。
+// 用户关窗（quit）和正常播完都是 exit 0，不会落到这里；
+// 普通非零退出也算异常退出，但不是崩溃，仍交给原来那条路处理。
+func crashedBySignal(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
+		return ws.Signaled()
+	}
+	return false
+}
+
+// recoverFromCrash 在 mpv 因信号崩掉后，从崩溃前的位置重新拉起它。
+// 崩溃不是用户关窗也不是播完：放着不管画面会停在冻结帧上，
+// 而控制点还看到进度在走（用户实际遇到的就是这个）。
+// 同一个崩溃事件最多重试 3 次：同一份流反复崩时不能无限重启。
+func (m *mpvScreen) recoverFromCrash(cause error) bool {
+	m.mu.Lock()
+	if m.exiting {
+		m.mu.Unlock()
+		return false
+	}
+	uri := m.uri
+	if uri == "" {
+		m.mu.Unlock()
+		return false
+	}
+	// 隔得久了算新的崩溃事件，重新给额度。
+	if m.lastCrashAt.IsZero() || time.Since(m.lastCrashAt) > 10*time.Minute {
+		m.crashRetries = 0
+	}
+	m.crashRetries++
+	m.lastCrashAt = time.Now()
+	n := m.crashRetries
+	pos, paused := m.lastPos, m.paused
+	volume, mute := m.volume, m.mute
+	m.mu.Unlock()
+
+	if n > 3 {
+		m.dev.logf("screen", "mpv 已崩溃 %d 次，不再重启（%v）", n-1, cause)
+		return false
+	}
+
+	m.dev.logf("screen", "mpv 崩溃（%v），1 秒后从 %s 重新拉起（第 %d/3 次）", cause, formatTime(pos), n)
+	m.dev.reenterSelected(pos)
+	go func() {
+		time.Sleep(time.Second)
+		m.mu.Lock()
+		exiting := m.exiting
+		m.mu.Unlock()
+		if exiting {
+			return
+		}
+		if err := m.start(); err != nil {
+			m.dev.logf("screen", "mpv 重新拉起失败（%v），结束播放", err)
+			m.dev.onScreenExit()
+			return
+		}
+		m.loadAt(uri, pos)
+		m.applyVolume(volume, mute)
+		m.applySettings()
+		m.send(map[string]any{"command": []any{"set_property", "pause", paused}})
+	}()
+	return true
 }
 
 func (m *mpvScreen) Close() {

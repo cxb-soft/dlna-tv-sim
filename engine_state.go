@@ -22,6 +22,78 @@ func (d *Device) syncPosition(pos time.Duration) {
 	d.mu.Unlock()
 }
 
+// syncPaused 把播放器自身的暂停状态回填到设备状态。
+// 用户直接在播放器窗口里按暂停时，控制点不会发任何 SOAP 请求，只有引擎知道这件事；
+// 不回写的话 DLNA 侧会一直报 PLAYING，而且 positionLocked 会按 pos+since(posAt) 继续算，
+// 控制点看到的进度就一直往前走，跟画面完全对不上。
+func (d *Device) syncPaused(paused bool) {
+	d.mu.Lock()
+	changed := false
+	switch {
+	case paused && d.state == statePlaying:
+		// 先按播放态算出当前位置再冻结，否则冻结后 pos 会丢掉这一段。
+		d.pos = d.positionLocked()
+		d.posAt = time.Now()
+		d.state = statePaused
+		changed = true
+	case !paused && d.state == statePaused:
+		d.state = statePlaying
+		d.posAt = time.Now()
+		changed = true
+	}
+	d.mu.Unlock()
+	if changed {
+		if paused {
+			d.logf("screen", "播放器暂停，同步为 PAUSED_PLAYBACK")
+		} else {
+			d.logf("screen", "播放器继续，同步为 PLAYING")
+		}
+		d.emit(serviceAVTransport)
+	}
+}
+
+// syncRendering 把播放器侧的音量/静音变化回写到设备，并推事件给控制点。
+// 和暂停一样：用户在播放器窗口（或键盘）里调音时，控制点不会发 SOAP，
+// 不回写的话远程遥控器上显示的还是旧值，两边完全对不上。
+// 自己发起的 SetVolume 也会回到这里，值没变时直接返回，不会造成事件风暴。
+func (d *Device) syncRendering(volume int, mute bool) {
+	if volume < 0 {
+		volume = 0
+	}
+	if volume > 100 {
+		volume = 100
+	}
+	d.mu.Lock()
+	changed := d.volume != volume || d.mute != mute
+	if changed {
+		d.volume, d.mute = volume, mute
+	}
+	d.mu.Unlock()
+	if !changed {
+		return
+	}
+	d.logf("rcs", "播放器调音，同步音量 %d 静音 %v", volume, mute)
+	d.emit(serviceRenderingControl)
+}
+
+// reenterSelected 把设备放回“加载中”，让播放器加载完成后的 startPlayback 能重新推到 PLAYING。
+// 用于播放引擎崩溃后自动重拉：崩溃不是用户关窗，不能走 onScreenExit 把状态打成
+// STOPPED 并把位置归零，否则重新拉起来的窗口再也推不回 PLAYING，控制点看到的还是停着。
+func (d *Device) reenterSelected(pos time.Duration) {
+	d.mu.Lock()
+	if d.uri == "" {
+		d.mu.Unlock()
+		return
+	}
+	d.state = stateTransitioning
+	d.pos = pos
+	d.posAt = time.Now()
+	d.hasPendingSeek = false
+	d.mu.Unlock()
+	d.logf("avt", "播放器重启，从 %s 重新加载", formatTime(pos))
+	d.emit(serviceAVTransport)
+}
+
 // startPlayback 由播放器在文件真正加载完成后调用，进入 PLAYING。
 func (d *Device) startPlayback() {
 	d.mu.Lock()

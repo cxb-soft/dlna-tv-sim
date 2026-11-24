@@ -79,7 +79,7 @@ func (d *Device) avtAction(action string, in map[string]string) ([]Arg, *upnpErr
 		return []Arg{
 			{"CurrentTransportState", d.state},
 			{"CurrentTransportStatus", d.status},
-			{"CurrentSpeed", d.playSpeed},
+			{"CurrentSpeed", formatPlaySpeed(d.speed)},
 		}, nil
 
 	case "GetPositionInfo":
@@ -96,6 +96,14 @@ func (d *Device) avtAction(action string, in map[string]string) ([]Arg, *upnpErr
 			{"RelCount", "2147483647"},
 			{"AbsCount", "2147483647"},
 		}, nil
+
+	case "Record":
+		// SCPD 里按 AVTransport:1 完整模板声明了 Record，那这个动作就得存在。
+		// 不能落到 unknow 分支返回 401 Invalid Action——那是“动作不存在”，跟 SCPD 自相矛盾，
+		// 控制点会当成协议不兼容。设备是 MediaRenderer，不做录制，
+		// 按规范在不支持的状态下返回 701 Transition not available。
+		// 这与 GetDeviceCapabilities 里的 RecMedia=NOT_IMPLEMENTED 一致。
+		return nil, &upnpError{701, "Transition not available"}
 
 	case "GetDeviceCapabilities":
 		return []Arg{
@@ -119,9 +127,22 @@ func (d *Device) avtAction(action string, in map[string]string) ([]Arg, *upnpErr
 		return nil, nil
 
 	case "Play":
+		// 倍速在 SCPD 里已声明支持 0.25–4，这里就得真的认。
+		// 以前只认 "1"，其他一律 712，但 SCPD 的 CurrentSpeed 又会如实报出实际倍速，
+		// 两边就矛盾了：声明了支持却永远改不了。
 		speed := strings.TrimSpace(in["Speed"])
-		if speed != "" && speed != "1" && speed != "1/1" {
-			return nil, &upnpError{712, "Play speed not supported"}
+		v, perr := parsePlaySpeed(speed)
+		if perr != nil {
+			return nil, perr
+		}
+		// 先写倍速再开播：Show 里的 applySettings 会读 d.speed，
+		// 反过来做就存在“播放器已按旧倍速起来”的竞态。
+		// 只在显式带了 Speed 时才改：不传 Speed 的 Play 很常见（尤其在暂停后恢复），
+		// 那时把用户在本机设的 2x 悄悄拉回 1x 是没人要的行为。
+		if speed != "" {
+			if serr := d.SetSpeed(v); serr != nil {
+				return nil, serr
+			}
 		}
 		if err := d.Play(); err != nil {
 			return nil, err
@@ -206,7 +227,7 @@ func (d *Device) avtAction(action string, in map[string]string) ([]Arg, *upnpErr
 			"REPEAT_ALL": true, "RANDOM": true, "DIRECT_1": true, "INTRO": true,
 		}
 		if !valid[mode] {
-			return nil, &upnpError{712, "Play speed not supported"}
+			return nil, &upnpError{712, "Play mode not supported"}
 		}
 		d.mu.Lock()
 		d.playMode = mode
@@ -352,6 +373,34 @@ func dbToVolume(db int) int {
 		v = 0
 	}
 	return int(v + 0.5)
+}
+
+// parsePlaySpeed 解析 Play 的 Speed 参数。
+// UPnP 里倍速既允许 "1"、"2" 这种整数，也允许 "1/2" 这种分数写法（老控制点常用）。
+// 空值表示不指定，按 1x 处理；超出 SCPD 声明范围时返回 717。
+// 注意 717 才是 “Play speed not supported”，712 是 “Play mode not supported”。
+func parsePlaySpeed(v string) (float64, *upnpError) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 1, nil
+	}
+	if strings.Contains(v, "/") {
+		parts := strings.SplitN(v, "/", 2)
+		num, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		den, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		if err1 != nil || err2 != nil || den == 0 {
+			return 0, &upnpError{402, "Invalid Args"}
+		}
+		v = strconv.FormatFloat(num/den, 'f', -1, 64)
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, &upnpError{402, "Invalid Args"}
+	}
+	if f < 0.25 || f > 4 {
+		return 0, &upnpError{717, "Play speed not supported"}
+	}
+	return f, nil
 }
 
 func parseBool(v string) (bool, error) {

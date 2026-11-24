@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -366,6 +367,386 @@ func TestPlaybackStateMachine(t *testing.T) {
 	body := soapCall(t, base, serviceAVTransport, "GetPositionInfo", map[string]string{"InstanceID": "0"}, 200)
 	if pos := soapOut(t, body, "RelTime"); pos != "00:00:00" {
 		t.Errorf("Stop 后位置应归零，实际 %s", pos)
+	}
+}
+
+// TestPlayerWindowPauseSync 覆盖“用户直接在播放器窗口里按暂停”这条路：
+// 控制点不会发任何 SOAP，只有引擎知道，所以必须由播放器把状态回写给 DLNA。
+// 不回写时 DLNA 一直报 PLAYING，而 positionLocked 按 pos+since(posAt) 继续算，
+// 控制点（iPad）看到的进度就一直往前走，跟画面完全对不上。
+func TestPlayerWindowPauseSync(t *testing.T) {
+	dev := newTestDevice(t)
+	base := dev.testBase()
+
+	meta := `<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item><dc:title>窗口暂停测试</dc:title>` +
+		`<res protocolInfo="http-get:*:video/mp4:*" duration="0:02:30.000">http://127.0.0.1:1/a.mp4</res></item></DIDL-Lite>`
+	soapCall(t, base, serviceAVTransport, "SetAVTransportURI", map[string]string{
+		"InstanceID": "0", "CurrentURI": "http://127.0.0.1:1/a.mp4", "CurrentURIMetaData": meta,
+	}, 200)
+
+	transport := func() string {
+		return soapOut(t, soapCall(t, base, serviceAVTransport, "GetTransportInfo", map[string]string{"InstanceID": "0"}, 200), "CurrentTransportState")
+	}
+	relTime := func() string {
+		return soapOut(t, soapCall(t, base, serviceAVTransport, "GetPositionInfo", map[string]string{"InstanceID": "0"}, 200), "RelTime")
+	}
+
+	// 摆到“正在播、已经放到 30 秒”。
+	dev.mu.Lock()
+	dev.state = statePlaying
+	dev.pos = 30 * time.Second
+	dev.posAt = time.Now()
+	dev.mu.Unlock()
+
+	// 播放器窗口里按了暂停：设备层同步状态。
+	dev.syncPaused(true)
+	if st := transport(); st != statePaused {
+		t.Fatalf("播放器暂停后 CurrentTransportState 应为 %s，实际 %s", statePaused, st)
+	}
+	first := relTime()
+	time.Sleep(900 * time.Millisecond)
+	second := relTime()
+	if first != second {
+		t.Errorf("播放器暂停后位置应冻结，实际从 %s 走到了 %s", first, second)
+	}
+	if first == "00:00:00" {
+		t.Errorf("暂停不应把位置归零，至少应保留播放到的位置")
+	}
+
+	// 窗口里再按继续：回到 PLAYING，位置重新前进。
+	dev.syncPaused(false)
+	if st := transport(); st != statePlaying {
+		t.Fatalf("播放器继续后应为 %s，实际 %s", statePlaying, st)
+	}
+	resumed := relTime()
+	time.Sleep(1200 * time.Millisecond)
+	if later := relTime(); later == resumed {
+		t.Errorf("播放器继续后位置没有重新前进: %s", later)
+	}
+
+	// 已经是 PLAYING 时再收到“未暂停”不该改状态（避免事件风暴）。
+	dev.syncPaused(false)
+	if st := transport(); st != statePlaying {
+		t.Errorf("重复的未暂停信号不应改状态，实际 %s", st)
+	}
+
+	// 停止后，空闲播放器窗口报暂停（mpv --idle --force-window 会这样）不能被当成 PAUSED_PLAYBACK。
+	soapCall(t, base, serviceAVTransport, "Stop", map[string]string{"InstanceID": "0"}, 200)
+	dev.syncPaused(true)
+	if st := transport(); st == statePaused {
+		t.Errorf("停止后被播放器暂停信号误改成了 %s", st)
+	}
+}
+
+// TestMpvLoadFileAtCommand 固住续播命令的形状：
+// mpv 0.41 上 set_property start 会报 error accessing property 静默失效，
+// 续播就变从头播。必须走 loadfile 的 options 参数。
+func TestMpvLoadFileAtCommand(t *testing.T) {
+	cmd := loadFileAtCommand("http://127.0.0.1:1/a.mp4", 90*time.Second)
+	if len(cmd) != 5 {
+		t.Fatalf("loadfile 命令应有 5 段，实际 %d: %v", len(cmd), cmd)
+	}
+	if cmd[0] != "loadfile" {
+		t.Errorf("第一条应为 loadfile，实际 %v", cmd[0])
+	}
+	if cmd[1] != "http://127.0.0.1:1/a.mp4" {
+		t.Errorf("地址不对: %v", cmd[1])
+	}
+	if cmd[2] != "replace" {
+		t.Errorf("replace 位置不对: %v", cmd[2])
+	}
+	// 第四个是选项表下标，-1 表示插到末尾。
+	if v, ok := cmd[3].(int); !ok || v != -1 {
+		t.Errorf("第四段应为 -1，实际 %v", cmd[3])
+	}
+	// start 必须是 “start=<秒>” 这种字符串选项，不能是数字（数字会被当成下标）。
+	opt, ok := cmd[4].(string)
+	if !ok {
+		t.Fatalf("第五段应为字符串选项，实际 %T", cmd[4])
+	}
+	if opt != "start=90.000" {
+		t.Errorf("start 选项不对: %q", opt)
+	}
+
+	// 负位置要归零，不能把负数传给 mpv。
+	neg := loadFileAtCommand("x", -5*time.Second)
+	if neg[4] != "start=0.000" {
+		t.Errorf("负位置应归零，实际 %q", neg[4])
+	}
+}
+
+// TestPlayerWindowVolumeSync 覆盖“在播放器窗口里调音量/静音”：
+// 与暂停同理，自绘控件和快捷键调音都不走 SOAP，只有引擎知道。
+// 不回写时远程遥控器上显示的还是旧值；而且不能把控制点刚设的值反过来盖掉。
+func TestPlayerWindowVolumeSync(t *testing.T) {
+	dev := newTestDevice(t)
+	base := dev.testBase()
+
+	volume := func() string {
+		return soapOut(t, soapCall(t, base, serviceRenderingControl, "GetVolume", map[string]string{
+			"InstanceID": "0", "Channel": "Master",
+		}, 200), "CurrentVolume")
+	}
+	mute := func() string {
+		return soapOut(t, soapCall(t, base, serviceRenderingControl, "GetMute", map[string]string{
+			"InstanceID": "0", "Channel": "Master",
+		}, 200), "CurrentMute")
+	}
+
+	// 播放器窗口里把音量拉到 55。
+	dev.syncRendering(55, false)
+	if got := volume(); got != "55" {
+		t.Errorf("播放器调音后 DLNA 音量应为 55，实际 %s", got)
+	}
+
+	// 播放器窗口里静音。
+	dev.syncRendering(55, true)
+	if got := mute(); got != "1" {
+		t.Errorf("播放器静音后 DLNA Mute 应为 1，实际 %s", got)
+	}
+
+	// 控制点调音：不能被播放器侧旧值盖回去。
+	soapCall(t, base, serviceRenderingControl, "SetVolume", map[string]string{
+		"InstanceID": "0", "Channel": "Master", "DesiredVolume": "20",
+	}, 200)
+	if got := volume(); got != "20" {
+		t.Errorf("控制点设音量 20 后应为 20，实际 %s", got)
+	}
+
+	// 值没变时不应反复推事件（120ms 轮询会不停回调）。
+	// 这里用真实 GENA 订阅数事件，不能用订阅数量代替。
+	ch := make(chan notification, 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		w.WriteHeader(200)
+		ch <- notification{body: string(body)}
+	}))
+	defer srv.Close()
+	subscribe(t, base, serviceRenderingControl, srv.URL+"/", "Second-300")
+	waitNotification(t, ch, 3*time.Second, nil) // 初始事件
+
+	// GENA 的 LastChange 是两层转义的：外层 propertyset 把内层 XML 转义一次，
+	// 属性里的引号再转成 &#34;。所以先反转义两遍再匹配。
+	unescaped := func(n notification) string {
+		return html.UnescapeString(html.UnescapeString(n.body))
+	}
+
+	// 本测试还没设过订阅前的值，先把当前值对齐，再重复推送同值。
+	dev.syncRendering(40, false)
+	waitNotification(t, ch, 3*time.Second, func(n notification) bool {
+		return strings.Contains(unescaped(n), `<Volume channel="Master" val="40"/>`)
+	})
+	for i := 0; i < 5; i++ {
+		dev.syncRendering(40, false)
+	}
+	select {
+	case n := <-ch:
+		t.Errorf("值没变时不应推事件，却收到: %s", unescaped(n))
+	case <-time.After(600 * time.Millisecond):
+	}
+
+	// 值真变了就要推事件。
+	dev.syncRendering(70, false)
+	ev := waitNotification(t, ch, 3*time.Second, func(n notification) bool {
+		return strings.Contains(unescaped(n), `<Volume channel="Master" val="70"/>`)
+	})
+	if !strings.Contains(unescaped(ev), "Volume") {
+		t.Errorf("音量事件内容不对: %s", unescaped(ev))
+	}
+
+	// 越界值要夹到 0–100。
+	dev.syncRendering(150, false)
+	if got := volume(); got != "100" {
+		t.Errorf("超界音量应夹到 100，实际 %s", got)
+	}
+	dev.syncRendering(-5, false)
+	if got := volume(); got != "0" {
+		t.Errorf("负音量应夹到 0，实际 %s", got)
+	}
+}
+
+// TestTransportSpeedSync 固住倍速上报：DLNA 的 CurrentSpeed 和 TransportPlaySpeed
+// 原来读的是一个独立字段，而这个字段从来没人写过，永远是 "1"。
+// 结果就是不论控制点还是播放器窗口改倍速，iPad 查到的始终是「正在 1 倍速播」。
+func TestTransportSpeedSync(t *testing.T) {
+	dev := newTestDevice(t)
+	base := dev.testBase()
+
+	meta := `<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item><dc:title>倍速测试</dc:title>` +
+		`<res protocolInfo="http-get:*:video/mp4:*" duration="0:02:30.000">http://127.0.0.1:1/a.mp4</res></item></DIDL-Lite>`
+	soapCall(t, base, serviceAVTransport, "SetAVTransportURI", map[string]string{
+		"InstanceID": "0", "CurrentURI": "http://127.0.0.1:1/a.mp4", "CurrentURIMetaData": meta,
+	}, 200)
+
+	currentSpeed := func() string {
+		return soapOut(t, soapCall(t, base, serviceAVTransport, "GetTransportInfo", map[string]string{"InstanceID": "0"}, 200), "CurrentSpeed")
+	}
+
+	// 默认应为 1
+	if got := currentSpeed(); got != "1" {
+		t.Errorf("默认倍速应为 1，实际 %q", got)
+	}
+
+	// 控制点设 1.25 → GetTransportInfo 要能读到
+	soapCall(t, base, serviceAVTransport, "Play", map[string]string{"InstanceID": "0", "Speed": "1"}, 200)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if st := soapOut(t, soapCall(t, base, serviceAVTransport, "GetTransportInfo", map[string]string{"InstanceID": "0"}, 200), "CurrentTransportState"); st == statePlaying {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("没有进入 PLAYING")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	dev.SetSpeed(1.25)
+	if got := currentSpeed(); got != "1.25" {
+		t.Errorf("SetSpeed(1.25) 后 CurrentSpeed 应为 1.25，实际 %q", got)
+	}
+
+	// 播放器窗口里改倍速（mpv observe / 自研轮询都走 noteSpeed）→ 也要能读到
+	dev.noteSpeed(2)
+	if got := currentSpeed(); got != "2" {
+		t.Errorf("窗口改 2x 后 CurrentSpeed 应为 2，实际 %q", got)
+	}
+
+	// 事件里的 TransportPlaySpeed 也得跟上，否则控制点只能轮询
+	ch := make(chan notification, 16)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		w.WriteHeader(200)
+		ch <- notification{body: string(body)}
+	}))
+	defer srv.Close()
+	subscribe(t, base, serviceAVTransport, srv.URL+"/", "Second-300")
+	waitNotification(t, ch, 3*time.Second, nil) // 初始事件
+
+	dev.noteSpeed(0.75)
+	n := waitNotification(t, ch, 3*time.Second, func(n notification) bool {
+		return strings.Contains(html.UnescapeString(html.UnescapeString(n.body)), `TransportPlaySpeed val="0.75"`)
+	})
+	if !strings.Contains(html.UnescapeString(html.UnescapeString(n.body)), "TransportPlaySpeed") {
+		t.Errorf("事件里没有 TransportPlaySpeed")
+	}
+
+	// 值没变时不应刷事件
+	dev.noteSpeed(0.75)
+	select {
+	case got := <-ch:
+		t.Errorf("倍速没变时不应推事件，却收到: %s", html.UnescapeString(html.UnescapeString(got.body)))
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestRecordActionDeclared 固住 SCPD 与实现的一致性：
+// SCPD 里按 AVTransport:1 模板声明了 Record，于是这个动作就必须存在。
+// 设备是 MediaRenderer、不做录制，按规范返回 701 Transition not available；
+// 不能因为没写 case 就落到 unknow 分支回 401 Invalid Action——
+// 那是“动作不存在”，跟自己的 SCPD 自相矛盾，控制点会当成协议不兼容。
+func TestRecordActionDeclared(t *testing.T) {
+	dev := newTestDevice(t)
+	base := dev.testBase()
+
+	// 先把 SCPD 拿出来，确认确实声明了 Record
+	code, scpd := getBody(t, base+"/AVTransport/scpd.xml")
+	if code != 200 || !strings.Contains(scpd, "<name>Record</name>") {
+		t.Fatalf("SCPD 应声明 Record，实际状态 %d", code)
+	}
+
+	body := soapCall(t, base, serviceAVTransport, "Record", map[string]string{
+		"InstanceID": "0", "RecordSource": "NETWORK", "RecordTarget": "",
+	}, 500)
+	if !strings.Contains(body, "<errorCode>701</errorCode>") {
+		t.Errorf("Record 应返回 701（不支持的转换），实际：%s", body)
+	}
+	if strings.Contains(body, "Invalid Action") {
+		t.Errorf("Record 已声明，不应回“动作不存在”：%s", body)
+	}
+
+	// 录像能力要把话说死，别让控制点试
+	caps := soapCall(t, base, serviceAVTransport, "GetDeviceCapabilities", map[string]string{"InstanceID": "0"}, 200)
+	if !strings.Contains(caps, "NOT_IMPLEMENTED") {
+		t.Errorf("GetDeviceCapabilities 应声明不录制：%s", caps)
+	}
+}
+
+// TestPlaySpeedSupported 固住 SCPD 声明与实际能力的一致性：
+// 以前 SCPD 里 TransportPlaySpeed 只声明了 1，Play 也把非 1 一律拒（当年还用错了错误码）；
+// 但引擎、网页控制台、窗口都真支持 0.25–4。现在两边说一致：声明了就要真认。
+func TestPlaySpeedSupported(t *testing.T) {
+	dev := newTestDevice(t)
+	base := dev.testBase()
+
+	// SCPD 里应该声明多个允许值，而不只是 1
+	code, spd := getBody(t, base+"/AVTransport/scpd.xml")
+	if code != 200 {
+		t.Fatalf("取 SCPD 失败: %d", code)
+	}
+	for _, v := range []string{"0.5", "1.25", "2", "4"} {
+		if !strings.Contains(spd, "<allowedValue>"+v+"</allowedValue>") {
+			t.Errorf("SCPD 应声明支持 %s 倍速", v)
+		}
+	}
+
+	meta := `<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item><dc:title>倍速</dc:title>` +
+		`<res protocolInfo="http-get:*:video/mp4:*" duration="0:02:30.000">http://127.0.0.1:1/a.mp4</res></item></DIDL-Lite>`
+	soapCall(t, base, serviceAVTransport, "SetAVTransportURI", map[string]string{
+		"InstanceID": "0", "CurrentURI": "http://127.0.0.1:1/a.mp4", "CurrentURIMetaData": meta,
+	}, 200)
+
+	currentSpeed := func() string {
+		return soapOut(t, soapCall(t, base, serviceAVTransport, "GetTransportInfo", map[string]string{"InstanceID": "0"}, 200), "CurrentSpeed")
+	}
+
+	// Play 带倍速 2 → 应该真的生效，而不是被拒掉
+	soapCall(t, base, serviceAVTransport, "Play", map[string]string{"InstanceID": "0", "Speed": "2"}, 200)
+	if got := currentSpeed(); got != "2" {
+		t.Errorf("Play(Speed=2) 后 CurrentSpeed 应为 2，实际 %q", got)
+	}
+
+	// 分数写法（老控制点常用）
+	soapCall(t, base, serviceAVTransport, "Play", map[string]string{"InstanceID": "0", "Speed": "1/2"}, 200)
+	if got := currentSpeed(); got != "0.5" {
+		t.Errorf("Play(Speed=1/2) 后 CurrentSpeed 应为 0.5，实际 %q", got)
+	}
+
+	// 超出声明范围要拒绝（717 才是 Play speed not supported；712 是 Play mode not supported）
+	body := soapCall(t, base, serviceAVTransport, "Play", map[string]string{"InstanceID": "0", "Speed": "8"}, 500)
+	if !strings.Contains(body, "<errorCode>717</errorCode>") {
+		t.Errorf("超范围倍速应回 717（Play speed not supported），实际：%s", body)
+	}
+	if strings.Contains(body, "<errorCode>712</errorCode>") {
+		t.Errorf("712 是 Play mode not supported，不能用作倍速错误：%s", body)
+	}
+
+	// 非法写法要是参数错，不是 717
+	body = soapCall(t, base, serviceAVTransport, "Play", map[string]string{"InstanceID": "0", "Speed": "abc"}, 500)
+	if !strings.Contains(body, "<errorCode>402</errorCode>") {
+		t.Errorf("非法倍速应回 402，实际：%s", body)
+	}
+
+	// 播放模式不支持用 712，描述要是 “Play mode not supported”
+	body = soapCall(t, base, serviceAVTransport, "SetPlayMode", map[string]string{
+		"InstanceID": "0", "NewPlayMode": "BOGUS",
+	}, 500)
+	if !strings.Contains(body, "<errorCode>712</errorCode>") {
+		t.Errorf("非法播放模式应回 712，实际：%s", body)
+	}
+	if !strings.Contains(body, "Play mode not supported") {
+		t.Errorf("712 的描述应为 Play mode not supported，实际：%s", body)
+	}
+
+	// 不传 Speed 时不应把本机设的倍速改掉（暂停后恢复很常见）。
+	soapCall(t, base, serviceAVTransport, "Play", map[string]string{"InstanceID": "0"}, 200)
+	if got := currentSpeed(); got != "0.5" {
+		t.Errorf("不传 Speed 时应保留当前倍速 0.5，实际 %q", got)
+	}
+
+	// 显式传 1 才回到 1 倍速
+	soapCall(t, base, serviceAVTransport, "Play", map[string]string{"InstanceID": "0", "Speed": "1"}, 200)
+	if got := currentSpeed(); got != "1" {
+		t.Errorf("显式 Speed=1 后应为 1，实际 %q", got)
 	}
 }
 

@@ -261,18 +261,7 @@ func (n *nativeScreen) Show(uri, title string, volume int, mute bool) {
 
 // attach 在主线程上、Run 之前安装回调，保证从第一帧起状态就能回填。
 func (n *nativeScreen) attach(sess *nativeSession) {
-	sess.p.OnUpdate(func(st player.Status) {
-		if st.Duration > 0 {
-			n.dev.setDuration(toDuration(st.Duration))
-		}
-		if !st.Paused && !st.Ended {
-			n.dev.syncPosition(toDuration(st.Position))
-		}
-		if st.Ended && !sess.ended.Swap(true) {
-			n.dev.logf("screen", "播放到结尾（位置 %s）", formatTime(toDuration(st.Position)))
-			n.dev.onPlaybackEnded()
-		}
-	})
+	sess.p.OnUpdate(func(st player.Status) { n.onPlayerStatus(st, sess) })
 	sess.p.OnClose(func() {
 		if sess.closing.Load() {
 			return
@@ -280,6 +269,37 @@ func (n *nativeScreen) attach(sess *nativeSession) {
 		n.dev.logf("screen", "用户关闭了播放器窗口")
 		n.dev.onScreenExit()
 	})
+}
+
+// onPlayerStatus 把自研核心每 ~120ms 上报的状态回填到设备。
+// 单独拆出来是为了能直接测：暂停/继续这条回写路径不值得为了拿一个全屏窗口去碰。
+func (n *nativeScreen) onPlayerStatus(st player.Status, sess *nativeSession) {
+	if st.Duration > 0 {
+		n.dev.setDuration(toDuration(st.Duration))
+	}
+	// 用户在播放器窗口里直接按暂停/继续，控制点不会发 SOAP，只有这里能把状态告诉 DLNA；
+	// 播完时交给 onPlaybackEnded 处理，不要在这里把状态改成 PAUSED。
+	if !st.Ended {
+		n.dev.syncPaused(st.Paused)
+	}
+	// 音量/静音同理：自绘控件和快捷键调音都不走 SOAP。
+	// 自研核心的 volume 在 pe_open 时就从设备音量初始化，起播不会出现跳变；
+	// 值没变时 syncRendering 直接返回，不会因 120ms 轮询而刷事件。
+	if !st.Ended && !st.Closed {
+		n.dev.syncRendering(st.Volume, st.Muted)
+		// 倍速/循环也是窗口里能改的东西，mpv 那边靠 observe 属性同步，这里靠轮询状态。
+		if st.Speed > 0 {
+			n.dev.noteSpeed(st.Speed)
+		}
+		n.dev.noteLoop(st.Loop)
+	}
+	if !st.Paused && !st.Ended {
+		n.dev.syncPosition(toDuration(st.Position))
+	}
+	if st.Ended && !sess.ended.Swap(true) {
+		n.dev.logf("screen", "播放到结尾（位置 %s）", formatTime(toDuration(st.Position)))
+		n.dev.onPlaybackEnded()
+	}
 }
 
 // updateTracks 把引擎枚举到的音轨/字幕轨报给设备快照（/api/player）。
