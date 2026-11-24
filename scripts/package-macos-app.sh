@@ -23,7 +23,7 @@ echo "→ 构建 Go 引擎（arm64），版本 $VERSION"
 mkdir -p dist
 if [ "$NATIVE_ENGINE" = "1" ]; then
   if [ ! -f "$FFMPEG_PREFIX/lib/libavcodec.dylib" ]; then
-    echo "错误：找不到 LGPL FFmpeg（$FFMPEG_PREFIX）" >&2
+    echo "错误：找不到 LGPL FFmpeg（${FFMPEG_PREFIX}）" >&2
     echo "      先运行 scripts/build-native-deps.sh，或用 DLNA_NATIVE_ENGINE=0 构建不含 native 的引擎。" >&2
     exit 1
   fi

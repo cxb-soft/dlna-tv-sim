@@ -29,7 +29,7 @@ fi
 
 CC="${CC:-x86_64-w64-mingw32-gcc}"
 if ! command -v "$CC" >/dev/null 2>&1; then
-  echo "找不到交叉编译器 $CC（macOS: brew install mingw-w64）" >&2
+  echo "找不到交叉编译器 ${CC}（macOS: brew install mingw-w64）" >&2
   exit 1
 fi
 
